@@ -177,6 +177,27 @@ pub struct State {
 
 static mut STATE: State = State { cursor: 0, last_rx: 0, dump_held: false, up: false, siggen: false, closing: false, starting: false, stopping: false, services: None, play: Play::DEFAULT, clicks: mix::Clicks::NONE, feed: mix::Feed::NONE, bench: Bench::NONE, streams: [const { mix::Stream::EMPTY }; mix::STREAMS], tone: mix::Tone::NONE, clip: mix::Clip::NONE, mic: mic::Mic::NONE, generation: [0; mix::STREAMS], periods: 0, underruns: 0, starved: 0, irqs: 0, quiet: 0, amps: [(0, 0); 2], fault: false, watch_failed: 0 };
 
+/// The amplifiers' port (spi_19): since the watch has a thread of its own (2026-11-24), it and the clock thread's bring-up and power-down both drive the port, one at a time under this lock (0 free, 1 held, 2 held with a waiter).
+static AMP_LOCK: AtomicU64 = AtomicU64::new(0);
+pub fn amp_lock() {
+    if AMP_LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        while AMP_LOCK.swap(2, Ordering::Acquire) != 0 {
+            ferros_sys::wait(&AMP_LOCK, 2, 0);
+        }
+    }
+}
+pub fn amp_unlock() {
+    if AMP_LOCK.swap(0, Ordering::Release) == 2 {
+        ferros_sys::wake(&AMP_LOCK, 1);
+    }
+}
+
+/// The watch's doorbell (the clock thread counts it up once a period while sound plays) and the counter's time of its last completed read.
+static WATCH_BELL: AtomicU64 = AtomicU64::new(0);
+static WATCH_DONE_AT: AtomicU64 = AtomicU64::new(0);
+/// WHY a bound on the watch's age (the coordinator for the owner, 2026-11-24: "treat a stale watch as unknown, not as safe"): the watch is the only protection the unprotected speaker has (amp.rs: bypass, no protection firmware), so a watch that has not completed a read for 2^11 frames (42.7 ms at 48 kHz) means the amplifiers' state is unknown, and the sound stops as it does on an error bit. 2^11 frames is about nine times the slowest read measured on the Pro (4.5 ms, the SPI stall that made the clicks) and about four of the deep-buffer path's 10 ms takes, so a healthy watch never trips it.
+const WATCH_STALE_FRAMES: u64 = 1 << 11;
+
 /// 0 free, 1 held, 2 held with a waiter.
 static LOCK: AtomicU64 = AtomicU64::new(0);
 pub fn lock() -> &'static mut State {
@@ -268,7 +289,9 @@ fn start(p: Play) -> Result<aoc::Services, &'static str> {
 fn down(s: &aoc::Services) {
     aoc::listen(0, 0xFFFF, false);
     let _ = aoc::source(s, s.ep, false);
+    amp_lock();
     amp::Amps::new().off();
+    amp_unlock();
     let _ = aoc::bind(s, s.ep, aoc::SINK_SPEAKER, false);
     if s.heap {
         let _ = aoc::map_heap(aoc::MAP_PLAYBACK, aoc::HEAP_PLAYBACK, false);
@@ -330,6 +353,9 @@ fn play_turn(rang: u16) {
             unlock();
             return;
         };
+        if watch_stale(st) {
+            return;
+        }
         let p = st.play;
         let pb = p.period_bytes();
         if p.mmap() {
@@ -339,7 +365,7 @@ fn play_turn(rang: u16) {
                 return;
             }
             unlock();
-            watch();
+            ring_watch();
             return;
         }
         let q = s.queued();
@@ -390,7 +416,7 @@ fn play_turn(rang: u16) {
     if let Some((b, token, s)) = ended {
         b.report(&token, &s);
     }
-    watch();
+    ring_watch();
 }
 
 /// The tail played: the sound brought down and the process ended if nothing else holds it. Called with the lock held; returns with it released.
@@ -466,8 +492,22 @@ fn mmap_turn(st: &mut State, s: &aoc::Services, p: Play) {
 /// The amplifiers read once a period while sound plays (the AoC's interrupt is the clock, no timer), outside the lock: only this thread drives their port while `up` (`start` runs before it is set, `down` and `fault` after this thread clears it). Any error bit (AMP_SHORT, BST_SHORT, TEMP, BST_OVP, BST_DCM_UVP) stops everything at once (`fault`): there is no speaker protection in bypass (amp.rs), so a fault is never played thru.
 fn watch() {
     let t = ferros_sys::now();
+    amp_lock();
+    // Only while sound plays: the bring-up and the power-down hold the port's lock for their whole sequence, and a read after `up` cleared is not wanted.
+    let up = {
+        let st = lock();
+        let up = st.up;
+        unlock();
+        up
+    };
+    if !up {
+        amp_unlock();
+        return;
+    }
     let r = amp::Amps::new().status();
+    amp_unlock();
     turn_part(3, ferros_sys::now() - t);
+    WATCH_DONE_AT.store(ferros_sys::now(), Ordering::Release);
     match r {
         Ok(w) => {
             let st = lock();
@@ -488,6 +528,34 @@ fn watch() {
             }
         }
     }
+}
+
+/// The amplifiers' watch on a thread of its own (2026-11-24): woken by the clock thread once a period (`ring_watch`), it reads both amplifiers' status, so a slow SPI read (measured to 4.5 ms) never holds the next period's mix past the AoC's read. Every period still rings it; a read still finding an error bit stops everything (`fault`); a watch that falls behind is caught by the clock thread (`WATCH_STALE_FRAMES`).
+extern "C" fn watcher(_: u64) -> ! {
+    let mut seen = WATCH_BELL.load(Ordering::Acquire);
+    loop {
+        ferros_sys::wait(&WATCH_BELL, seen, 0);
+        seen = WATCH_BELL.load(Ordering::Acquire);
+        watch();
+    }
+}
+
+/// The clock thread's ring of the watch, once a period while sound plays.
+fn ring_watch() {
+    WATCH_BELL.fetch_add(1, Ordering::AcqRel);
+    ferros_sys::wake(&WATCH_BELL, 1);
+}
+
+/// The watch's age checked at the clock thread's turn (the lock held): past `WATCH_STALE_FRAMES` the amplifiers are unknown, said, and everything stopped as for an error bit (`fault`, which returns with the lock released). True when it stopped.
+fn watch_stale(st: &mut State) -> bool {
+    let last = WATCH_DONE_AT.load(Ordering::Acquire);
+    let age = ferros_sys::now().wrapping_sub(last);
+    if last == 0 || age <= ferros_sys::freq() * WATCH_STALE_FRAMES / audio::RATE as u64 {
+        return false;
+    }
+    say!("audio: the amplifiers' watch is stale: A#{} us since its last read, more than A#{} frames: their state is unknown, so everything is stopped", age * 1_000_000 / ferros_sys::freq(), WATCH_STALE_FRAMES);
+    fault(st);
+    true
 }
 
 /// An amplifier's error bit while sound plays: the tone and every stream stopped (a held write answered "unknown"), the source off, both amplifiers down, the speaker unbound. The process stays, silent, so the next call is told why (its report says `stopped by an error`), then ends (`exit_if_idle`); the switch puts both amplifiers in reset with it. Called with the lock held; returns with it released.
@@ -530,6 +598,7 @@ pub fn report(st: &State, status: u8) -> [u8; 1 + REPORT] {
 
 static mut CLOCK_STACK: [u8; 1 << 14] = [0; 1 << 14];
 static mut POLL_STACK: [u8; 1 << 13] = [0; 1 << 13];
+static mut WATCH_STACK: [u8; 1 << 14] = [0; 1 << 14];
 static mut MSG: [u8; 4096] = [0; 4096];
 
 /// Bring the sound up if it is not: true when playing. Called without the lock (the AoC and the amplifiers take tens of milliseconds); one start at a time (`starting`), from the receiving thread, or from the clock thread for a recording's playback (mic.rs `recorded`): a second caller meanwhile is refused, as one is while the sound is brought down.
@@ -547,13 +616,17 @@ pub fn ensure_up(p: Play) -> bool {
         st.starting = true;
         unlock();
     }
+    amp_lock();
     let r = start(p);
+    amp_unlock();
     let st = lock();
     st.starting = false;
     let why = match r {
         Ok(s) => {
             st.services = Some(s);
             st.play = p;
+            // The watch's age counts from here: the amplifiers were read at their power-up (`start`).
+            WATCH_DONE_AT.store(ferros_sys::now(), Ordering::Release);
             st.up = true;
             st.quiet = 0;
             None
@@ -580,6 +653,7 @@ pub extern "C" fn audio_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     INPUT[1].store(_input_len, Ordering::Relaxed);
     ferros_sys::thread_spawn(clock, unsafe { &mut *(&raw mut CLOCK_STACK) }, 0);
     ferros_sys::thread_spawn(mic::poller, unsafe { &mut *(&raw mut POLL_STACK) }, 0);
+    ferros_sys::thread_spawn(watcher, unsafe { &mut *(&raw mut WATCH_STACK) }, 0);
     let ep = cap(grants, S_AUDIO);
     let msg = unsafe { &mut *(&raw mut MSG) };
     let mut token = [0u8; 32];
