@@ -17,6 +17,10 @@ OUT=${OUT:-target/flash-publish}
 T=${CARGO_TARGET_DIR:-target}
 rm -rf "$OUT" && mkdir -p "$OUT"
 
+# Google's USB driver package (tools/flash/src/driver.rs) must still be the file the tool pins: the tool fetches it from Google, never from us, so a changed file at Google's URL stops the publish here rather than every Windows install later.
+DRV_URL=$(sed -n 's/^pub const URL: &str = "\(.*\)";/\1/p' tools/flash/src/driver.rs)
+DRV_SHA=$(sed -n 's/^pub const SHA256: &str = "\(.*\)";/\1/p' tools/flash/src/driver.rs)
+[ "$(curl -sSfL "$DRV_URL" | sha256sum | cut -c1-64)" = "$DRV_SHA" ] || { echo "Google's USB driver at $DRV_URL is no longer the pinned file (driver.rs): check Google's repository manifest (addon2-*.xml) and pin the new one"; exit 1; }
 cargo build -q --release -p ferros-flash --target x86_64-pc-windows-gnu
 cargo build -q --release -p ferros-flash --target x86_64-unknown-linux-gnu
 cargo build -q -p ferros-flash --features publish

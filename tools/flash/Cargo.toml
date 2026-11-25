@@ -23,6 +23,8 @@ vsf = { path = "../../../vsf", features = ["crypto-verify", "text-encode"] }
 nusb = { version = "0.1", optional = true }
 tokio = { version = "1", features = ["rt", "time", "macros"], optional = true }
 ed25519-dalek = { version = "2", optional = true }
+# Google's USB driver package checked against its pinned SHA-256 (driver.rs): the hash Google's manifest does not give (it gives SHA-1).
+sha2 = "0.10"
 # `log send`: one HTTPS POST to fgtw.org/report (rustls and the web's roots: nothing of the system's to find on Windows).
 ureq = { version = "2", default-features = false, features = ["tls"] }
 # The signing key's one reader (keys/ferros.key.vsf), for `release make` only.

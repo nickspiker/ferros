@@ -4,6 +4,7 @@
 //! The rest of putting ferros on a phone, each a module: board manifests (board.rs), the signed release (release.rs), the fastboot client (fastboot.rs, usb.rs) and the run log (runlog.rs).
 
 pub mod board;
+pub mod driver;
 pub mod fastboot;
 pub mod release;
 pub mod runlog;
@@ -11,7 +12,9 @@ pub mod runlog;
 pub mod usb;
 
 /// GPT type of a ferros partition: BLAKE3("ferros") truncated to 128 bits (RING.md), A0B51225-61C5-0F5A-FFE7-1B644F9CA954, in GPT's on-disk order (the first three fields little-endian).
-pub const FERROS_TYPE: [u8; 16] = [0x25, 0x12, 0xB5, 0xA0, 0xC5, 0x61, 0x5A, 0x0F, 0xFF, 0xE7, 0x1B, 0x64, 0x4F, 0x9C, 0xA9, 0x54];
+pub const FERROS_TYPE: [u8; 16] = [
+    0x25, 0x12, 0xB5, 0xA0, 0xC5, 0x61, 0x5A, 0x0F, 0xFF, 0xE7, 0x1B, 0x64, 0x4F, 0x9C, 0xA9, 0x54,
+];
 /// The entry count a full table grows to: 64 entries of 128 bytes = 8 KiB, two 4 KiB blocks.
 pub const GROWN_COUNT: u32 = 64;
 /// Partition starts are kept on 1 MiB boundaries.
@@ -153,9 +156,21 @@ impl Entry {
     }
     /// The name, UTF-16LE up to 36 units, as far as it is ASCII (every Pixel name is).
     pub fn name(&self) -> String {
-        self.raw[56..128].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).map(|u| if u < 128 { u as u8 as char } else { '?' }).collect()
+        self.raw[56..128]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&u| u != 0)
+            .map(|u| if u < 128 { u as u8 as char } else { '?' })
+            .collect()
     }
-    pub fn new(size: usize, type_guid: [u8; 16], unique: [u8; 16], first: u64, last: u64, name: &str) -> Entry {
+    pub fn new(
+        size: usize,
+        type_guid: [u8; 16],
+        unique: [u8; 16],
+        first: u64,
+        last: u64,
+        name: &str,
+    ) -> Entry {
         let mut raw = vec![0u8; size];
         raw[0..16].copy_from_slice(&type_guid);
         raw[16..32].copy_from_slice(&unique);
@@ -195,7 +210,10 @@ fn entries_of(img: &[u8], off: usize, h: &Header, what: &'static str) -> Result<
     if crc32(arr) != crc {
         return Err(Error::EntriesCrc(what));
     }
-    Ok(arr.chunks(h.entry_size as usize).map(|c| Entry { raw: c.to_vec() }).collect())
+    Ok(arr
+        .chunks(h.entry_size as usize)
+        .map(|c| Entry { raw: c.to_vec() })
+        .collect())
 }
 
 impl Gpt {
@@ -208,8 +226,15 @@ impl Gpt {
         if primary.my_lba != 1 {
             return Err(Error::Mismatch("the primary header is not at LBA 1"));
         }
-        let entries = entries_of(head, primary.entries_lba as usize * block, &primary, "primary entries")?;
-        if primary.alt_lba < tail_lba || ((primary.alt_lba - tail_lba) as usize + 1) * block > tail.len() {
+        let entries = entries_of(
+            head,
+            primary.entries_lba as usize * block,
+            &primary,
+            "primary entries",
+        )?;
+        if primary.alt_lba < tail_lba
+            || ((primary.alt_lba - tail_lba) as usize + 1) * block > tail.len()
+        {
             return Err(Error::Plan(format!("the tail image (from LBA A#{tail_lba}, {} bytes) does not hold the backup header at LBA A#{}", tail.len(), primary.alt_lba)));
         }
         let bo = (primary.alt_lba - tail_lba) as usize * block;
@@ -217,21 +242,36 @@ impl Gpt {
         if backup.entries_lba < tail_lba {
             return Err(Error::Short("tail: the backup entries start before it"));
         }
-        let backup_entries = entries_of(tail, (backup.entries_lba - tail_lba) as usize * block, &backup, "backup entries")?;
+        let backup_entries = entries_of(
+            tail,
+            (backup.entries_lba - tail_lba) as usize * block,
+            &backup,
+            "backup entries",
+        )?;
         if backup.my_lba != primary.alt_lba || backup.alt_lba != 1 {
             return Err(Error::Mismatch("header locations"));
         }
-        if backup.first_usable != primary.first_usable || backup.last_usable != primary.last_usable || backup.disk_guid != primary.disk_guid {
+        if backup.first_usable != primary.first_usable
+            || backup.last_usable != primary.last_usable
+            || backup.disk_guid != primary.disk_guid
+        {
             return Err(Error::Mismatch("usable range or disk GUID"));
         }
         if backup_entries != entries {
             return Err(Error::Mismatch("entry arrays"));
         }
-        Ok(Gpt { block, primary, backup, entries })
+        Ok(Gpt {
+            block,
+            primary,
+            backup,
+            entries,
+        })
     }
 
     pub fn find(&self, name: &str) -> Option<usize> {
-        self.entries.iter().position(|e| !e.empty() && e.name() == name)
+        self.entries
+            .iter()
+            .position(|e| !e.empty() && e.name() == name)
     }
 
     /// Room for entries before the first partition (primary) and before the backup header (backup), in entries.
@@ -247,12 +287,22 @@ impl Gpt {
         if self.find("ferros").is_some() {
             return Err(Error::Plan("there is a ferros partition already".into()));
         }
-        let u = self.find("userdata").ok_or(Error::Plan("no userdata partition".into()))?;
+        let u = self
+            .find("userdata")
+            .ok_or(Error::Plan("no userdata partition".into()))?;
         let ud = &self.entries[u];
         if ud.last() != self.primary.last_usable {
-            return Err(Error::Plan(format!("userdata ends at LBA A#{}, not at the last usable LBA A#{}", ud.last(), self.primary.last_usable)));
+            return Err(Error::Plan(format!(
+                "userdata ends at LBA A#{}, not at the last usable LBA A#{}",
+                ud.last(),
+                self.primary.last_usable
+            )));
         }
-        if self.entries.iter().any(|e| !e.empty() && e.first() > ud.first()) {
+        if self
+            .entries
+            .iter()
+            .any(|e| !e.empty() && e.first() > ud.first())
+        {
             return Err(Error::Plan("userdata is not the last partition".into()));
         }
         let b = self.block as u64;
@@ -261,7 +311,9 @@ impl Gpt {
         let blocks = userdata_bytes / ALIGN_BYTES * align;
         let ferros_first = (start + blocks).div_ceil(align) * align;
         if blocks == 0 || ferros_first > self.primary.last_usable {
-            return Err(Error::Plan(format!("userdata of A#{userdata_bytes} bytes leaves nothing for ferros")));
+            return Err(Error::Plan(format!(
+                "userdata of A#{userdata_bytes} bytes leaves nothing for ferros"
+            )));
         }
         // A free slot below the count, else the count grows into the reserved blocks.
         let slot = match self.entries.iter().position(|e| e.empty()) {
@@ -269,28 +321,45 @@ impl Gpt {
             None => {
                 let room = self.entry_room();
                 if room < GROWN_COUNT {
-                    return Err(Error::Plan(format!("every entry slot is used and the table has room for only A#{room}")));
+                    return Err(Error::Plan(format!(
+                        "every entry slot is used and the table has room for only A#{room}"
+                    )));
                 }
                 let s = self.entries.len();
                 let es = self.primary.entry_size as usize;
-                self.entries.resize(GROWN_COUNT as usize, Entry { raw: vec![0; es] });
+                self.entries
+                    .resize(GROWN_COUNT as usize, Entry { raw: vec![0; es] });
                 self.primary.count = GROWN_COUNT;
                 self.backup.count = GROWN_COUNT;
                 s
             }
         };
         self.entries[u].set_last(start + blocks - 1);
-        let h = blake3::Hasher::new().update(b"ferros partition").update(&self.primary.disk_guid).finalize();
+        let h = blake3::Hasher::new()
+            .update(b"ferros partition")
+            .update(&self.primary.disk_guid)
+            .finalize();
         let mut unique: [u8; 16] = h.as_bytes()[..16].try_into().unwrap();
         // RFC 4122 version 4 / variant 1 bits, as a random GUID carries.
         unique[7] = (unique[7] & 0x0F) | 0x40;
         unique[8] = (unique[8] & 0x3F) | 0x80;
-        self.entries[slot] = Entry::new(self.primary.entry_size as usize, FERROS_TYPE, unique, ferros_first, self.primary.last_usable, "ferros");
+        self.entries[slot] = Entry::new(
+            self.primary.entry_size as usize,
+            FERROS_TYPE,
+            unique,
+            ferros_first,
+            self.primary.last_usable,
+            "ferros",
+        );
         Ok(())
     }
 
     fn array(&self) -> Vec<u8> {
-        let mut a: Vec<u8> = self.entries.iter().flat_map(|e| e.raw.iter().copied()).collect();
+        let mut a: Vec<u8> = self
+            .entries
+            .iter()
+            .flat_map(|e| e.raw.iter().copied())
+            .collect();
         let b = self.block;
         a.resize(a.len().div_ceil(b) * b, 0);
         a
@@ -307,31 +376,67 @@ impl Gpt {
             v
         };
         vec![
-            Write { lba: 1, bytes: header(&self.primary) },
-            Write { lba: self.primary.entries_lba, bytes: arr.clone() },
-            Write { lba: self.backup.entries_lba, bytes: arr },
-            Write { lba: self.backup.my_lba, bytes: header(&self.backup) },
+            Write {
+                lba: 1,
+                bytes: header(&self.primary),
+            },
+            Write {
+                lba: self.primary.entries_lba,
+                bytes: arr.clone(),
+            },
+            Write {
+                lba: self.backup.entries_lba,
+                bytes: arr,
+            },
+            Write {
+                lba: self.backup.my_lba,
+                bytes: header(&self.backup),
+            },
         ]
     }
 
     /// The images with this table written into them (for reading back with `read`, before anything goes to a device).
     pub fn apply(&self, head: &mut [u8], tail: &mut [u8], tail_lba: u64) {
         for w in self.writes() {
-            let (img, off) = if w.lba < tail_lba { (&mut *head, w.lba as usize * self.block) } else { (&mut *tail, (w.lba - tail_lba) as usize * self.block) };
+            let (img, off) = if w.lba < tail_lba {
+                (&mut *head, w.lba as usize * self.block)
+            } else {
+                (&mut *tail, (w.lba - tail_lba) as usize * self.block)
+            };
             img[off..off + w.bytes.len()].copy_from_slice(&w.bytes);
         }
     }
 
     /// One line per partition, in disk order.
     pub fn table(&self) -> String {
-        let mut idx: Vec<usize> = (0..self.entries.len()).filter(|&i| !self.entries[i].empty()).collect();
+        let mut idx: Vec<usize> = (0..self.entries.len())
+            .filter(|&i| !self.entries[i].empty())
+            .collect();
         idx.sort_by_key(|&i| self.entries[i].first());
         let b = self.block as u64;
-        let mut s = format!("block A#{}, entries A#{} (room for A#{}), usable LBA A#{}..=A#{}\n", self.block, self.entries.len(), self.entry_room(), self.primary.first_usable, self.primary.last_usable);
+        let mut s = format!(
+            "block A#{}, entries A#{} (room for A#{}), usable LBA A#{}..=A#{}\n",
+            self.block,
+            self.entries.len(),
+            self.entry_room(),
+            self.primary.first_usable,
+            self.primary.last_usable
+        );
         for i in idx {
             let e = &self.entries[i];
             let bytes = (e.last() - e.first() + 1) * b;
-            s += &format!("  slot A#{i:<3} {:<20} LBA A#{}..=A#{}  A#{} MiB{}\n", e.name(), e.first(), e.last(), bytes >> 20, if e.attrs() != 0 { format!("  attrs G#{:X}", e.attrs()) } else { String::new() });
+            s += &format!(
+                "  slot A#{i:<3} {:<20} LBA A#{}..=A#{}  A#{} MiB{}\n",
+                e.name(),
+                e.first(),
+                e.last(),
+                bytes >> 20,
+                if e.attrs() != 0 {
+                    format!("  attrs G#{:X}", e.attrs())
+                } else {
+                    String::new()
+                }
+            );
         }
         s
     }
@@ -351,7 +456,10 @@ mod tests {
         let h = blake3::hash(b"ferros");
         let g = &h.as_bytes()[..16];
         // GPT's mixed-endian form of the text GUID made from those bytes.
-        let disk = [g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]];
+        let disk = [
+            g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11], g[12], g[13],
+            g[14], g[15],
+        ];
         assert_eq!(disk, FERROS_TYPE);
     }
 }

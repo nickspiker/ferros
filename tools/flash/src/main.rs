@@ -138,9 +138,6 @@ mod phone {
         }
     }
 
-    /// What a person on Windows does when the bootloader shows but cannot be opened (docs/FLASHER.md "Windows and the driver").
-    const WINUSB: &str = "On Windows the phone's bootloader needs the WinUSB driver: install Google's USB driver (https://developer.android.com/studio/run/win-usb), or in Device Manager let Windows Update install \"Android Bootloader Interface\", then run the guide again.";
-
     /// The one phone to talk to: the serial asked for, else the only one there is.
     fn one(serial: Option<&str>) -> Result<usb::Found, String> {
         let found = usb::list()?;
@@ -149,12 +146,6 @@ mod phone {
             .filter(|f| serial.is_none_or(|s| f.serial == s))
             .collect();
         match m.len() {
-            // A Google device the computer sees without a fastboot interface: a phone in Android, or a bootloader whose driver is missing.
-            0 if !usb::google().is_empty() => Err(format!(
-                "a Google device is plugged in but no bootloader answers (USB ids {}). If the phone is in Android, power it off and hold power and volume down. {}",
-                usb::google().iter().map(|(v, p)| format!("G#{v:04X}:{p:04X}")).collect::<Vec<_>>().join(", "),
-                if cfg!(windows) { WINUSB } else { "" }
-            )),
             0 => Err("no phone in fastboot (plugged in, and in its bootloader: hold power and volume down)".into()),
             1 => Ok(m.remove(0)),
             _ => Err("more than one phone in fastboot: name one by its serial".into()),
@@ -198,39 +189,175 @@ mod phone {
         }
     }
 
+    /// The phone in fastboot, opened: on Windows, Google's USB driver installed first when the phone cannot be opened (driver.rs), with the person's yes.
+    fn find(log: &Log) -> (usb::Found, Usb) {
+        loop {
+            let seen = usb::scan().unwrap_or_else(|e| die(e));
+            let fastboot: Vec<_> = seen
+                .iter()
+                .filter_map(|s| {
+                    if let usb::Seen::Fastboot(f) = s {
+                        Some(f.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let nodriver: Vec<_> = seen
+                .iter()
+                .filter_map(|s| {
+                    if let usb::Seen::NoDriver { vid, pid, why } = s {
+                        Some((*vid, *pid, why.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let other = seen.iter().any(|s| matches!(s, usb::Seen::Other { .. }));
+            for (vid, pid, why) in &nodriver {
+                note(
+                    log,
+                    Ev::warn("find", "a Google device this computer cannot open: {}")
+                        .t(why)
+                        .u("vid", *vid as u64)
+                        .u("pid", *pid as u64),
+                );
+            }
+            if fastboot.len() == 1 {
+                let f = fastboot[0].clone();
+                match Usb::open(&f) {
+                    Ok(u) => {
+                        note(
+                            log,
+                            Ev::info("find", "the bootloader opened")
+                                .u("vid", f.vid as u64)
+                                .u("pid", f.pid as u64),
+                        );
+                        return (f, u);
+                    }
+                    Err(e) => {
+                        note(
+                            log,
+                            Ev::error("find", "the bootloader is there but cannot be opened: {}")
+                                .t(&e)
+                                .u("vid", f.vid as u64)
+                                .u("pid", f.pid as u64),
+                        );
+                        if cfg!(windows) {
+                            offer_driver(log, &e);
+                            continue;
+                        }
+                        die(format!(
+                            "the phone's bootloader is there but cannot be opened: {e}"
+                        ));
+                    }
+                }
+            }
+            let why = if fastboot.len() > 1 {
+                "More than one phone is in fastboot: leave one plugged in.".to_string()
+            } else if let Some((_, _, why)) = nodriver.first() {
+                if cfg!(windows) {
+                    offer_driver(log, why);
+                    continue;
+                }
+                format!("This computer sees the phone but cannot open it ({why}). On Linux, reaching it without root needs a udev rule for USB vendor 18d1 (most distributions' android-udev package has it).")
+            } else if other {
+                "The phone is plugged in but not in its bootloader. Power it off, then hold power and volume down until the bootloader screen shows.".to_string()
+            } else {
+                "No phone found. Plug it in, in its bootloader (power it off, then hold power and volume down).".to_string()
+            };
+            note(log, Ev::warn("find", "{}").t(&why));
+            println!("{why}");
+            if !ask("Try again?") {
+                die("stopped: no phone");
+            }
+        }
+    }
+
+    /// Windows cannot open the phone: offer Google's own USB driver, said in full first, installed only on a typed yes; then the person replugs and the search runs again.
+    fn offer_driver(log: &Log, why: &str) {
+        use ferros_flash::driver;
+        println!();
+        println!("Windows cannot open the phone yet: it has no driver for it ({why}).");
+        println!("ferros-flash can install Google's own USB driver for it:");
+        println!(
+            "  0. download it from Google: {} (A#{} bytes),",
+            driver::URL,
+            driver::SIZE
+        );
+        println!(
+            "  1. check it is exactly the file Google published (SHA-256 {}),",
+            driver::SHA256
+        );
+        println!("  2. install it with Windows' own pnputil, which asks you once for administrator rights.");
+        println!("Nothing else is installed: no Android tools, no adb.");
+        note(
+            log,
+            Ev::info("driver", "offered Google's USB driver")
+                .id("url", driver::URL)
+                .words("why", why),
+        );
+        if !ask("Install Google's USB driver?") {
+            note(
+                log,
+                Ev::info("driver", "the person chose not to install it"),
+            );
+            println!("{}", driver::BY_HAND);
+            die("stopped: no driver");
+        }
+        let r = driver::install(
+            |url| {
+                let r = ureq::get(url).call().map_err(|e| e.to_string())?;
+                let mut b = Vec::new();
+                std::io::Read::read_to_end(&mut r.into_reader(), &mut b)
+                    .map_err(|e| e.to_string())?;
+                Ok(b)
+            },
+            |st| {
+                println!(
+                    "  {} {}: {}",
+                    if st.ok { "done" } else { "FAILED" },
+                    st.what,
+                    st.words
+                );
+                let ev = if st.ok {
+                    Ev::info("driver", "{}: {}")
+                } else {
+                    Ev::error("driver", "{}: {}")
+                };
+                note(log, ev.t(st.what).t(&st.words).flag("ok", st.ok));
+            },
+        );
+        match r {
+            Ok(()) => {
+                say(
+                    log,
+                    Ev::info("driver", "installed; asked the person to replug"),
+                    "Google's USB driver is installed. Unplug the phone and plug it back in.",
+                );
+                print!("Then press Enter: ");
+                let _ = std::io::stdout().flush();
+                let mut line = String::new();
+                let _ = std::io::stdin().lock().read_line(&mut line);
+            }
+            Err(e) => {
+                println!("Google's USB driver could not be installed: {e}");
+                println!("{}", driver::BY_HAND);
+                die("stopped: no driver");
+            }
+        }
+    }
+
     /// The walk thru, as far as it is built: every step says what it will do, and stops before anything it cannot yet do.
     pub fn guide() {
         let log = open_log("guide");
         println!("ferros-flash {VERSION}: put ferros on a Pixel.");
         println!("Each step says what it will do before it does it. Nothing is written to the phone without your yes.");
-        println!("Everything this run does is kept in the log named above; you can send it to us at any point (ferros-flash log report).");
+        println!("Everything this run does is kept in the log named above; you can send it to us at any point (ferros-flash log send).");
         println!();
         say(&log, Ev::info("find", "looking for a phone in fastboot"), "Step 0: find the phone. Put it in its bootloader (power it off, then hold power and volume down) and plug it in.");
-        let f = loop {
-            match one(None) {
-                Ok(f) => break f,
-                Err(e) => {
-                    note(&log, Ev::warn("find", "{}").t(&e));
-                    if !ask(&format!("{e}. Try again?")) {
-                        die("stopped: no phone");
-                    }
-                }
-            }
-        };
-        let mut fb = match Usb::open(&f) {
-            Ok(u) => Fastboot::new(u, Board::akita()),
-            Err(e) => {
-                // On Windows this is where a missing WinUSB driver shows.
-                note(
-                    &log,
-                    Ev::error("find", "the phone is there but cannot be opened: {}")
-                        .t(&e)
-                        .u("vid", f.vid as u64)
-                        .u("pid", f.pid as u64),
-                );
-                die(format!("{e}\n{WINUSB}"));
-            }
-        };
+        let (f, u) = find(&log);
+        let mut fb = Fastboot::new(u, Board::akita());
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let l2 = lines.clone();
         fb.on_line = Some(Box::new(move |s| l2.lock().unwrap().push(s.to_string())));

@@ -72,8 +72,8 @@ Write-Host ""
 Say "Notes for this first test:" Yellow
 Say "  ferros-flash is not yet code-signed for Windows (Authenticode)," Yellow
 Say "  so Windows may warn that it is from an unknown publisher." Yellow
-Say "  The phone's bootloader needs the WinUSB driver; if the guide says" Yellow
-Say "  the phone cannot be opened, it says what to install." Yellow
+Say "  If Windows has no driver for the phone, the guide offers to install" Yellow
+Say "  Google's own USB driver (one administrator prompt); no Android tools." Yellow
 Say "  Every run keeps a log in $runs;" Yellow
 Say "  please send it to us whatever happens (ferros-flash log send)." Yellow
 Write-Host ""

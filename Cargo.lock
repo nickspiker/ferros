@@ -834,6 +834,7 @@ dependencies = [
  "ed25519-dalek",
  "ferros_kist",
  "nusb",
+ "sha2",
  "tokio",
  "ureq",
  "vsf 0.11.0",

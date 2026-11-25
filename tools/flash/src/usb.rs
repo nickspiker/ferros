@@ -1,6 +1,6 @@
 //! The fastboot transport on a real phone: nusb (plain Rust on Linux, macOS and Windows, no libusb), the crate the bridge already uses.
 //! A bootloader in fastboot shows one interface of class G#FF, subclass G#42, protocol G#03 with a bulk endpoint each way; that triple finds it, whatever its USB ids.
-//! On Windows nusb needs the WinUSB driver bound to that interface; whether the Pixel's bootloader asks Windows for it by itself (Microsoft OS descriptors) is docs/FLASHER.md's open measurement.
+//! On Windows nusb needs the WinUSB driver bound to that interface; when it is not, the guide installs Google's own USB driver package (the CLI's driver.rs).
 
 use crate::fastboot::Transport;
 use nusb::transfer::{Direction, EndpointType, RequestBuffer};
@@ -21,35 +21,117 @@ pub struct Found {
     pub info: nusb::DeviceInfo,
 }
 
-/// Every phone in fastboot on this computer.
-pub fn list() -> Result<Vec<Found>, String> {
-    let all = nusb::list_devices().map_err(|e| format!("listing USB devices: {e}"))?;
-    Ok(all
-        .filter_map(|d| {
-            let i = d.interfaces().find(|i| {
-                i.class() == CLASS && i.subclass() == SUBCLASS && i.protocol() == PROTOCOL
-            })?;
-            Some(Found {
-                vid: d.vendor_id(),
-                pid: d.product_id(),
-                serial: d.serial_number().unwrap_or("").to_string(),
-                bus: d.bus_number(),
-                interface: i.interface_number(),
-                info: d.clone(),
-            })
-        })
-        .collect())
+/// A Google device as this computer sees it.
+#[derive(Clone, Debug)]
+pub enum Seen {
+    /// A bootloader in fastboot, its interface found.
+    Fastboot(Found),
+    /// A Google device this computer cannot open (on Windows: no WinUSB driver bound to it), with the system's own words.
+    NoDriver { vid: u16, pid: u16, why: String },
+    /// A Google device that is not in fastboot (the phone in Android): its USB ids.
+    Other { vid: u16, pid: u16 },
 }
 
-/// Every Google device (USB vendor G#18D1) the computer lists, fastboot or not: its USB ids.
-pub fn google() -> Vec<(u16, u16)> {
-    nusb::list_devices()
-        .map(|all| {
-            all.filter(|d| d.vendor_id() == 0x18D1)
-                .map(|d| (d.vendor_id(), d.product_id()))
-                .collect()
+const GOOGLE: u16 = 0x18D1;
+/// The ADB interface (G#FF, G#42, G#01) of a phone in Android, checked on Windows so the driver goes on before the phone is even in its bootloader.
+const ADB_PROTOCOL: u8 = 0x01;
+
+fn found(d: &nusb::DeviceInfo, interface: u8) -> Found {
+    Found {
+        vid: d.vendor_id(),
+        pid: d.product_id(),
+        serial: d.serial_number().unwrap_or("").to_string(),
+        bus: d.bus_number(),
+        interface,
+        info: d.clone(),
+    }
+}
+
+/// The fastboot interface's number in an opened device's active configuration.
+fn fastboot_interface(dev: &nusb::Device) -> Option<u8> {
+    let config = dev.active_configuration().ok()?;
+    for i in config.interfaces() {
+        for a in i.alt_settings() {
+            if a.class() == CLASS && a.subclass() == SUBCLASS && a.protocol() == PROTOCOL {
+                return Some(a.interface_number());
+            }
+        }
+    }
+    None
+}
+
+/// Every phone in fastboot on this computer, and every other Google device with why it is not one.
+/// Windows lists no interfaces for a device with one interface (nusb reads them only from a composite device's children), so a Google device listed with none is opened and its configuration read: a bootloader without the WinUSB driver fails that open, which is how a missing driver shows.
+pub fn scan() -> Result<Vec<Seen>, String> {
+    let all = nusb::list_devices().map_err(|e| format!("listing USB devices: {e}"))?;
+    let mut out = Vec::new();
+    for d in all {
+        if let Some(i) = d
+            .interfaces()
+            .find(|i| i.class() == CLASS && i.subclass() == SUBCLASS && i.protocol() == PROTOCOL)
+        {
+            out.push(Seen::Fastboot(found(&d, i.interface_number())));
+            continue;
+        }
+        // A phone already running ferros (its own USB ids): not in its bootloader either.
+        if d.vendor_id() == 0x1209 && d.product_id() == 0x4665 {
+            out.push(Seen::Other { vid: d.vendor_id(), pid: d.product_id() });
+            continue;
+        }
+        if d.vendor_id() != GOOGLE {
+            continue;
+        }
+        let (vid, pid) = (d.vendor_id(), d.product_id());
+        if d.interfaces().next().is_none() {
+            match d.open() {
+                Err(e) => out.push(Seen::NoDriver {
+                    vid,
+                    pid,
+                    why: e.to_string(),
+                }),
+                Ok(dev) => match fastboot_interface(&dev) {
+                    Some(n) => out.push(Seen::Fastboot(found(&d, n))),
+                    None => out.push(Seen::Other { vid, pid }),
+                },
+            }
+            continue;
+        }
+        // A phone in Android: on Windows, whether its ADB interface has a driver (the same package covers it and the bootloader).
+        let adb = d
+            .interfaces()
+            .find(|i| {
+                i.class() == CLASS && i.subclass() == SUBCLASS && i.protocol() == ADB_PROTOCOL
+            })
+            .map(|i| i.interface_number());
+        match adb {
+            Some(n) if cfg!(windows) => {
+                match d.open().and_then(|dev| dev.claim_interface(n).map(|_| ())) {
+                    Err(e) => out.push(Seen::NoDriver {
+                        vid,
+                        pid,
+                        why: e.to_string(),
+                    }),
+                    Ok(()) => out.push(Seen::Other { vid, pid }),
+                }
+            }
+            _ => out.push(Seen::Other { vid, pid }),
+        }
+    }
+    Ok(out)
+}
+
+/// Every phone in fastboot on this computer.
+pub fn list() -> Result<Vec<Found>, String> {
+    Ok(scan()?
+        .into_iter()
+        .filter_map(|s| {
+            if let Seen::Fastboot(f) = s {
+                Some(f)
+            } else {
+                None
+            }
         })
-        .unwrap_or_default()
+        .collect())
 }
 
 /// An opened phone: its claimed interface and bulk endpoints.
