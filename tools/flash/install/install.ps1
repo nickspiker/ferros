@@ -1,25 +1,35 @@
-# ferros-flash installer for Windows (PowerShell), the same shape as Photon's install-release.ps1.
-# It downloads the tool, checks the download's SHA-256 against the one written into this script at publish time, and installs it for this user only (no administrator).
-# The tool then checks everything else it fetches (the boot images, the board manifests) by BLAKE3 against a release signed with the ferros key, before it writes anything to the phone.
-# PowerShell has SHA-256 built in and not BLAKE3, so this one check, of the tool itself, is SHA-256; nothing after it is.
-# Run: powershell -ExecutionPolicy Bypass -c "iex (irm __BASE__/install.ps1 | Out-String)"
-# `Out-String` makes the script one string whatever Invoke-RestMethod hands back: on 2026-11-24 the owner's Windows PowerShell gave `| iex` the script a line at a time ("trap {" alone, then "Missing closing '}'"), so a bare `irm | iex` is not trusted.
+# ferros-flash installer for Windows (PowerShell), the same shape as Photon's.
+# It downloads the tool, checks its SHA-256 against the one publish.sh wrote
+# into this script, installs it for this user only (no administrator), and
+# starts the guide. The tool checks what it fetches later by BLAKE3 against a
+# release signed with the ferros key. PowerShell has SHA-256 built in and not
+# BLAKE3, so this one check, of the tool itself, is SHA-256.
+# Run it as a file, never thru Invoke-Expression (docs/FLASHER.md "The first
+# Windows test"): in PowerShell,
+#   irm __BASE__/install.ps1 -OutFile $env:TEMP\ferros-install.ps1
+#   powershell -ExecutionPolicy Bypass -File $env:TEMP\ferros-install.ps1
+# Every line here stays under 100 characters.
 
 $ErrorActionPreference = "Stop"
+# One line of words in one colour.
+function Say([string]$text, [string]$colour = "White") {
+    Write-Host $text -ForegroundColor $colour
+}
 trap {
     Write-Host ""
-    Write-Host "ERROR: $_" -ForegroundColor Red
-    Write-Host "Press Enter to exit..." -ForegroundColor Yellow
+    Say "ERROR: $_" Red
+    Say "Press Enter to exit..." Yellow
     Read-Host
     exit 1
 }
 
-Write-Host "ferros-flash installer" -ForegroundColor Cyan
+Say "ferros-flash installer" Cyan
 Write-Host ""
 
 $arch = $env:PROCESSOR_ARCHITECTURE
 if ($arch -ne "AMD64") {
-    Write-Host "This first build of ferros-flash is for 64-bit Intel and AMD Windows only (this computer is $arch)." -ForegroundColor Red
+    Say "This first build is for 64-bit Intel and AMD Windows only." Red
+    Say "This computer is $arch." Red
     exit 1
 }
 
@@ -27,7 +37,7 @@ if ($arch -ne "AMD64") {
 $base = "__BASE__"
 $expectedHash = "__SHA256_WINDOWS_X86_64__"
 if ($expectedHash -notmatch "^[0-9A-F]{64}$") {
-    Write-Host "This copy of the installer carries no hash: it was not published. Nothing was installed." -ForegroundColor Red
+    Say "This copy of the installer was not published: nothing installed." Red
     exit 1
 }
 
@@ -35,19 +45,19 @@ $installDir = "$env:LOCALAPPDATA\Programs\ferros-flash"
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 $exe = "$installDir\ferros-flash.exe"
 
-Write-Host "Downloading ferros-flash..." -ForegroundColor Yellow
-Invoke-WebRequest -Uri "$base/ferros-flash-windows-x86_64.exe" -OutFile $exe -ErrorAction Stop
+Say "Downloading ferros-flash..." Yellow
+Invoke-WebRequest -UseBasicParsing -Uri "$base/ferros-flash-windows-x86_64.exe" -OutFile $exe
 
-Write-Host "Checking the download..." -ForegroundColor Yellow
+Say "Checking the download..." Yellow
 $actualHash = (Get-FileHash $exe -Algorithm SHA256).Hash
 if ($actualHash -ne $expectedHash) {
-    Write-Host "The download is not the published ferros-flash." -ForegroundColor Red
-    Write-Host "  expected $expectedHash" -ForegroundColor Red
-    Write-Host "  got      $actualHash" -ForegroundColor Red
+    Say "The download is not the published ferros-flash." Red
+    Say "  expected $expectedHash" Red
+    Say "  got      $actualHash" Red
     Remove-Item $exe -ErrorAction SilentlyContinue
     exit 1
 }
-Write-Host "[OK] The download is the published ferros-flash" -ForegroundColor Green
+Say "[OK] The download is the published ferros-flash" Green
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if ($userPath -notlike "*$installDir*") {
@@ -55,13 +65,17 @@ if ($userPath -notlike "*$installDir*") {
     $env:Path += ";$installDir"
 }
 
+$runs = "$env:LOCALAPPDATA\ferros-flash\runs"
 Write-Host ""
-Write-Host "Installed to $installDir" -ForegroundColor Green
+Say "Installed to $installDir" Green
 Write-Host ""
-Write-Host "Notes for this first test:" -ForegroundColor Yellow
-Write-Host "  ferros-flash is not yet signed for Windows (Authenticode), so Windows may warn that it is from an unknown publisher." -ForegroundColor Yellow
-Write-Host "  Windows needs the WinUSB driver for the phone's bootloader; if the guide says the phone cannot be opened, see its note." -ForegroundColor Yellow
-Write-Host "  Every run keeps a log in $env:LOCALAPPDATA\ferros-flash\runs; please send it to us whatever happens." -ForegroundColor Yellow
+Say "Notes for this first test:" Yellow
+Say "  ferros-flash is not yet code-signed for Windows (Authenticode)," Yellow
+Say "  so Windows may warn that it is from an unknown publisher." Yellow
+Say "  The phone's bootloader needs the WinUSB driver; if the guide says" Yellow
+Say "  the phone cannot be opened, it says what to install." Yellow
+Say "  Every run keeps a log in $runs;" Yellow
+Say "  please send it to us whatever happens (ferros-flash log send)." Yellow
 Write-Host ""
-Write-Host "Starting the guide. (Later: open a new terminal and run ferros-flash.)" -ForegroundColor Cyan
+Say "Starting the guide. (Later: open a new terminal, run ferros-flash.)" Cyan
 & $exe guide
