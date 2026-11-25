@@ -141,7 +141,18 @@ The owner, 2026-11-24 ("Yes and yes"): OpenH264 (Cisco's H.264 codec, C++) on fe
 - **Known waits in OpenH264 itself:** a thread pool's start waits for its thread in 1 ms sleeps (`WelsThread::Start`) and its teardown in 10 ms sleeps, and `WelsMultipleEventsWaitSingleBlocking` without a master event tries each event and sleeps 1-2 us between rounds; these are upstream's, once per encoder at start and end, not per frame (the encoder's per-frame work waits on semaphores).
 - **The test:** `std/h264bench` (`tools/std-build.sh std/h264bench`, image 1.12 MB; spawn with no grants): the shims as C calls them (four pthreads counting under one mutex, a condition variable, a static-init guard raced, a semaphore round trip timed, `sem_timedwait` and `pthread_cond_timedwait` to a 2 ms deadline), the `openh264` crate's Encoder and Decoder with Photon's settings, then the raw API with fixed slice counts and encoder threads: 32 synthetic frames a case (a scrolling gradient, a textured square crossing, noise), baseline, 4 Mbit/s at 30 frames/s, each decoded and its luma PSNR checked against 30 dB.
 - **Host run** (x86_64, crates.io's 2.6.0 with its x86 assembly, the same program; a reference for the device's numbers, not a measure of it): 1280×720 one slice 6.1 ms encode, 3.4 ms decode a frame, PSNR-Y 35.0 mean; four slices on four threads 2.9 ms encode; 672×1496 (a quarter of the Pro's panel) eight slices on four threads 3.3 ms encode, 3.0 ms decode; every slice count came back as asked, every picture above 32 dB.
-- **On the device:** not yet run (the Pro was in use by the audio agent's Android capture; a run waits on the coordinator).
+- **On the device** (the Pro, 2026-11-24, b1176, one spawn from the farm build of forge 520a1b8d plus the watchdog below; threads unpinned on the kernel's A715 workers at whatever clocks they held, the display drawing beside it): everything passed and the process ended with exit 0. The shims: four pthreads counted 65536 of 65536 under one mutex, the static-init guard raced by four threads ran its initialiser once, a semaphore round trip between two threads took 3 us mean (12 us at most, 1024 trips), `sem_timedwait` and `pthread_cond_timedwait` to a 2 ms deadline answered ETIMEDOUT after 2027 and 2045 us. The openh264 crate with Photon's settings: 32 pictures at 1280×720, PSNR-Y at least 33.10 dB. The raw API, 32 frames a case (times in ms a frame, mean / median / largest):
+
+| Size | Slices | Encoder threads | Encode | Decode | Bytes a frame | PSNR-Y mean / min |
+|---|---|---|---|---|---|---|
+| 1280×720 | 1 | 1 | 18.1 / 19.4 / 26.2 | 5.2 / 5.5 / 9.5 | 16700 | 35.03 / 32.84 |
+| 1280×720 | 4 | 1 | 18.8 / 19.6 / 26.8 | 5.4 / 5.6 / 9.9 | 16667 | 34.66 / 32.40 |
+| 1280×720 | 4 | 4 | 9.3 / 9.3 / 15.7 | 5.4 / 5.4 / 9.9 | 16645 | 34.73 / 32.45 |
+| 672×1496 | 1 | 1 | 20.1 / 21.3 / 28.7 | 5.9 / 5.8 / 11.2 | 16650 | 34.20 / 32.50 |
+| 672×1496 | 8 | 4 | 8.4 / 8.3 / 12.1 | 5.9 / 5.7 / 10.6 | 16610 | 34.13 / 32.45 |
+
+  Every slice count came back as asked. The single-threaded cases match the host's 2.6.0 run to the byte and the hundredth of a dB (16700, 16667 and 16650 bytes a frame; 35.03, 34.66 and 34.20 dB): the NEON paths and the shims compute what upstream's x86 paths do. The threaded cases differ slightly from the host's (16645 bytes against 16604 at 720p): with threads the slices finish in an order the scheduler sets, which the rate control may follow (not checked run to run). Four threads halve the encode; decoding is one thread (Photon's path), 5 to 6 ms a frame at these sizes. Not yet measured: pinned or at lifted clocks, under a call's load, the decoder's own threads.
+- **The watchdog:** h264bench ends itself after 2^6 s (a real deadline, the Pro being shared: a deadlocked shim would otherwise leave its threads asleep there), saying so; SYS_EXIT ends every thread of the process. It did not fire.
 
 ## Order
 

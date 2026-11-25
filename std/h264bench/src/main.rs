@@ -371,7 +371,16 @@ fn posix_check() -> bool {
     ok
 }
 
+/// How long the whole run may take before the watchdog ends it: the bench runs in seconds, and the Pro is shared.
+const WATCHDOG_S: u64 = 1 << 6;
+
 fn main() {
+    // A real deadline, not a poll: if a shim deadlocked, the bench would sit on the shared device with its threads asleep; at the deadline it says so and the process ends (SYS_EXIT ends every thread of it).
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(WATCHDOG_S));
+        println!("h264bench: watchdog: still running after {WATCHDOG_S} s, ending");
+        std::process::exit(2);
+    });
     let v = unsafe { sys::source::APILoader::WelsGetCodecVersion() };
     println!("h264bench: OpenH264 {}.{}.{}", v.uMajor, v.uMinor, v.uRevision);
     #[cfg(target_os = "ferros")]
