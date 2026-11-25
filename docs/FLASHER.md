@@ -11,6 +11,13 @@ So the flasher offers no keep-Android option, and every hosted image is a produc
 
 Owner, 2026-11-24, on the boot: "no 1s boot gate or green arrow, just straight to ferros since the google nag is already obnoxious."
 
+The owner's answers, 2026-11-24 (relayed by the coordinator):
+- Hosting: "R2", ferros.org on R2 as Photon's is served; deploys to ferros.org need no further go. Built: the bucket `ferros` at https://get.ferros.org.
+- The image: "Bare ferros, no hypervisor".
+- userdata: "Sure!", a 1 GiB floor holding the device-only secret, so a bootloader unlock destroys the device-class keys with no writes of ours.
+- USB doors: "Yes": the production install door (open only while no ferros partition exists), the signed-only update door, and the signed-only boot-slot write for the A/B updater.
+- Logs: "big yes": fgtw.org/report, consent per report, the serial blinded by default; fgtw.org deploys need no go, handles, keys and location kept out by construction. Built (below, "Submitting").
+
 The targets are the Pixel 8a (akita, the first real-world test, from a Windows PC) and the Pixel 8 Pro (husky).
 
 ## What a person does
@@ -35,8 +42,8 @@ Every step says what it will do before it does it, every write is read back, and
 | `ferros-flash provision` | not built: needs the production install door (below) | |
 | 2 Native fastboot | built, host-tested against a scripted bootloader; not yet run on a phone | tools/flash/src/fastboot.rs, usb.rs |
 | 3 The guide | built to the lock step (find, name, lock state, unlock walkthrough, the plan); stops before the backup | tools/flash/src/main.rs `guide` |
-| 4 Distribution | built: the signed release (VSF, BLAKE3 names), staging, the PowerShell and sh installers; nothing uploaded | tools/flash/src/release.rs, publish.sh, install/ |
-| 5 Logging | built and host-tested: the run log, the submit report | tools/flash/src/runlog.rs |
+| 4 Distribution | built and live: the signed release (VSF, BLAKE3 names), the PowerShell and sh installers, on https://get.ferros.org (R2 bucket `ferros`) | tools/flash/src/release.rs, publish.sh, install/ |
+| 5 Logging | built and live: the run log, `log send` to fgtw.org/report on a typed yes, the endpoint, `reports.sh` to read what came | tools/flash/src/runlog.rs, reports.sh; fgtw-bootstrap `handle_report` |
 | Production images | Android paths compiled out of the kernel and the hv; image composition proposed (bare ferros) | below |
 | Updating while locked | designed, for the owner | below |
 | The fluor GUI, code signing | later; signing is the owner's cost decision | |
@@ -103,7 +110,7 @@ It stops there and says so: the backup, the carve and the flash run thru ferros 
 3. Thru that door the tool reads the calibration partitions (the backup), reads both boot slots back (the flash's verification), reads the GPT, plans the carve on the computer (lib.rs `carve`, the board's floor), and sends the changed blocks; the kernel checks the new table itself (every entry kept but userdata's end and the new `ferros`) before writing, and reads it back.
 4. Reboot: the vault is created on the new partition, the release's capsules are stored thru the same door and read back, and the tool checks each process came up.
 
-The install door is kernel work (a production door, so the owner's to approve): ask the coordinator for a slot.
+The install door is kernel work, approved by the owner (2026-11-24: "Yes"); it needs a device slot from the coordinator.
 
 ## 4. Distribution
 
@@ -112,7 +119,7 @@ The same shape as Photon's install (photon README "Installation", installers/ins
 - **SHA-256 at the bootstrap only.** PowerShell has SHA-256 built in and no BLAKE3, and few systems have b3sum, so the installer's one check of the tool itself is SHA-256, as Photon's. Everything the tool fetches after that is BLAKE3 in VSF.
 - **The release** (release.rs): one VSF document Ed25519-signed with the ferros key (keys/ferros.key.vsf; the tool pins keys/ferros.pub), section `release` (channel, the commit) and one `artefact` section a file (role, name, board, platform, size, BLAKE3 `hb`). Every file is served under its BLAKE3 in hex, so a host can swap nothing.
 - **publish.sh** builds the Windows (x86_64-pc-windows-gnu, from this host) and Linux executables, the board manifests, any boot images given, signs the release, writes the installers and stages it all; it uploads only when told (`FERROS_FLASH_UPLOAD=r2:<bucket>/<path>`, Photon's route). macOS waits for a mac build host.
-- **The host is the owner's to pick** (ferros.org, fgtw.org, or holdmyoscilloscope where Photon lives). Recommended: **ferros.org**, on R2 behind it as Photon's is: it is the OS's own name, people will look for it there; fgtw.org is the network's bootstrap and FGTW is a DUNA nobody owns, so ferros's images there blur that; holdmyoscilloscope is the owner's personal site. The base is one variable, so a move is a republish.
+- **The host** (owner, 2026-11-24: "R2"): the R2 bucket `ferros`, its custom domain https://get.ferros.org (made 2026-11-24). `tools/flash/publish.sh --upload` puts the staged release there under the R2 token in keys/: files named by their BLAKE3 cached for good, the installers, the fixed-name executables and release.vsf with `no-cache`, so an edge never pairs an old executable with a new installer. The one lines: `powershell -ExecutionPolicy Bypass -c "irm https://get.ferros.org/install.ps1 | iex"` and `curl -sSfL https://get.ferros.org/install.sh | sh`.
 - **Code signing** (Authenticode, and Developer ID for macOS) is the owner's cost decision. Until then the executable is unsigned, the installer says Windows may warn of an unknown publisher, and the signed release is what vouches for the images.
 
 ## 5. Logging
@@ -125,18 +132,23 @@ The same shape as Photon's install (photon README "Installation", installers/ins
 
 **On the phone.** The flash log is the ledger's ring (ferros_ledger): every entry a complete VSF document with its provenance hash, chained by BLAKE3, its words sealed under the ira-derived system key (personal entries under the person's key). The host pulls it today with `ferros-bridge diag log [--raw]` (the kernel opens the entries for the answer), but that is a development door, closed in production. Proposed: the install door and a production `log` door hand the tool the system entries sealed as stored plus the kernel's opened copy only while the device is unlocked or the person approves on the phone, so a submitted report can carry the phone's side of the run.
 
-**Submitting, proposed (nothing built on the server).**
-- Where: `https://fgtw.org/report` (POST of the report document; fgtw.org already takes VSF from devices). What it takes: the document checked (VSF, provenance hash, size cap), stored under its BLAKE3, the answer that hash so the person can quote it.
-- Privacy: the report carries no handle, key or location by construction; the serial is blinded by default; the computer's address is not stored with it. The person sees what will be sent (`log show`) and types yes; nothing is sent on its own.
-- Consent: per report, never a standing setting.
-- To build: an fgtw route and its store, a `ferros-flash log send` command. Proposed before building, as asked.
+**Submitting (built 2026-11-24; the owner: "big yes").**
+- **The person's side:** `ferros-flash log send [run] [--keep-serial]` (the newest run when none is named), and the guide offers it at its end; every way out of the tool names the run's log and this command. Before anything is sent it says where it goes, how big it is, how many records, that it holds no handle, key, location or file, whether the serial is blinded, how long it is kept, and how to read every line of it (`log show`); it sends only on a typed yes. The consent and fgtw.org's answer are added to that run's own log.
+- **The endpoint:** `POST https://fgtw.org/report` (fgtw-bootstrap `handle_report`). It takes a report only whole and clean: the report and every record checked by provenance hash; one `report` section of known fields; each `record` one `log` section; refused if anything carries a key, a signature, a MAC, handle material (`hP`, `hI`, `hV`), a place (`w`, `wm`, `wa`) or a network address (`n*`), or a `serial` the report says was left out; at most 16 MiB. The answer is `report_taken` with the report's BLAKE3, which the person quotes to us; a refusal is an `error` section with its reason.
+- **The privacy rules:**
+  - Nothing is sent without the person's typed yes, per report; there is no standing setting and nothing is sent on its own, a crash included.
+  - A report never holds a handle, a key, a location or the contents of the phone's partitions: the tool never writes them into a run, and the endpoint refuses any report whose values are of those kinds.
+  - The phone's serial is replaced by its keyed BLAKE3 unless the person keeps it in (`--keep-serial`).
+  - No device key or identity is asked for; the sender's address is neither stored nor logged with it.
+  - Kept 2^5 days under `ferros-reports/<Eagle time>-<BLAKE3>.vsf` in the bucket fgtw-data, then deleted by the hourly sweep.
+- **Reading them:** `tools/flash/reports.sh [hash]` lists what came, fetches each once into target/flash-reports, unpacks it back into a run log (`log unpack`) and renders it.
 
 ## Production images
 
 Hosted images are production builds (owner, 2026-11-24), and production has no way into Android:
 - **Built (2026-11-24):** the hv's gate honours no ANDROID_ONCE or RECOVERY_ONCE in a production build (ferros, or fastboot when no ferros is packed); the kernel's ANDROID_ONCE writer, the boot-time Android branch, the Start into launch, the Android launch and the recovery "yes" are compiled out (`cfg(ferros_production)`), so a production build that still referred to them would not compile. The gate screen, the 1 s wait and the arrow were already compiled out of production in both the kernel (ready.rs) and the hv (gate.rs).
 - **Left for the map's owner:** the Settings page "Android" still shows in a production build (payloads/map PAGES); its controls set requests the production kernel no longer acts on. It should be absent there.
-- **Proposed: the hosted image is bare ferros**, `ferros-mkimg boot` with its AVB footer, no hv and no Linux Image. The gate format needs a Linux Image packed in front of ferros, and that Image is Google's Android kernel for one Android build: hosting it is hosting an image that runs Android, and it would be one image per Android build. Without Android the hv gives ferros nothing it needs: the UFS firewall, the chords into Android and the key routing exist for Android; the killswitch is the kernel's. A bare boot loses the jump-style restart (ferros reboots thru the bootloader instead) and the hv's early fastboot escape (ABL's own power + volume down remains). akita marked its slot only thru the hv; a production build now marks it bare too (main.rs), which the A/B updater needs.
+- **The hosted image is bare ferros** (owner, 2026-11-24: "Bare ferros, no hypervisor"), `ferros-mkimg boot` with its AVB footer, no hv and no Linux Image. The gate format needs a Linux Image packed in front of ferros, and that Image is Google's Android kernel for one Android build: hosting it is hosting an image that runs Android, and it would be one image per Android build. Without Android the hv gives ferros nothing it needs: the UFS firewall, the chords into Android and the key routing exist for Android; the killswitch is the kernel's. A bare boot loses the jump-style restart (ferros reboots thru the bootloader instead) and the hv's early fastboot escape (ABL's own power + volume down remains). akita marked its slot only thru the hv; a production build now marks it bare too (main.rs), which the A/B updater needs.
 
 ## Updating while locked (owner, 2026-11-24: to build before the first locked deploy)
 
@@ -153,7 +165,7 @@ Hosted images are production builds (owner, 2026-11-24), and production has no w
 - **What it is:** Android's "OEM unlocking" switch, which ferros must set itself as there is no Android. ON by default for the first deploys, behind an approve, the page saying plainly: with it on, anyone holding the phone can unlock it; unlocking wipes userdata, and ferros's device-class data (settings, stowed kists, cached wallpaper) becomes readable to whoever unlocks it, while the person's identity and fleet stay closed.
 - **Where the flag lives, found so far:** Android writes the last byte of `frp` (LU0 LBA 37126..=37253 on both phones, 512 KiB; husky's read 1 on 2026-11-01), with a SHA-256 over the partition after its first 32 bytes in those 32 bytes (AOSP's PersistentDataBlockService, from memory, unverified); a later Android boot wipes frp if the digest is wrong. But on Pixels with a Titan M2 the bootloader most likely asks Titan's own device lock (the AVB app's SetDeviceLock, which Android's Titan-backed OemLock service also sets), reached on zuma thru GSA (`GSA_MB_CMD_GSC_NOS_CALL`). Not proven from the trees: no oemlock HAL, no `get_unlock_ability` handler, no ABL log of it.
 - **The measurement first, on the 8a** (unlocked today; one boot of ferros): `fastboot flashing get_unlock_ability`, then ferros sets frp's last byte to 0 with the digest recomputed, then `get_unlock_ability` again. If it follows frp, (b) is an frp write behind the approve. If not, (b) is a Titan call thru GSA, and Titan may refuse it from anything but Android; that would make (b) much harder and is the owner's to weigh.
-- **A proposal that falls out of it:** keep ferros's device-only secret (the salt of the device-class keys) in the small userdata partition the carve leaves. The bootloader's unlock erases userdata, so an unlock becomes the key shred by the bootloader's own hand ("Claude memories/feedback_no_needless_writes.md": destroying data is destroying its keys), and the device-class data a thief would read after unlocking is noise.
+- **Decided (owner, 2026-11-24: "Sure!"):** keep ferros's device-only secret (the salt of the device-class keys) in the small userdata partition the carve leaves. The bootloader's unlock erases userdata, so an unlock becomes the key shred by the bootloader's own hand ("Claude memories/feedback_no_needless_writes.md": destroying data is destroying its keys), and the device-class data a thief would read after unlocking is noise.
 
 ### (c) Kernel updates thru the vault's kernel ring
 
@@ -173,17 +185,14 @@ This is not built and needs measuring on the 8a before any lock (none is ever se
 ## The first Windows test (what it looks like today)
 
 On the owner's Windows PC, with the 8a in its bootloader on the cable:
-0. `powershell -ExecutionPolicy Bypass -c "irm <base>/install.ps1 | iex"` (once the release is staged and uploaded to the chosen host).
-1. The guide finds the phone and names it, or says the phone cannot be opened (the WinUSB question); the log says which.
+0. `powershell -ExecutionPolicy Bypass -c "irm https://get.ferros.org/install.ps1 | iex"`.
+1. The guide finds the phone and names it, or says the phone cannot be opened (the WinUSB question, with what to install); the log says which.
 2. It reads the lock state (the 8a is unlocked), shows the plan, and stops before the backup.
-3. `ferros-flash log report <the run's file> report.vsf`, sent back to us.
+3. It offers to send the run's log to fgtw.org/report; he types yes, and quotes the hash it answers (or runs `ferros-flash log send` later, from any terminal).
 That run tests the install, the executable, USB on Windows and the log, and writes nothing to the phone. The flash itself follows once the install door, the production image and the measurements above are in.
 
 ## Open for the owner
 
-- The host (recommended ferros.org on R2), and code signing for Windows and macOS.
-- The carve's userdata floor (proposed 1 GiB, holding the device-only secret as above) and the production image as bare ferros.
-- The install door, the update door and the signed-only boot write (production doors, so the owner's).
+- Code signing for Windows and macOS.
 - (b)'s path once measured, and whether Titan may be asked.
-- The log endpoint at fgtw.org and its privacy rules.
 - Whether captured register sequences (camera, GNSS) may be hosted.

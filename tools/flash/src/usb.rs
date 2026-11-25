@@ -41,6 +41,17 @@ pub fn list() -> Result<Vec<Found>, String> {
         .collect())
 }
 
+/// Every Google device (USB vendor G#18D1) the computer lists, fastboot or not: its USB ids.
+pub fn google() -> Vec<(u16, u16)> {
+    nusb::list_devices()
+        .map(|all| {
+            all.filter(|d| d.vendor_id() == 0x18D1)
+                .map(|d| (d.vendor_id(), d.product_id()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// An opened phone: its claimed interface and bulk endpoints.
 pub struct Usb {
     rt: tokio::runtime::Runtime,

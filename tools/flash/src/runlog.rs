@@ -149,6 +149,18 @@ impl RunLog {
         Ok(l)
     }
 
+    /// An existing run's file, opened to append (a send records its consent and its answer in the run it sent).
+    pub fn append_to(path: &Path) -> Result<RunLog, String> {
+        let file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(RunLog {
+            path: path.to_path_buf(),
+            file,
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -231,11 +243,68 @@ pub fn report(run: &[u8], tool: &str, made: i64, keep_serial: bool) -> Result<Ve
         .build()
 }
 
+/// Where a person's report goes (docs/FLASHER.md "Submitting"): fgtw.org's `/report`, which keeps it 2^5 days and never the sender's address.
+pub const REPORT_URL: &str = "https://fgtw.org/report";
+
+/// The newest run on this computer, the one a person most likely means.
+pub fn newest(dir: &Path) -> Option<PathBuf> {
+    let mut runs: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.to_string_lossy().ends_with(".log.vsf"))
+        .collect();
+    // The names are the runs' start times in hex, all the same width: their order is the runs' order.
+    runs.sort();
+    runs.pop()
+}
+
+/// A report's records back as a run log (the bytes the sender's disk held, serial blinding aside), for `log show` and `vsflog`.
+pub fn unpack(report: &[u8]) -> Result<Vec<u8>, String> {
+    vsf::verification::is_original(report)?;
+    let (h, end) = vsf::VsfHeader::decode_strict(report)?;
+    let secs = h.sections(report, end)?;
+    let r = secs
+        .iter()
+        .find(|s| s.name == "report")
+        .ok_or("not a report")?;
+    let mut out = Vec::new();
+    for f in r.get_fields("record") {
+        match f.values.first() {
+            Some(VsfType::v(b'b', rec)) => out.extend_from_slice(rec),
+            _ => return Err("a record that is not raw bytes".into()),
+        }
+    }
+    Ok(out)
+}
+
+/// fgtw.org's answer to a report: its BLAKE3 when taken, else the refusal's reason and words.
+pub fn reply(bytes: &[u8]) -> Result<[u8; 32], String> {
+    let (h, end) =
+        vsf::VsfHeader::decode(bytes).map_err(|e| format!("the answer is not VSF: {e}"))?;
+    let secs = h.sections(bytes, end)?;
+    let s = secs.first().ok_or("an empty answer")?;
+    match s.name.as_str() {
+        "report_taken" => s
+            .bytes32("hash")
+            .ok_or_else(|| "the answer names no hash".to_string()),
+        "error" => Err(format!(
+            "refused ({}): {}",
+            s.text("reason").unwrap_or("?"),
+            s.text("detail").unwrap_or("")
+        )),
+        n => Err(format!("an answer named `{n}`")),
+    }
+}
+
 /// A record with its `serial` field replaced by the serial's keyed BLAKE3 (the same phone still reads as the same phone within a report, and no further).
 fn without_serial(raw: &[u8]) -> Result<Vec<u8>, String> {
     let (h, end) = vsf::VsfHeader::decode(raw)?;
-    let mut p = end;
-    let mut s = VsfSection::parse(raw, &mut p)?;
+    // By the TOC, so the section keeps its name (a body alone may be written nameless, its name in the TOC).
+    let mut s = h
+        .sections(raw, end)?
+        .into_iter()
+        .next()
+        .ok_or("a record with no section")?;
     if s.get_field("serial").is_none() {
         return Ok(raw.to_vec());
     }
@@ -319,7 +388,44 @@ mod tests {
         let (some, whole) = read(cut);
         assert_eq!(some.len(), 3);
         assert!(whole < cut.len());
+        // What fgtw.org's /report checks of every record: a whole document by its provenance hash.
+        for r in &all {
+            vsf::verification::is_original(&r.raw).unwrap();
+        }
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn replies() {
+        let taken = VsfBuilder::new()
+            .creation_time_oscillations(1)
+            .add_section(
+                "report_taken",
+                vec![
+                    ("hash".into(), VsfType::hb(vec![5; 32])),
+                    ("keep_days".into(), VsfType::u(32, false)),
+                ],
+            )
+            .build()
+            .unwrap();
+        assert_eq!(reply(&taken).unwrap(), [5; 32]);
+        let refused = VsfBuilder::new()
+            .add_section(
+                "error",
+                vec![
+                    (
+                        "reason".into(),
+                        VsfType::a(vsf::types::Ascii::new("bad_report").unwrap()),
+                    ),
+                    (
+                        "detail".into(),
+                        VsfType::a(vsf::types::Ascii::new("no").unwrap()),
+                    ),
+                ],
+            )
+            .build()
+            .unwrap();
+        assert!(reply(&refused).unwrap_err().contains("bad_report"));
     }
 
     #[test]
@@ -334,7 +440,23 @@ mod tests {
         let secs = h.sections(&doc, end).unwrap();
         assert_eq!(secs[0].uint("records"), Some(2));
         assert!(!doc.windows(11).any(|w| w == b"TESTSERIAL0"));
+        // What fgtw.org's /report checks: the report and each record whole by their provenance hashes, the count right, no `serial` unless kept.
+        vsf::verification::is_original(&doc).unwrap();
+        let recs: Vec<_> = secs[0].get_fields("record");
+        assert_eq!(recs.len(), 2);
+        for f in recs {
+            let Some(VsfType::v(b'b', rec)) = f.values.first() else {
+                panic!("a record is raw bytes")
+            };
+            vsf::verification::is_original(rec).unwrap();
+            let (rh, rend) = vsf::VsfHeader::decode_strict(rec).unwrap();
+            let rs = rh.sections(rec, rend).unwrap();
+            assert_eq!(rs.len(), 1);
+            assert!(rs[0].get_field("serial").is_none());
+        }
+        assert_eq!(read(&unpack(&doc).unwrap()).0.len(), 2);
         let kept = report(&run, "ferros-flash 0.1.0", 1 << 42, true).unwrap();
+        assert_eq!(unpack(&kept).unwrap(), run);
         assert!(kept.windows(11).any(|w| w == b"TESTSERIAL0"));
         std::fs::remove_dir_all(&d).unwrap();
     }

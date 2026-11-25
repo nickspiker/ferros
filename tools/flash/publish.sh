@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Stage a ferros-flash release (docs/FLASHER.md "Distribution"): the executables, the board manifests and the boot images, each under its BLAKE3, a release document signed with the ferros key naming them all, and the two one-line installers with the executables' SHA-256 written in.
-# The host is the owner's choice and not decided, so nothing is uploaded unless asked: FERROS_FLASH_BASE is the URL the installers and the tool fetch from, and FERROS_FLASH_UPLOAD=r2:<bucket>/<path> uploads the staged folder with wrangler (Photon's route to brobdingnagian.holdmyoscilloscope.com).
+# The host (owner, 2026-11-24: "R2"): the R2 bucket `ferros`, served at https://get.ferros.org (its custom domain), as Photon's bucket is at brobdingnagian.holdmyoscilloscope.com. FERROS_FLASH_BASE is the URL the installers and the tool fetch from (default that one); `--upload` puts the staged folder in the bucket (FERROS_FLASH_BUCKET, default `ferros`) with wrangler, under the R2 token in keys/cloudflare-r2-token.
+# Files named by their BLAKE3 never change, so they are cached for good; the installers and the fixed-name executables change with every publish, so they go up with `no-cache` (an edge holding an old executable beside a new installer would fail every install's hash check).
 # Boot images: FERROS_FLASH_BOOT_<BOARD>=<whole signed boot partition image> adds one; the owner's rule (2026-11-24) is that only production builds are hosted, with every Android path compiled out, so the channel is `production` only when every image given is one, else `development`.
 # FERROS_FLASH_COMMIT names the commit when building outside a checkout (a scratch export).
-# Usage: FERROS_FLASH_BASE=https://<host>/ferros [FERROS_FLASH_CHANNEL=development] [FERROS_FLASH_BOOT_AKITA=img] tools/flash/publish.sh
+# Usage: [FERROS_FLASH_CHANNEL=development] [FERROS_FLASH_BOOT_AKITA=img] tools/flash/publish.sh [--upload]
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-BASE=${FERROS_FLASH_BASE:?the URL the installers fetch from, e.g. https://ferros.org/flash}
+BASE=${FERROS_FLASH_BASE:-https://get.ferros.org}
+BUCKET=${FERROS_FLASH_BUCKET:-ferros}
+UPLOAD=0
+for a in "$@"; do case $a in --upload) UPLOAD=1 ;; *) echo "unknown argument $a"; exit 2 ;; esac; done
 CHANNEL=${FERROS_FLASH_CHANNEL:-development}
 KEY=${FERROS_KEY:-/mnt/Harbor/Code/keys/ferros.key.vsf}
 OUT=${OUT:-target/flash-publish}
@@ -41,13 +45,35 @@ sed -e "s|__BASE__|$BASE|g" -e "s|__SHA256_LINUX_X86_64__|$L|" -e "s|__SHA256_MA
 echo "== staged in $OUT ($CHANNEL)"
 echo "   Windows: powershell -ExecutionPolicy Bypass -c \"irm $BASE/install.ps1 | iex\""
 echo "   Linux:   curl -sSfL $BASE/install.sh | sh"
-case "${FERROS_FLASH_UPLOAD:-}" in
-    "") echo "   not uploaded (FERROS_FLASH_UPLOAD=r2:<bucket>/<path> to upload)" ;;
-    r2:*)
-        dest=${FERROS_FLASH_UPLOAD#r2:}
-        for f in "$OUT"/*; do
-            wrangler r2 object put "$dest/$(basename "$f")" --file "$f" --remote
-        done
-        ;;
-    *) echo "FERROS_FLASH_UPLOAD: only r2:<bucket>/<path> is known"; exit 1 ;;
-esac
+if [ $UPLOAD = 0 ]; then
+    echo "   not uploaded (--upload puts it in the R2 bucket $BUCKET)"
+    exit 0
+fi
+export WRANGLER_SEND_METRICS=false
+if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] && [ -r /mnt/Harbor/Code/keys/cloudflare-r2-token ]; then
+    CLOUDFLARE_API_TOKEN=$(tr -d ' \n' < /mnt/Harbor/Code/keys/cloudflare-r2-token)
+    export CLOUDFLARE_API_TOKEN
+    export CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID:-6be7ec6dc3bb3f60fabb62ff944cc2c2}
+fi
+put() {
+    local name=$1 file=$2 ctype=$3 cache=$4 attempt
+    for attempt in 0 1 2; do
+        wrangler r2 object put "$BUCKET/$name" --file "$file" --content-type "$ctype" --cache-control "$cache" --remote >/dev/null && return 0
+        echo "   upload of $name failed (attempt $attempt), again"
+    done
+    echo "   upload of $name failed three times: stopped"
+    exit 1
+}
+# The hash-named files first, the release next, the installers last: an installer never names an executable that is not yet there.
+for f in "$OUT"/*; do
+    n=$(basename "$f")
+    case $n in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) [ ${#n} = 64 ] && put "$n" "$f" application/octet-stream "public, max-age=31536000, immutable" ;;
+    esac
+done
+put ferros-flash-windows-x86_64.exe "$OUT/ferros-flash-windows-x86_64.exe" application/octet-stream no-cache
+put ferros-flash-linux-x86_64 "$OUT/ferros-flash-linux-x86_64" application/octet-stream no-cache
+put release.vsf "$OUT/release.vsf" application/octet-stream no-cache
+put install.ps1 "$OUT/install.ps1" "text/plain; charset=utf-8" no-cache
+put install.sh "$OUT/install.sh" "text/plain; charset=utf-8" no-cache
+echo "== uploaded to $BUCKET ($BASE)"

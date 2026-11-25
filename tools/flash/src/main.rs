@@ -5,6 +5,8 @@
 //!   ferros-flash board <product> <out.vsf>     the built-in board manifest as its VSF document
 //!   ferros-flash log show <run.log.vsf>        a run's records, rendered
 //!   ferros-flash log report <run.log.vsf> <out.vsf> [--keep-serial]    the one document a person submits
+//!   ferros-flash log unpack <report.vsf> <out.log.vsf>    a received report's records back as a run log (tools/flash/reports.sh fetches them)
+//!   ferros-flash log send [run.log.vsf] [--keep-serial]    that document sent to fgtw.org/report on a typed yes (the newest run when none is named)
 //!   ferros-flash release verify <release.vsf>  a release checked against the ferros key, its files listed
 //!   ferros-flash release make ...              (built with `publish`) a release signed with a key from keys/
 //!   ferros-flash show  <head> <tail> <tail-lba> [block]
@@ -26,8 +28,17 @@ fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// This run's log, once one is open: every way out names it and how to send it.
+static RUN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
 fn die(msg: impl core::fmt::Display) -> ! {
     eprintln!("ferros-flash: {msg}");
+    if let Some(p) = RUN.get() {
+        eprintln!(
+            "This run's log is {}. To send it to the ferros developers: ferros-flash log send",
+            p.display()
+        );
+    }
     exit(1)
 }
 
@@ -54,6 +65,7 @@ fn open_log(what: &str) -> Log {
     let l = RunLog::create(&runlog::default_dir(), start, facts)
         .unwrap_or_else(|e| die(format!("cannot keep a log: {e}")));
     eprintln!("ferros-flash: this run's log is {}", l.path().display());
+    let _ = RUN.set(l.path().to_path_buf());
     let log = Arc::new(Mutex::new(l));
     let hook = log.clone();
     std::panic::set_hook(Box::new(move |p| {
@@ -126,6 +138,9 @@ mod phone {
         }
     }
 
+    /// What a person on Windows does when the bootloader shows but cannot be opened (docs/FLASHER.md "Windows and the driver").
+    const WINUSB: &str = "On Windows the phone's bootloader needs the WinUSB driver: install Google's USB driver (https://developer.android.com/studio/run/win-usb), or in Device Manager let Windows Update install \"Android Bootloader Interface\", then run the guide again.";
+
     /// The one phone to talk to: the serial asked for, else the only one there is.
     fn one(serial: Option<&str>) -> Result<usb::Found, String> {
         let found = usb::list()?;
@@ -134,6 +149,12 @@ mod phone {
             .filter(|f| serial.is_none_or(|s| f.serial == s))
             .collect();
         match m.len() {
+            // A Google device the computer sees without a fastboot interface: a phone in Android, or a bootloader whose driver is missing.
+            0 if !usb::google().is_empty() => Err(format!(
+                "a Google device is plugged in but no bootloader answers (USB ids {}). If the phone is in Android, power it off and hold power and volume down. {}",
+                usb::google().iter().map(|(v, p)| format!("G#{v:04X}:{p:04X}")).collect::<Vec<_>>().join(", "),
+                if cfg!(windows) { WINUSB } else { "" }
+            )),
             0 => Err("no phone in fastboot (plugged in, and in its bootloader: hold power and volume down)".into()),
             1 => Ok(m.remove(0)),
             _ => Err("more than one phone in fastboot: name one by its serial".into()),
@@ -207,7 +228,7 @@ mod phone {
                         .u("vid", f.vid as u64)
                         .u("pid", f.pid as u64),
                 );
-                die(format!("{e}\nOn Windows, the phone's bootloader needs the WinUSB driver: see the guide's notes."));
+                die(format!("{e}\n{WINUSB}"));
             }
         };
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -318,6 +339,9 @@ mod phone {
         for w in words {
             note(&log, Ev::info("bootloader", "{}").t(&w));
         }
+        let path = log.lock().unwrap().path().to_path_buf();
+        println!();
+        send(&path, false);
     }
 }
 
@@ -364,8 +388,90 @@ fn log_cmd(a: &[String]) {
                 }
             );
         }
-        _ => die("log show <run.log.vsf> | log report <run.log.vsf> <out.vsf> [--keep-serial]"),
+        (Some("unpack"), Some(p)) => {
+            let out = a.get(4).unwrap_or_else(|| die("log unpack <report.vsf> <out.log.vsf>"));
+            let run = runlog::unpack(&read(p)).unwrap_or_else(|e| die(e));
+            std::fs::write(out, &run).unwrap_or_else(|e| die(format!("{out}: {e}")));
+            println!("{out}: A#{} records", runlog::read(&run).0.len());
+        }
+        (Some("send"), _) => {
+            let keep = a.iter().any(|x| x == "--keep-serial");
+            let path = match a.get(3).filter(|x| !x.starts_with("--")) {
+                Some(p) => std::path::PathBuf::from(p),
+                None => runlog::newest(&runlog::default_dir()).unwrap_or_else(|| die("no run on this computer to send")),
+            };
+            send(&path, keep);
+        }
+        _ => die("log show <run.log.vsf> | log report <run.log.vsf> <out.vsf> [--keep-serial] | log send [run.log.vsf] [--keep-serial]"),
     }
+}
+
+/// A run's report sent to fgtw.org, only on the person's typed yes, said in full first; the consent and the answer are added to that run's own log.
+fn send(path: &std::path::Path, keep_serial: bool) {
+    let run = std::fs::read(path).unwrap_or_else(|e| die(format!("{}: {e}", path.display())));
+    let (recs, _) = runlog::read(&run);
+    let doc = runlog::report(
+        &run,
+        &format!("ferros-flash {VERSION} {}", platform()),
+        vsf::eagle_time_oscillations(),
+        keep_serial,
+    )
+    .unwrap_or_else(|e| die(e));
+    println!("Send this run's log to the ferros developers?");
+    println!("  It goes to {} as one document of A#{} bytes: A#{} records of what the tool did and what the phone answered.", runlog::REPORT_URL, doc.len(), recs.len());
+    println!(
+        "  It never holds a handle, a key, a location or your files. The phone's serial is {}.",
+        if keep_serial {
+            "included, as you asked"
+        } else {
+            "replaced by a hash"
+        }
+    );
+    println!("  fgtw.org keeps it 32 days and does not keep your computer's address. `ferros-flash log show {}` shows every line of it.", path.display());
+    if !ask("Send it?") {
+        println!(
+            "Not sent. You can send it later: ferros-flash log send {}",
+            path.display()
+        );
+        return;
+    }
+    let mut log = runlog::RunLog::append_to(path).ok();
+    if let Some(l) = log.as_mut() {
+        let _ = l.append(
+            &Ev::info("send", "the person chose to send this run's log")
+                .flag("serial_kept", keep_serial)
+                .u("bytes", doc.len() as u64),
+        );
+    }
+    let answer = post(runlog::REPORT_URL, &doc).and_then(|b| runlog::reply(&b));
+    match answer {
+        Ok(h) => {
+            println!("Sent. Its name at fgtw.org is {}; quote it to us.", hex(&h));
+            if let Some(l) = log.as_mut() {
+                let _ = l.append(&Ev::info("send", "fgtw.org took it").hash("report", &h));
+            }
+        }
+        Err(e) => {
+            println!(
+                "Not sent: {e}. The log stays on this computer at {}.",
+                path.display()
+            );
+            if let Some(l) = log.as_mut() {
+                let _ = l.append(&Ev::error("send", "not sent: {}").t(&e));
+            }
+        }
+    }
+}
+
+/// One POST of VSF bytes over HTTPS (rustls, the web's roots), its answer's bytes.
+fn post(url: &str, body: &[u8]) -> Result<Vec<u8>, String> {
+    let r = ureq::post(url)
+        .set("Content-Type", "application/octet-stream")
+        .send_bytes(body)
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut r.into_reader(), &mut out).map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 fn hex(b: &[u8]) -> String {
