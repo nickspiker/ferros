@@ -371,3 +371,22 @@ Captured under Android with tracefs kprobes on `aoc_service_write` (tools/aaudio
 
 The spread from one start to the next (about 8 ms) is under study: where the AoC reads the heap against where the service writes.
 **Clicks** (the owner heard them): with 64 frames (1.33 ms) of lead, the clock thread's wake-up tail (up to 4 ms, unpinned on the A715s) let the AoC read the zeroed heap: 2 to 3 holes of 3 to 5 ms in every 2.7 s of tone, each at a late turn. The lead must cover the wake-up's tail, or the tail must shrink (KERNEL.md's scheduling proposal).
+
+## Where audio stands (2026-11-24, end of the audio session)
+
+**The Pro:** forge ebfc18ee RAM-reloaded (boot b1178; the identity unlocks at boot), `dev follow` off as found. No audio process runs. The vault's stored `audio` capsule is older than this session's work (from before 59abc9f6: entry point 5, the whole-period top-up that starved): the kernel's on-demand start (the Sound page, Photon's WRITE) still gets that one until `tools/husky-shell.sh audio` stores forge's. Everything measured today ran from hand spawns (target/farm/audio/bench.sh and sweep.sh: the doc line in main.rs, plus `--dma aoc-heaps --dma test-mailbox --input-file`).
+
+**What works, measured:** entry point 0 (MMAP) plays from the playback heap and `audio_capture1` records into the capture heap at 1 ms blocks; speaker to microphone 10.7 to 19.0 ms against Android's 21.5 ms; no holes with a 2 ms lead since the amplifiers' watch has its own thread (051e07d0). Entry point 5 stays the default shape.
+
+**Next, in order:**
+1. The watch's SPI read still takes up to 2 ms (4.5 ms seen): its cause, ferros_spi's wait against a kernel lock on the mmio path, by measurement.
+2. The lead toward 1 ms and the clock thread's pinning, measured again now the turn is 76 us (pinning was worse only while the watch stalled the turn); Lumis pins cores 0 to 3.
+3. The about 8 ms spread from one MMAP start to the next: where the AoC reads the heap (Linux counts from rx at prepare) against where the service writes (from rp).
+4. The split of the loop into its speaker and microphone halves: the amplifiers' V/I sense on TDM0's TX as an electrical reference; Android's stage list; the owner's calibrated microphone at the calibration session.
+5. The service's default to entry point 0 with the heaps, then the shared playback ring (SYS_SHARE, the network agent's) and the `mic` mailbox (its kernel part unwritten: the grant, the op-0 proof, the view count), the APIs drafted for Photon.
+
+**Open, the owner's:**
+- A `mic` right of its own (today any kist with `audio`, which is implicit, can record).
+- The gain policy (the record soft and hardware gains set by the service per use; Android's values as the start).
+- Audio's priority in the scheduler (a real-time class or a core for device threads), with the numbers above.
+- The speaker tuning's source: Android's HAL computes it (11,272 bytes, block 16, component 2; its id 5 follows the volume), most likely from the vendor partition's Waves preset; entry point 0 plays without it. Reading it from the phone's own vendor partition (partfs) is the recommendation, decoding the preset the last resort.
