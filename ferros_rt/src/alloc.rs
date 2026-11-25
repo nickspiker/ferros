@@ -2,6 +2,11 @@
 //!
 //! The arc grows at its top and shrinks from its top (ARC_SHRINK; never under what the process was spawned with), so the heap gives memory back when the free block at the top of what it grew is large: a cushion is kept (layout.rs `shrink_to`), the rest goes. A range in the middle is never given back (ARC_RELEASE): a native arc's grow refills only what lies past its old top, so a hole there would be address space lost for good.
 
+//!
+//! An app's own copy of this crate with `cxx` (the C++ shims, whose threads and allocations need a heap) has no heap of its own: its `alloc`, `alloc_zeroed`, `dealloc` and `realloc` go to Rust's global allocator, which is std's copy's heap here, so a process keeps one heap whichever copy asks.
+
+#![cfg_attr(all(feature = "cxx", not(feature = "runtime")), allow(dead_code, unused_imports))]
+
 use core::alloc::Layout;
 
 use crate::layout;
@@ -96,6 +101,7 @@ pub unsafe fn add_region(start: usize, size: usize) {
     unsafe { HEAP.lock().add(start, start + size) };
 }
 
+#[cfg(not(all(feature = "cxx", not(feature = "runtime"))))]
 pub unsafe fn alloc(layout: Layout) -> *mut u8 {
     loop {
         let p = unsafe { HEAP.lock().alloc(layout) };
@@ -105,6 +111,7 @@ pub unsafe fn alloc(layout: Layout) -> *mut u8 {
     }
 }
 
+#[cfg(not(all(feature = "cxx", not(feature = "runtime"))))]
 /// The heap ran out for `layout`: the arc grows by at least what it needs (SYS_ARC), and the new bytes join the heap (one region with what the last grow brought: the old top's sentinel becomes the new block's header). False when the kernel refuses (the ceiling the build declared, or the device's memory, gone): the allocation fails as it always did.
 fn grow(layout: Layout) -> bool {
     let mut arc = ARC.lock();
@@ -138,6 +145,7 @@ fn grow(layout: Layout) -> bool {
     true
 }
 
+#[cfg(not(all(feature = "cxx", not(feature = "runtime"))))]
 /// The free block at the heap's top just grew: give the arc's top back past the cushion (layout.rs `shrink_to`). Skipped while a grow or another shrink is under way.
 fn shrink() {
     let Some(mut arc) = ARC.try_lock() else { return };
@@ -172,6 +180,7 @@ fn shrink() {
     unsafe { HEAP.lock().cut(b, end) };
 }
 
+#[cfg(not(all(feature = "cxx", not(feature = "runtime"))))]
 pub unsafe fn alloc_zeroed(layout: Layout) -> *mut u8 {
     let p = unsafe { alloc(layout) };
     if !p.is_null() {
@@ -180,6 +189,7 @@ pub unsafe fn alloc_zeroed(layout: Layout) -> *mut u8 {
     p
 }
 
+#[cfg(not(all(feature = "cxx", not(feature = "runtime"))))]
 pub unsafe fn dealloc(ptr: *mut u8, _layout: Layout) {
     let top = unsafe { HEAP.lock().free(ptr) };
     if top {
@@ -187,6 +197,7 @@ pub unsafe fn dealloc(ptr: *mut u8, _layout: Layout) {
     }
 }
 
+#[cfg(not(all(feature = "cxx", not(feature = "runtime"))))]
 /// Where it lies first: a shrink cuts the tail off, a grow takes the free block behind it (a Vec doubling over free space moves nothing); otherwise a new block, the copy, the old one freed.
 pub unsafe fn realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
     let (done, top) = unsafe { HEAP.lock().resize(ptr, new_size) };
@@ -206,6 +217,30 @@ pub unsafe fn realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 
     }
     p
 }
+
+/// The app copy's entry points (`cxx` without `runtime`): the global allocator, std's copy's heap.
+#[cfg(all(feature = "cxx", not(feature = "runtime")))]
+pub unsafe fn alloc(layout: Layout) -> *mut u8 {
+    unsafe { rust_alloc::alloc::alloc(layout) }
+}
+
+#[cfg(all(feature = "cxx", not(feature = "runtime")))]
+pub unsafe fn alloc_zeroed(layout: Layout) -> *mut u8 {
+    unsafe { rust_alloc::alloc::alloc_zeroed(layout) }
+}
+
+#[cfg(all(feature = "cxx", not(feature = "runtime")))]
+pub unsafe fn dealloc(ptr: *mut u8, layout: Layout) {
+    unsafe { rust_alloc::alloc::dealloc(ptr, layout) }
+}
+
+#[cfg(all(feature = "cxx", not(feature = "runtime")))]
+pub unsafe fn realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    unsafe { rust_alloc::alloc::realloc(ptr, layout, new_size) }
+}
+
+#[cfg(all(feature = "cxx", not(feature = "runtime")))]
+extern crate alloc as rust_alloc;
 
 /// Bytes free in the heap right now (diagnostics).
 pub fn free_bytes() -> usize {

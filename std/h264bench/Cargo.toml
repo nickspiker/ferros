@@ -1,0 +1,29 @@
+[package]
+name = "h264bench"
+version = "0.1.0"
+edition = "2024"
+description = "OpenH264 on ferros (docs/STD-TARGET.md \"C++ through ferros_rt\"): synthetic frames encoded and decoded round trip at beam sizes, one slice and several, one thread and several, PSNR checked, encode and decode timed per frame"
+
+[dependencies]
+# Photon's versions (its Cargo.toml), the sys crate from ferros's fork below.
+openh264 = { version = "=0.9.8", default-features = false, features = ["source"] }
+openh264-sys2 = { version = "=0.9.8", default-features = false, features = ["source"] }
+
+[patch.crates-io]
+openh264-sys2 = { path = "../openh264-sys2" }
+
+[[bin]]
+name = "h264bench"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+debug = false
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

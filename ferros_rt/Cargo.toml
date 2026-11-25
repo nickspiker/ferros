@@ -15,5 +15,7 @@ default = ["runtime"]
 # The image's entry, the C allocator symbols, memcpy/memmove/memset and getrandom's backends: the symbols std's copy gives the link. An app's own copy beside std's (for `tcp`) is built without it, or the two copies' symbols collide.
 runtime = []
 rustc-dep-of-std = ["core", "runtime"]
+# C++ without its runtime library, and the POSIX and stdio calls of C and C++ libraries (cxx.rs, posix.rs, stdio.rs): an app's own copy only (without `runtime`), turned on by the crate that links the C++ (std/openh264-sys2). Nightly: C's variadic functions and `#[thread_local]`.
+cxx = []
 
 [workspace]

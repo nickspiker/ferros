@@ -14,3 +14,7 @@ ferros_heap = { path = "../../ferros_heap" }
 
 [profile.release]
 debug = true
+
+# alloc.rs names ferros_rt's own features (an app copy with `cxx` forwards to the global allocator); here, as in std's copy, neither path is that one.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cxx", "runtime"))'] }

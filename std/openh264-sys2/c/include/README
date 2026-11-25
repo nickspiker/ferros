@@ -1,0 +1,3 @@
+The C library openh264 sees on ferros: declarations only, each answered by ferros_rt's `cxx` feature (cxx.rs, posix.rs, stdio.rs) or by std's own copy of ferros_rt and compiler_builtins (the allocator, the mem routines, strlen, the libm subset).
+A name openh264 does not use is not declared, so a new use fails at compile time, loud.
+The types shared with ferros_rt (pthread_mutex_t, pthread_cond_t, sem_t, pthread_t, pthread_attr_t) have the layout ferros_rt's posix.rs gives them.

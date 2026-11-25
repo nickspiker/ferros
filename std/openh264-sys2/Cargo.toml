@@ -1,0 +1,26 @@
+[package]
+name = "openh264-sys2"
+version = "0.9.8"
+edition = "2024"
+license = "BSD-2-Clause"
+description = "openh264-sys2 0.9.8 forked for ferros (README.md): the same bindings, OpenH264 2.7.0 built for aarch64-unknown-ferros with no C++ standard library, its runtime calls ferros_rt's `cxx` feature. An app takes it by [patch.crates-io] and keeps the openh264 crate's API (docs/STD-TARGET.md \"C++ through ferros_rt\")."
+build = "build.rs"
+
+[lib]
+name = "openh264_sys2"
+path = "src/lib.rs"
+
+[features]
+default = ["source"]
+# The only way it is built here: from source. (crates.io's `libloading`, a prebuilt library loaded at run time, has no ferros meaning and is not offered.)
+source = []
+
+[dependencies]
+# The C++ runtime, POSIX and stdio calls openh264 makes: an app's copy of the runtime beside std's (`runtime` off), with `cxx`.
+ferros-rt = { path = "../../ferros_rt", default-features = false, features = ["cxx"] }
+
+[build-dependencies]
+cc = { version = "1.0", features = ["parallel"] }
+
+[workspace]
+

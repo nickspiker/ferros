@@ -31,55 +31,73 @@ impl<T> Lock<T> {
 
     #[inline]
     pub fn lock(&self) -> Guard<'_, T> {
-        if self.word.compare_exchange(FREE, HELD, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            self.contended();
-        }
+        acquire(&self.word);
         Guard { lock: self }
     }
 
     /// The lock only when it is free now (a shrink that would wait behind a grow is not worth waiting for).
     #[inline]
     pub fn try_lock(&self) -> Option<Guard<'_, T>> {
-        self.word.compare_exchange(FREE, HELD, Ordering::Acquire, Ordering::Relaxed).ok().map(|_| Guard { lock: self })
-    }
-
-    #[cold]
-    fn contended(&self) {
-        let mut w = self.spin();
-        if w == FREE {
-            match self.word.compare_exchange(FREE, HELD, Ordering::Acquire, Ordering::Relaxed) {
-                Ok(_) => return,
-                Err(now) => w = now,
-            }
-        }
-        loop {
-            // Mark it waited before sleeping, so the holder's unlock wakes someone; taking it this way leaves it marked, which costs at most one wake with nobody asleep.
-            if w != WAITED && self.word.swap(WAITED, Ordering::Acquire) == FREE {
-                return;
-            }
-            futex_wait(&self.word, WAITED, None);
-            w = self.spin();
-        }
-    }
-
-    /// Spin while the word says held with nobody asleep, `SPIN` loads at most; the word last seen.
-    fn spin(&self) -> u64 {
-        let mut n = SPIN;
-        loop {
-            let w = self.word.load(Ordering::Relaxed);
-            if w != HELD || n == 0 {
-                return w;
-            }
-            core::hint::spin_loop();
-            n -= 1;
-        }
+        try_acquire(&self.word).then(|| Guard { lock: self })
     }
 
     #[inline]
     fn unlock(&self) {
-        if self.word.swap(FREE, Ordering::Release) == WAITED {
-            futex_wake(&self.word);
+        release(&self.word);
+    }
+}
+
+/// Take the lock a bare word is (0 free, 1 held, 2 held and waited): `Lock`'s own, and a C `pthread_mutex_t`'s (posix.rs).
+#[inline]
+pub fn acquire(word: &AtomicU64) {
+    if word.compare_exchange(FREE, HELD, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        contended(word);
+    }
+}
+
+/// The word's lock only when it is free now.
+#[inline]
+pub fn try_acquire(word: &AtomicU64) -> bool {
+    word.compare_exchange(FREE, HELD, Ordering::Acquire, Ordering::Relaxed).is_ok()
+}
+
+/// Let the word's lock go, waking one sleeper when one may be asleep.
+#[inline]
+pub fn release(word: &AtomicU64) {
+    if word.swap(FREE, Ordering::Release) == WAITED {
+        futex_wake(word);
+    }
+}
+
+#[cold]
+fn contended(word: &AtomicU64) {
+    let mut w = spin(word);
+    if w == FREE {
+        match word.compare_exchange(FREE, HELD, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(now) => w = now,
         }
+    }
+    loop {
+        // Mark it waited before sleeping, so the holder's unlock wakes someone; taking it this way leaves it marked, which costs at most one wake with nobody asleep.
+        if w != WAITED && word.swap(WAITED, Ordering::Acquire) == FREE {
+            return;
+        }
+        futex_wait(word, WAITED, None);
+        w = spin(word);
+    }
+}
+
+/// Spin while the word says held with nobody asleep, `SPIN` loads at most; the word last seen.
+fn spin(word: &AtomicU64) -> u64 {
+    let mut n = SPIN;
+    loop {
+        let w = word.load(Ordering::Relaxed);
+        if w != HELD || n == 0 {
+            return w;
+        }
+        core::hint::spin_loop();
+        n -= 1;
     }
 }
 

@@ -20,6 +20,11 @@ pub fn futex_wait(futex: &AtomicU64, expected: u64, timeout: Option<Duration>) -
     sys::svc(nr::WAIT, off(futex), expected, deadline, 0, 0) != 2
 }
 
+/// As `futex_wait`, to an exact counter deadline (`deadline` in counter ticks, 0 none): false only on timeout. A C timed wait hands its absolute time this way (posix.rs), with no second reading of the counter between its clock and the kernel's.
+pub fn futex_wait_until(futex: &AtomicU64, expected: u64, deadline: u64) -> bool {
+    sys::svc(nr::WAIT, off(futex), expected, deadline, 0, 0) != 2
+}
+
 /// Wake one waiter; true when there was one.
 #[inline]
 pub fn futex_wake(futex: &AtomicU64) -> bool {
