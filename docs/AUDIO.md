@@ -352,3 +352,22 @@ Under load and pinned to an A510: to be measured (Lumis pins its intake to cores
 - **A mic right.** Today any kist holding `audio` (implicit for every kist) can call `MIC_LEVELS` and `RECORD`, and would read the planned `mic` mailbox. Proposed: `mic`, a right of its own in the kists' vocabulary, asked once per person per kist (permissions_asked_once), the proof for SYS_MAILBOX op 0 on `mic` and for `MIC_LEVELS` and `RECORD`; the Sound page's tests keep it as a Settings holder. Until the owner decides, the proof is the `audio` right, swapped in one place.
 - **The capture runs only while someone holds a view.** A kernel-kept count of views (a header word, +1 at an open, -1 at its process's end) the service reads every period: at 0 the microphones stop, so a kist that dies cannot leave them on, and the same count is the mic-in-use indicator.
 - **Gain policy.** The record soft gain (block 136, component 30, key 16, whole dB) and the hardware gain (cB) are the service's, never a kist's: one setting per use, a call's voice and a recording at Android's measured values (soft 0 dB, hardware 130 cB for voice; 5 dB unprocessed), the level meter at what a recording uses, the defaults stored as device settings; a kist gets the samples at that gain and scales its own copy. The calibration session (the owner's measurement microphone) turns them into dB SPL.
+
+### What Android sends, and the MMAP path on ferros (2026-11-24, the Pro)
+
+Captured under Android with tracefs kprobes on `aoc_service_write` (tools/aaudio-bench), the HAL's AAudio MMAP streams opened by tools/aaudio-bench's NDK test:
+- **Playback (entry point 0):** CMD_MEM_MAP_REGION (212) on the AoC's `control` service maps a 16 KiB buffer in the playback heap (AoC G#9ABF_C000, AP G#96BF_C000), then BIND2 (0 to the speaker), the speaker's tuning (11,272 bytes into the ring `audio_bulk_tx`, then SET_GET_PARAM_BULK 213 on `audio_output_tuning`: block 16, component 2), EP_SETUP (two channels of 32-bit float), EP_SETUP2 (the buffer the whole 15,360-byte ring, the period 384 bytes, 1 ms), SOURCE; at the end SOURCE off, BIND2 off, the buffer unmapped.
+- **Record (`audio_capture1`, device 9):** the capture heap's 64 KiB mapped (AoC G#9ABE_C000, AP G#96BE_C000), the record soft gain 5 dB, MIC_RECORD_AP_SET_PARAMS (one channel, 32-bit), SET_PARAMS2 (the buffer the whole 46,080-byte ring, the period 192 bytes, 1 ms), the microphone list, AP_INPUT_START, MMAP_ENABLE_2 (one channel).
+- The samples of an MMAP stream are in the mapped heap, never in the IPC ring, which carries only the counts: why entry point 0 played nothing and `audio_capture1` stayed empty until ferros mapped the heaps (kernel `aoc-heaps`, forge ebfc18ee).
+- The tuning only shapes the sound: entry point 0 with the heap mapped and no tuning plays at the same level as entry point 5. The tuning is computed by the HAL (it is in no vendor file verbatim; its id 5 follows Android's volume); the Waves preset in the vendor tree is its likely source.
+
+| Loopback, the same sweep and tool | Write to arrival | Of it, queued |
+|---|---|---|
+| Android, AAudio MMAP (96-frame bursts) | 21.5 ms | 5.3 ms |
+| Android, legacy (raw entry point 23) | 88.1 ms | 21.3 ms |
+| ferros, entry point 5, normal record | 34.2 to 34.8 ms | 0.67 ms |
+| ferros, entry point 0 MMAP (heap), normal record | 19.3 ms | 0.33 ms |
+| ferros, entry point 0 MMAP, MMAP record (heap) | 10.7 to 19.0 ms over four starts | 0.33 ms |
+
+The spread from one start to the next (about 8 ms) is under study: where the AoC reads the heap against where the service writes.
+**Clicks** (the owner heard them): with 64 frames (1.33 ms) of lead, the clock thread's wake-up tail (up to 4 ms, unpinned on the A715s) let the AoC read the zeroed heap: 2 to 3 holes of 3 to 5 ms in every 2.7 s of tone, each at a late turn. The lead must cover the wake-up's tail, or the tail must shrink (KERNEL.md's scheduling proposal).

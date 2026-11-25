@@ -35,11 +35,36 @@ pub const S_ENTROPY: u64 = 8;
 pub const S_PLAY_LO: u64 = 9;
 pub const S_CAPTURE: u64 = 10;
 pub const S_PLAY_HI: u64 = 11;
+/// The AoC's AAudio heaps (kernel cachemap.rs AOC_HEAPS, since 2026-11-24): the MMAP streams' buffers.
+pub const S_HEAPS: u64 = 12;
 /// A hand spawn's dump for the bench's sweep (`--dma test-mailbox`): the capture and its anchors, read by the host from the frame `diag arcs` names (development only; the kernel's own start grants nothing here).
-pub const S_DUMP: u64 = 12;
+pub const S_DUMP: u64 = 13;
 
-/// The spawn input (a hand spawn's `--input-file`: a u32 length, then the bench's mono feed as i16), its address and length in bytes; 0 for none.
+/// The spawn input (a hand spawn's `--input-file`s, each a u32 length and its bytes: the bench's mono feed as i16, then the speaker's tuning, then its second part), its address and length in bytes; 0 for none.
 static INPUT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// The spawn input's file `k` (0 the feed, 1 and 2 the tuning's two parts): its bytes, None when absent.
+pub fn input_file(k: usize) -> Option<&'static [u8]> {
+    let (mut at, len) = (INPUT[0].load(Ordering::Relaxed), INPUT[1].load(Ordering::Relaxed));
+    let end = at + len;
+    for j in 0..=k {
+        // WHY each check: the framing is the bridge's, in the spawn input's bytes; a short or torn input answers None.
+        if at + 4 > end {
+            return None;
+        }
+        // SAFETY: inside the spawn input, in this process's arc, by the check above.
+        let n = (unsafe { core::ptr::read_unaligned(at as *const u32) }) as u64;
+        if at + 4 + n > end {
+            return None;
+        }
+        if j == k {
+            // SAFETY: as above, `n` bytes inside the input.
+            return Some(unsafe { core::slice::from_raw_parts((at + 4) as *const u8, n as usize) });
+        }
+        at += 4 + n;
+    }
+    None
+}
 
 static GRANTS: AtomicU64 = AtomicU64::new(0);
 /// The cores the clock thread is pinned to, as `ferros_sys::pin` takes them (0: as spawned); set by a bench, taken by the clock thread at its next wake (a pin applies to the calling thread).
@@ -172,7 +197,7 @@ fn start(p: Play) -> Result<aoc::Services, &'static str> {
     for name in [&b"audio_output_control"[..], ring] {
         aoc::dump(name);
     }
-    let s = aoc::services_for(p.ep)?;
+    let mut s = aoc::services_for(p.ep)?;
     aoc::describe("audio_output_control", s.control);
     aoc::describe(core::str::from_utf8(ring).unwrap_or("?"), s.playback);
     // The playback channel must be on f1, the block whose line this process holds.
@@ -189,10 +214,27 @@ fn start(p: Play) -> Result<aoc::Services, &'static str> {
     aoc::bind(&s, s.ep, aoc::SINK_SPEAKER, true)?;
     s.reset_write();
     if p.mmap() {
+        // The playback heap mapped into the AoC first, as Android's HAL does at an MMAP stream's open (aoc.rs "The AAudio heaps"): the samples go there.
+        if aoc::heaps() {
+            aoc::map_heap(aoc::MAP_PLAYBACK, aoc::HEAP_PLAYBACK, true)?;
+            s.heap = true;
+            say!("audio: the playback heap mapped into the AoC: A#{} bytes at G#{:X}", aoc::HEAP_PLAYBACK.1, aoc::HEAP_PLAYBACK.0);
+        }
+        // The speaker's tuning first, as Android's HAL sends it before an MMAP stream's setup (aoc.rs `tune`), from the hand spawn's input for now.
+        if let Some(t) = input_file(1) {
+            aoc::tune(t)?;
+            say!("audio: the speaker's tuning sent: A#{} bytes", t.len());
+        }
         // The MMAP way: the buffer is the whole ring (ALSA's buffer is the ring the app maps, aoc_alsa_pcm.c:733-770), silent, marked full; the writer keeps the lead ahead of the AoC's read place (`play_turn`).
-        aoc::setup_as(&s, aoc::MODE_PLAYBACK, s.ring_bytes(), p.period_bytes(), 3, 0)?;
+        // The period as Android's HAL gives it for this entry point: 1 ms of float frames, 384 bytes (measured 2026-11-24), whatever the service's own mixing period.
+        aoc::setup_as(&s, aoc::MODE_PLAYBACK, s.ring_bytes(), (48 * p.frame_bytes()) as u32, 3, 0)?;
         s.zero_all();
         s.mark_full();
+        // Android's second, shorter tuning came after the setup.
+        if let Some(t) = input_file(2) {
+            aoc::tune(t)?;
+            say!("audio: the speaker's second tuning sent: A#{} bytes", t.len());
+        }
     } else {
         aoc::setup(&s, aoc::MODE_PLAYBACK, p.buf * p.period_bytes(), p.period_bytes())?;
         let silence = [0u32; PERIOD];
@@ -223,6 +265,9 @@ fn down(s: &aoc::Services) {
     let _ = aoc::source(s, s.ep, false);
     amp::Amps::new().off();
     let _ = aoc::bind(s, s.ep, aoc::SINK_SPEAKER, false);
+    if s.heap {
+        let _ = aoc::map_heap(aoc::MAP_PLAYBACK, aoc::HEAP_PLAYBACK, false);
+    }
     say!("audio: speaker silent");
 }
 
@@ -730,7 +775,7 @@ fn probe() -> Result<([u32; 2], bool), &'static str> {
         return Err("the AoC is not up (the sensors process asks for its start at every boot)");
     }
     // Every audio ring the AoC lists (aoc_alsa_drv.c:34-74): where each lies, so which ones the granted windows reach is known (2026-11-24, the low-latency paths).
-    for name in [&b"audio_output_control"[..], b"audio_input_control", b"audio_playback0", b"audio_playback1", b"audio_playback5", b"audio_raw", b"audio_capture0", b"audio_capture1", b"audio_capture2", b"audio_capture3", b"audio_hifiin", b"audio_hifiout", b"audio_android_aec", b"audio_voip_rx", b"audio_voip_tx"] {
+    for name in [&b"audio_output_control"[..], b"audio_input_control", b"audio_playback0", b"audio_playback1", b"audio_playback5", b"audio_raw", b"audio_capture0", b"audio_capture1", b"audio_capture2", b"audio_capture3", b"audio_hifiin", b"audio_hifiout", b"audio_android_aec", b"audio_voip_rx", b"audio_voip_tx", b"audio_bulk_tx", b"audio_bulk_rx", b"audio_output_tuning", b"audio_input_tuning"] {
         aoc::dump(name);
     }
     // The rings are checked and said, and the probe goes on past a refusal: the control queue and the amplifiers are worth knowing about whatever the rings' places.

@@ -8,7 +8,7 @@
 //!
 //! The IPC block is Device memory, reached thru the `aoc-ipc` grant's handle: every access an aligned word or a byte (payloads/sensors usf.rs does the same).
 
-use crate::{say, S_CAPTURE, S_IPC, S_MBOX, S_PLAY_HI, S_PLAY_LO};
+use crate::{say, S_CAPTURE, S_HEAPS, S_IPC, S_MBOX, S_PLAY_HI, S_PLAY_LO};
 use ferros_sys::{cap, mmio_read, mmio_write, now, sleep_until, freq, Handle};
 
 type Ipc = Handle<S_IPC>;
@@ -283,6 +283,8 @@ pub struct Services {
     play: RingMap,
     /// The entry point the ring feeds.
     pub ep: u8,
+    /// The samples live in the playback heap (an MMAP stream, `map_heap`), at the ring's places.
+    pub heap: bool,
 }
 
 /// The playback ring of an entry point, by the name Linux allocates it by (aoc_alsa_drv.c:34-74; the device tree's front ends, gs101-audio.dtsi:63-190 and :426-440, name each ring and its entry point, google-aoc.h:27-36), and what Android routes thru it on husky (aoc_alsa_path.c:43-58, mixer_paths.xml:363-418):
@@ -316,7 +318,7 @@ pub fn services_for(ep: u8) -> Result<Services, &'static str> {
     if off & 3 != 0 || len & 3 != 0 {
         return Err("the playback ring is not word-aligned");
     }
-    Ok(Services { control, playback, play, ep })
+    Ok(Services { control, playback, play, ep, heap: false })
 }
 
 /// The default entry point's services.
@@ -624,6 +626,15 @@ impl Services {
         }
     }
 
+    /// A word at ring place `at`: in the playback heap for a mapped MMAP stream, in the IPC ring otherwise.
+    fn put_word(&self, off: u64, at: u64, v: u32) {
+        if self.heap {
+            heap_wr32(HEAP_PLAYBACK.0 + at, v)
+        } else {
+            self.play.wr32(off + at, v)
+        }
+    }
+
     /// Frames written at running count `count` as 32-bit floats, two words a frame (left, right): AAudio's MMAP port is PCM_FLOAT (audio_policy_configuration.xml:66-68), the format entry point 0 is set up for here (main.rs `start`).
     pub fn put_at_f32(&self, count: u32, frames: &[u32]) {
         let (off, _) = self.playback.span(DOWN);
@@ -632,7 +643,7 @@ impl Services {
         for &f in frames {
             for x in [f as u16 as i16, (f >> 16) as u16 as i16] {
                 // A sample over 2^15: full scale at 1.
-                self.play.wr32(off + at, (x as f32 * (1. / ((1u32 << 15) as f32))).to_bits());
+                self.put_word(off, at, (x as f32 * (1. / ((1u32 << 15) as f32))).to_bits());
                 at += 4;
                 if at == size {
                     at = 0;
@@ -647,7 +658,7 @@ impl Services {
         let size = self.playback.get(DOWN, R_SIZE) as u64;
         let mut at = self.place(count);
         for _ in 0..bytes >> 2 {
-            self.play.wr32(off + at, 0);
+            self.put_word(off, at, 0);
             at += 4;
             if at == size {
                 at = 0;
@@ -659,9 +670,93 @@ impl Services {
     pub fn zero_all(&self) {
         let (off, len) = self.playback.span(DOWN);
         for k in 0..len >> 2 {
-            self.play.wr32(off + 4 * k, 0);
+            self.put_word(off, 4 * k, 0);
         }
     }
+}
+
+// ── The AAudio heaps (measured from Android's HAL on the Pro, 2026-11-24: docs/AUDIO.md "What Android sends") ──
+//
+// An MMAP stream's samples are not in its IPC ring: Android's HAL hands the AoC a buffer inside the playback or the capture heap (the kernel's `parameters` declares both at the AoC's start) with CMD_MEM_MAP_REGION on the AoC's `control` service, and the AoC reads and writes the stream there at the ring's own places; the ring keeps only the counts.
+
+type Heaps = Handle<S_HEAPS>;
+/// The grant's start (kernel cachemap.rs AOC_HEAPS), the two heaps in it, and how the AoC sees the carve-out (aoc.c:187-198 `aoc_dram_translate_to_aoc`: G#9400_0000 on the AP is G#9800_0000 to the AoC).
+const HEAPS_BASE: u64 = 0x96BE_0000;
+pub const HEAP_CAPTURE: (u64, u32) = (0x96BE_C000, 64 << 10);
+pub const HEAP_PLAYBACK: (u64, u32) = (0x96BF_C000, 16 << 10);
+fn to_aoc(ap: u64) -> u32 {
+    (ap - 0x9400_0000 + 0x9800_0000) as u32
+}
+const CMD_MEM_MAP_REGION: u16 = 212;
+/// This process's names for its two mappings (any u32 the AP chooses: Linux passes its dma-buf's id).
+pub const MAP_PLAYBACK: u32 = 1;
+pub const MAP_CAPTURE: u32 = 2;
+
+/// Whether this process holds the heaps (a kernel from before 2026-11-24 grants nothing at slot 12).
+pub fn heaps() -> bool {
+    Heaps::len() >= 128 << 10
+}
+
+/// A heap mapped into the AoC, or unmapped (CMD_MEM_MAP_REGION, zuma.h:2438-2444, on `control`: the generic header's four zero bytes, then handle, base, size, mapped), as aoc_control_dev.c:587-609 sends it. `handle` is the caller's own name for the mapping.
+pub fn map_heap(handle: u32, heap: (u64, u32), on: bool) -> Result<(), &'static str> {
+    let control = find(b"control").ok_or("no control service")?;
+    if control.ring() || !control.fits(DOWN) || !control.fits(UP) {
+        return Err("the control service is not a queue inside the aoc-ipc window");
+    }
+    let mut c = [0u8; 25];
+    header(&mut c, CMD_MEM_MAP_REGION);
+    c[12..16].copy_from_slice(&handle.to_le_bytes());
+    c[16..20].copy_from_slice(&to_aoc(heap.0).to_le_bytes());
+    c[20..24].copy_from_slice(&heap.1.to_le_bytes());
+    c[24] = on as u8;
+    command_on(control, &mut c, &mut [0u8; 64]).map(|_| ())
+}
+
+fn heap_wr32(ap: u64, v: u32) {
+    Heaps::write32(ap - HEAPS_BASE, v)
+}
+fn heap_rd32(ap: u64) -> u32 {
+    Heaps::read32(ap - HEAPS_BASE)
+}
+
+// ── The speaker's tuning (measured from Android's HAL on the Pro, 2026-11-24: docs/AUDIO.md "What Android sends") ──
+//
+// Before an MMAP stream's setup Android's HAL writes its speaker tuning (11,272 bytes: ids with float values, biquad sets, the volume's gain) into the ring `audio_bulk_tx`, the whole 16 KiB of it, then sends SET_GET_PARAM_BULK (zuma.h:1112-1122) on the queue `audio_output_tuning`: block 16, component 2, the tuning's offset in the ring and its size. Without it entry point 0 takes samples and plays none.
+
+const CMD_SET_GET_PARAM_BULK: u16 = 213;
+
+/// The tuning `blob` sent as Android sends it: the bulk ring written whole from its write place (the blob, then zeros), then the command naming it.
+pub fn tune(blob: &[u8]) -> Result<(), &'static str> {
+    let bulk = find(b"audio_bulk_tx").ok_or("no audio_bulk_tx service")?;
+    let tun = find(b"audio_output_tuning").ok_or("no audio_output_tuning service")?;
+    // WHY: both are the AoC's, read from its memory; written only inside the aoc-ipc window (as `Svc::fits`).
+    if !bulk.ring() || !bulk.fits(DOWN) || tun.ring() || !tun.fits(DOWN) || !tun.fits(UP) {
+        return Err("audio_bulk_tx or audio_output_tuning is not where it should be");
+    }
+    let (off, size) = bulk.span(DOWN);
+    // WHY: the command carries the size in a u16 and the blob must fit the ring.
+    if blob.len() as u64 > size || blob.len() > u16::MAX as usize {
+        return Err("the tuning is larger than the bulk ring");
+    }
+    let wp = bulk.get(DOWN, R_WP) as u64;
+    let mut k = 0u64;
+    while k < size {
+        let mut w = [0u8; 4];
+        for (j, b) in w.iter_mut().enumerate() {
+            *b = blob.get(k as usize + j).copied().unwrap_or(0);
+        }
+        wr32(off + (wp + k) % size, u32::from_le_bytes(w));
+        k += 4;
+    }
+    unsafe { core::arch::asm!("dsb sy") };
+    bulk.set(DOWN, R_TX, bulk.get(DOWN, R_TX).wrapping_add(size as u32));
+    let mut c = [0u8; 26];
+    header(&mut c, CMD_SET_GET_PARAM_BULK);
+    c[8] = 16;
+    c[9] = 2;
+    c[10..12].copy_from_slice(&(wp as u16).to_le_bytes());
+    c[22..24].copy_from_slice(&(blob.len() as u16).to_le_bytes());
+    command_on(tun, &mut c, &mut [0u8; 64]).map(|_| ())
 }
 
 // ── The AoC-to-AP line (wc.c:150-175) ──
@@ -744,6 +839,9 @@ fn set_gains(c: &Capture, soft: i8, hw: i8) {
     m[10..14].copy_from_slice(&SOFT_GAIN.2.to_le_bytes());
     m[14..18].copy_from_slice(&(soft as i32).to_le_bytes());
     let _ = mic_command(c, "INPUT_SET_PARAMETER (the record soft gain)", &mut m);
+    // The MMAP record's own gain (hw.c:2280-2295 `aoc_mmap_record_gain_set`: block 136, component 0, key 16, whole dB), set to the same: Android's trace never showed it, so its value is whatever the AoC defaults to.
+    m[9] = 0;
+    let _ = mic_command(c, "INPUT_SET_PARAMETER (the MMAP record gain)", &mut m);
     let mut m = [0u8; 12];
     header(&mut m, CMD_SET_MIC_HIGH_POWER_HW_GAIN);
     m[8..12].copy_from_slice(&(hw as i32 * 10).to_le_bytes());
@@ -791,7 +889,8 @@ impl Shape {
     pub const LINUX: Shape = Shape { ms: CAPTURE_MS, width: WIDTH_16, gain: None, kind: REC_NORMAL };
     /// Channels in the ring: the three microphones on the normal path, two on the others.
     pub fn chans(self) -> usize {
-        if self.kind == REC_NORMAL { MICS } else { 2 }
+        // Android's MMAP and low-latency records ask for one channel (the HAL's commands, measured 2026-11-24); asked for two, the MMAP ring filled with zeros.
+        if self.kind == REC_NORMAL { MICS } else { 1 }
     }
     /// The PCM device the record path is (SET_PARAMS2's channel, hw.c:1822 and aoc_alsa.h:52-57).
     fn device(self) -> u8 {
@@ -825,6 +924,8 @@ pub struct Capture {
     win: RingMap,
     /// The record path (`Shape::kind`), for its stop.
     pub kind: u8,
+    /// The samples live in the capture heap (an MMAP record, `map_heap`), at the ring's places.
+    pub heap: bool,
 }
 
 /// The capture's two services by the names Linux allocates them by: the normal record's ring.
@@ -847,7 +948,7 @@ pub fn capture_services_for(shape: Shape) -> Result<Capture, &'static str> {
     if off & 1 != 0 || len & 1 != 0 {
         return Err("the record ring is not sample-aligned");
     }
-    Ok(Capture { control, ring, win, kind: shape.kind })
+    Ok(Capture { control, ring, win, kind: shape.kind, heap: false })
 }
 
 /// A capture command's reply checked only for arriving: the AoC's answer, or its error said with the command's name.
@@ -893,10 +994,12 @@ fn capture_steps(c: &Capture, shape: Shape) -> Result<(), &'static str> {
     m[10] = 5;
     m[11] = 1;
     m[12] = 0;
-    m[13] = (1 << shape.chans()) - 1;
-    m[14] = shape.ms;
+    // The PDM mask and the interleave as Android sends them for every record path: all three microphones, channel k from microphone k (a one-channel record takes the first).
+    m[13] = (1 << MICS) - 1;
+    // Android keeps 10 ms here on the MMAP and raw paths and gives the real period in SET_PARAMS2's bytes.
+    m[14] = if shape.kind == REC_NORMAL { shape.ms } else { CAPTURE_MS };
     m[15] = 4;
-    m[16..20].copy_from_slice(if shape.chans() == MICS { &[0, 1, 2, 0xFF] } else { &[0, 1, 0xFF, 0xFF] });
+    m[16..20].copy_from_slice(&[0, 1, 2, 0xFF]);
     m[20] = 5;
     m[21] = 0;
     mic_command(c, "MIC_RECORD_AP_SET_PARAMS", &mut m)?;
@@ -905,7 +1008,9 @@ fn capture_steps(c: &Capture, shape: Shape) -> Result<(), &'static str> {
     let mut m = [0u8; 17];
     header(&mut m, CMD_MIC_RECORD_AP_SET_PARAMS2);
     m[8] = shape.device();
-    m[9..13].copy_from_slice(&(4 * period).to_le_bytes());
+    // The buffer: four periods on the normal path, the whole ring on the MMAP and raw paths (Android's 46,080 for `audio_capture1`, measured).
+    let buffer = if shape.kind == REC_NORMAL { 4 * period } else { c.ring.span(UP).1 as u32 };
+    m[9..13].copy_from_slice(&buffer.to_le_bytes());
     m[13..17].copy_from_slice(&period.to_le_bytes());
     mic_command(c, "MIC_RECORD_AP_SET_PARAMS2", &mut m)?;
     // The microphone list as INPUT_SET_PARAMETER (zuma.h:1433-1439; hw.c:4334-4348): block 139 (ABLOCK_INPUT_PDM_MIC), component 0, key 0, the value's byte k microphone k's id, G#FF unused.
@@ -950,6 +1055,9 @@ pub fn capture_stop(c: &Capture) {
         m[8] = mic;
         let _ = mic_command(c, "MIC_POWER_OFF", &mut m);
     }
+    if c.heap {
+        let _ = map_heap(MAP_CAPTURE, HEAP_CAPTURE, false);
+    }
 }
 
 impl Capture {
@@ -988,7 +1096,7 @@ impl Capture {
         let mut done = 0u64;
         while done < n {
             if rp & 3 == 0 && n - done >= 4 && rp + 4 <= size {
-                let w = self.win.rd32(off + rp);
+                let w = if self.heap { heap_rd32(HEAP_CAPTURE.0 + rp) } else { self.win.rd32(off + rp) };
                 if bytes == 4 {
                     f((w >> 16) as u16 as i16, w);
                 } else {

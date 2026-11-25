@@ -121,7 +121,13 @@ fn start(shape: aoc::Shape) -> Result<(aoc::Capture, u16), &'static str> {
     if !aoc::online() {
         return Err("the AoC is not up (the sensors process asks for its start at every boot)");
     }
-    let c = aoc::capture_services_for(shape)?;
+    let mut c = aoc::capture_services_for(shape)?;
+    // An MMAP record's samples go to the capture heap, mapped first as Android's HAL does (aoc.rs "The AAudio heaps").
+    if shape.kind == aoc::REC_MMAP && aoc::heaps() {
+        aoc::map_heap(aoc::MAP_CAPTURE, aoc::HEAP_CAPTURE, true)?;
+        c.heap = true;
+        say!("audio: the capture heap mapped into the AoC: A#{} bytes at G#{:X}", aoc::HEAP_CAPTURE.1, aoc::HEAP_CAPTURE.0);
+    }
     aoc::describe("audio_input_control", c.control);
     aoc::describe_up("audio_capture0", c.ring);
     aoc::capture_start(&c, shape)?;
