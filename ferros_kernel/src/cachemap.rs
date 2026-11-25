@@ -171,6 +171,11 @@ pub const AOC_IPC: (usize, usize) = (0x95C0_0000, 0x95E0_0000);
 pub const AOC_PLAY_LO: (usize, usize) = (0x95C0_0000, 0x9600_0000);
 pub const AOC_PLAY_HI: (usize, usize) = (0x9600_0000, 0x9620_0000);
 pub const AOC_CAPTURE: (usize, usize) = (0x96A0_0000, 0x96B0_0000);
+/// The AoC's AAudio heaps (2026-11-24, docs/AUDIO.md "What Android sends"): Android's MMAP streams play from and record into buffers the AP hands the AoC with CMD_MEM_MAP_REGION, inside the two heaps ferros declares to the firmware at its start (aoc.rs `parameters`, keys G#100C to G#100F): the capture heap, 64 KiB at G#96BE_C000, and the playback heap, 16 KiB at G#96BF_C000, under the 4 MiB sensor heap at the carve-out's top (G#96C0_0000 to G#9700_0000). EL0 Device memory, granted to the audio service alone as `aoc-heaps`.
+/// WHY these bounds (AGENT.md rule 0): a granted region is reached thru a handle, base plus an offset masked to its size, so it must be a power of two aligned to itself (SANDBOX.md "Handles"). The two heaps together span G#96BE_C000 to G#96C0_0000 (80 KiB); the smallest aligned power of two holding them is 128 KiB at G#96BE_0000.
+/// PROOF: G#96BE_0000 is a multiple of G#2_0000, and G#96BE_0000 + G#2_0000 = G#96C0_0000, the sensor heap's start, so the window ends exactly where the heaps end and reaches none of the sensor heap; the 48 KiB below the capture heap (G#96BE_0000 to G#96BE_C000) is more of the AoC's own carve-out heap, the class of memory `aoc-capture` already reaches. It lies in the 2 MiB block the static map already gives EL0 as Device memory for `AOC_CAPTURE` (the assert below), so the map is unchanged.
+pub const AOC_HEAPS: (usize, usize) = (0x96BE_0000, 0x96C0_0000);
+const _: () = assert!(AOC_HEAPS.0 % (AOC_HEAPS.1 - AOC_HEAPS.0) == 0 && (AOC_HEAPS.1 - AOC_HEAPS.0).is_power_of_two() && AOC_HEAPS.0 / MIB2 == AOC_CAPTURE.0 / MIB2 && (AOC_HEAPS.1 - 1) / MIB2 == AOC_CAPTURE.0 / MIB2, "aoc-heaps: a power of two aligned to itself, inside the 2 MiB block the capture window's map already gives EL0");
 #[cfg(shim_handoff)]
 pub const USB_DMA: (usize, usize) = (0, 0);
 #[cfg(shim_handoff)]

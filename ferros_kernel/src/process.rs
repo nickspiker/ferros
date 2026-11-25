@@ -3067,6 +3067,8 @@ pub static DMA: &[Dma] = &[
     Dma { name: "aoc-play-lo", base: crate::cachemap::AOC_PLAY_LO.0, size: crate::cachemap::AOC_PLAY_LO.1 - crate::cachemap::AOC_PLAY_LO.0 },
     Dma { name: "aoc-play-hi", base: crate::cachemap::AOC_PLAY_HI.0, size: crate::cachemap::AOC_PLAY_HI.1 - crate::cachemap::AOC_PLAY_HI.0 },
     Dma { name: "aoc-capture", base: crate::cachemap::AOC_CAPTURE.0, size: crate::cachemap::AOC_CAPTURE.1 - crate::cachemap::AOC_CAPTURE.0 },
+    // The AoC's AAudio heaps, the MMAP streams' buffers (cachemap.rs AOC_HEAPS: the bounds' WHY): the audio service's alone.
+    Dma { name: "aoc-heaps", base: crate::cachemap::AOC_HEAPS.0, size: crate::cachemap::AOC_HEAPS.1 - crate::cachemap::AOC_HEAPS.0 },
     Dma { name: "display-fb", base: crate::cachemap::DISPLAY_FB.0, size: crate::cachemap::DISPLAY_FB.1 - crate::cachemap::DISPLAY_FB.0 },
     // Not DMA at all: the display server's cacheable heap, granted the same way (a base the process may use).
     Dma { name: "display-heap", base: crate::cachemap::DISPLAY_HEAP.0, size: crate::cachemap::DISPLAY_HEAP.1 - crate::cachemap::DISPLAY_HEAP.0 },
