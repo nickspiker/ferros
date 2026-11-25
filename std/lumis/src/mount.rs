@@ -28,12 +28,12 @@ const LOOK: Duration = Duration::from_millis(1 << 5);
 /// Where Lumis keeps its side of a pairing in its vault (one small module: when the identity's pairing store reaches kists, it moves there).
 const STORE: &str = "mount/pairing";
 
-/// The family's discovery tag (ACCESSORIES.md "Discovery"): the first 24 bytes of BLAKE3("lumis" ‖ "accessory").
-fn tag() -> [u8; 24] {
+/// The family's discovery tag (ACCESSORIES.md "Discovery"): the first 23 bytes of BLAKE3("lumis" ‖ "accessory") (with the flags and the class byte, an advertisement's 31 exactly).
+fn tag() -> [u8; 23] {
     let mut h = blake3::Hasher::new();
     h.update(b"lumis");
     h.update(b"accessory");
-    h.finalize().as_bytes()[..24].try_into().unwrap()
+    h.finalize().as_bytes()[..23].try_into().unwrap()
 }
 
 fn fresh<const N: usize>() -> [u8; N] {
@@ -126,8 +126,8 @@ fn family_class(data: &[u8]) -> Option<u8> {
         let len = data[at] as usize;
         // WHY get: the advertiser's bytes; a structure past the data is not one.
         let s = data.get(at + 1..at + 1 + len)?;
-        if len >= 1 + 2 + 25 && s[0] == 0xFF && s[1] == 0xFF && s[2] == 0xFF && s[3..27] == tag {
-            return Some(s[27]);
+        if len >= 1 + 2 + 24 && s[0] == 0xFF && s[1] == 0xFF && s[2] == 0xFF && s[3..26] == tag {
+            return Some(s[26]);
         }
         if len == 0 {
             return None;
