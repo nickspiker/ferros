@@ -24,7 +24,7 @@ unsafe fn take(size: usize) -> *mut c_void {
 /// Past 16: `align + size` bytes from malloc, the object at the first `align` boundary past its first word, the block's start in the word below the object.
 unsafe fn take_aligned(size: usize, align: usize) -> *mut c_void {
     // WHY: g++ hands `new[]` SIZE_MAX when an array's count times its element size overflows (so that the allocation fails), and both paths below add to the size (cabi.rs its 16-byte header, this one `align`).
-    // PROOF: SIZE_MAX + 16 wraps to 15, and malloc would hand back a 31-byte block for an array the caller then fills; no object can be over isize::MAX bytes, so above it is a failure, and at or below it neither sum can wrap (align is under 2^63).
+    // PROOF: with `align` 64, SIZE_MAX + 64 wraps to 63 and malloc would hand back a block of 63 bytes for an array the caller then fills (cabi.rs refuses a wrap of its own header, not this sum); no object can be over isize::MAX bytes, so above it is a failure, and at or below it the sum cannot wrap (align is under 2^63).
     if size > isize::MAX as usize {
         return core::ptr::null_mut();
     }

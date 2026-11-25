@@ -19,6 +19,10 @@ pub mod layout;
 #[path = "../../../ferros_rt/src/alloc.rs"]
 pub mod alloc;
 
+/// The C allocator's size arithmetic (cabi.rs): its tests run with these.
+#[path = "../../../ferros_rt/src/csize.rs"]
+pub mod csize;
+
 /// SplitMix64: a small deterministic generator for the tests and the benchmark.
 pub struct Rng(pub u64);
 

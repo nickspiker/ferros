@@ -1,16 +1,21 @@
 //! The few C symbols the C in a std image's graph calls (PQClean through `tools/std-sysroot`, rav1d by name through libc): the allocator over the process heap, with the size kept in a 16-byte header before each block, and `strlen`. The mem routines (memcpy, memset, memmove, memcmp) are compiler_builtins'.
+//!
+//! The sizes C asks for are untrusted: one that cannot be a block is refused with null (csize.rs, with the WHY and the PROOF), never wrapped into a small block the caller then writes past.
 
 use core::alloc::Layout;
 
-const HEADER: usize = 16;
+use crate::csize::{self, HEADER};
 
+/// The block of a size `malloc` already accepted (read back from its header by `free` and `realloc`).
 fn layout(size: usize) -> Layout {
+    // SAFETY: `size` was accepted by `csize::block` when the block was made, so the sum fits and the layout is valid.
     unsafe { Layout::from_size_align_unchecked(size + HEADER, HEADER) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
-    let p = unsafe { crate::alloc::alloc(layout(size)) };
+    let Some(block) = csize::block(size) else { return core::ptr::null_mut() };
+    let p = unsafe { crate::alloc::alloc(block) };
     if p.is_null() {
         return p;
     }
@@ -22,7 +27,7 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut u8 {
-    let n = count * size;
+    let Some(n) = csize::calloc_bytes(count, size) else { return core::ptr::null_mut() };
     let p = unsafe { malloc(n) };
     if !p.is_null() {
         unsafe { core::ptr::write_bytes(p, 0, n) };
