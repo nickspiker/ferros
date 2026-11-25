@@ -335,12 +335,61 @@
          font-size: calc(1.7 * var(--ru));
          white-space: nowrap;
       }
+
+      /* The install: one command a platform, the live one first; a platform not yet tested is shown, greyed, until it is. */
+      .install {
+         text-align: left;
+         width: min(100%, 60ch);
+         margin: calc(2 * var(--ru)) auto;
+      }
+
+      .install h3 {
+         font-family: var(--mono);
+         font-weight: 400;
+         font-size: calc(2 * var(--ru));
+         color: var(--zero);
+         margin-top: calc(3 * var(--ru));
+      }
+
+      .install .cmd {
+         display: block;
+         font-family: var(--mono);
+         font-size: calc(1.7 * var(--ru));
+         color: var(--ink);
+         border: calc(0.1 * var(--ru)) solid var(--line);
+         padding: calc(1 * var(--ru)) calc(1.6 * var(--ru));
+         margin: calc(1 * var(--ru)) 0;
+         white-space: pre-wrap;
+         overflow-wrap: anywhere;
+         user-select: all;
+      }
+
+      .install .later {
+         color: var(--faint);
+      }
+
+      .install .later h3,
+      .install .later .cmd {
+         color: var(--faint);
+      }
+
+      .install .later .cmd {
+         user-select: none;
+      }
+
+      .install .tag {
+         font-family: var(--mono);
+         font-size: calc(1.6 * var(--ru));
+         color: var(--faint);
+         letter-spacing: 0.1em;
+         text-transform: uppercase;
+      }
    </style>
 </head>
 <body>
    <main>
       <nav>
-         <a href="https://passless.org/">passless.org</a> · <a href="https://passless.org/photon/">photon</a> · <a href="https://github.com/nickspiker/ferros">source</a>
+         <a href="https://passless.org/">passless.org</a> · <a href="https://passless.org/photon/">photon</a> · <a href="https://github.com/nickspiker/ferros">source</a> · <a href="#install">install</a>
       </nav>
 
       <img class="logo" src="logo.svg" alt="The ferros mark">
@@ -374,6 +423,26 @@
 
       <p class="one">&lt;1</p>
       <p><strong>Under one second</strong> from the bootloader to the deck, from cold, every time.</p>
+
+      <h2 id="install">Install</h2>
+      <div class="install">
+         <p>For a <strong>Pixel 8a</strong> or a <strong>Pixel 8 Pro</strong>, nothing else. ferros replaces Android on it entirely: pure ferros, no Android beside it.</p>
+
+         <h3>Windows <span class="tag">live</span></h3>
+         <p>In PowerShell:</p>
+         <code class="cmd">powershell -ExecutionPolicy Bypass -c "irm https://get.ferros.org/install.ps1 | iex"</code>
+         <p>It downloads the installer tool, checks it against the hash of this release, installs it for you alone (no administrator), and starts the guide. With the phone in its bootloader (power off, then hold power and volume down) and on the cable, the guide finds the phone, names it, reads whether its bootloader is locked, shows you the plan, and stops. This first build writes nothing to the phone.</p>
+         <p class="warn">The tool is not yet code-signed for Windows, so Windows may warn that it comes from an unknown publisher. The installer checks the download against this release's hash before it runs it; the phone's images, when the tool flashes them, come in a release signed with the ferros key and are checked against it first.</p>
+
+         <div class="later">
+            <h3>macOS and Linux <span class="tag">not yet</span></h3>
+            <p>One installer for both, here once we have tested it:</p>
+            <code class="cmd">curl -sSfL https://get.ferros.org/install.sh | sh</code>
+         </div>
+
+         <h3>Logs</h3>
+         <p>Every run writes a log on your computer: what the tool did and what the phone answered, never a handle, a key, a location or your files. Nothing is sent anywhere unless you type yes; then it goes to fgtw.org, the phone's serial replaced by a hash, kept for 32 days. If something goes wrong, sending it is the most useful thing you can do.</p>
+      </div>
 
       <h2>What runs today</h2>
       <p>On a Pixel 8 Pro, from a cold boot, with no Linux underneath (and on a Pixel 8a too, all of it but the cameras and satellite positioning, so far):</p>
@@ -519,13 +588,13 @@
          <dt>Not started</dt>
          <dd>Carrier voice, by design, never. Glyph's hardware (years nine to twelve of the plan).</dd>
          <dt>Last updated</dt>
-         <dd>2026-11-10</dd>
+         <dd>2026-11-24</dd>
       </dl>
 
       <h2>Questions</h2>
       <dl>
          <dt>Can I run it on my device?</dt>
-         <dd>Yes, today, if it is a Pixel 8 Pro or a Pixel 8a: development builds, flashed from the repository (<code>tools/husky-cold.sh</code> on the Pro, <code>tools/akita-hv.sh</code> on the 8a), with a stock Android kept alongside. A public release is expected by 2027-01-01. Other devices come after; bringing one up is months of work each.</dd>
+         <dd>If it is a Pixel 8a or a Pixel 8 Pro: the installer above, the first steps of it today, and the whole of it as it is built. Development builds are flashed from the repository (<code>tools/husky-cold.sh</code> on the Pro, <code>tools/akita-hv.sh</code> on the 8a). A public release is expected by 2027-01-01. Other devices come after; bringing one up is months of work each.</dd>
          <dt>No passwords?</dt>
          <dd>One handle, yours. You give it to people so they can find you; you never give it to a machine that keeps it, and no server holds anything to compare it against. The things you carry today are the easy ones to steal: a social security number, a card number, an address, a password. Each is a copy, and whoever holds the copy is you, from anywhere, for as long as nobody notices. The handle is not a copy. Knowing it gets you nothing; it derives you only on a device of yours, and a device of yours is something you can see, hold and cut off. A stolen password fails quietly, everywhere, for months. A stolen device fails loudly, once, and you cut it off.</dd>
          <dt>What if I lose my device?</dt>
