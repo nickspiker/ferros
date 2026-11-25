@@ -248,7 +248,7 @@ fn trail(s: u64) {
     }
 }
 
-/// The suspend trail (G#FD60_0F40, u64 words in the ramoops page, kept through a warm reset, cleared when Android boots): what Android's sleeps did under the hv, so a hang in deep sleep (HV.md: the one path never measured) leaves its last steps for the boot after. 0 magic "SUSPEND1"; 1 system suspends entered; 2 the counter at the last; 3 the hv core's AFFINITY_INFO after it switched itself off (1: off); 4 what EL3 answered when a system suspend came back (it only returns on failure); 5 resumes after a system suspend; 6 the counter at the last; 7 the core it came back on; 8 CPU_SUSPENDs (idle); 9 the last one's core; 10 its power state; 11 the last CPU_SUSPEND's counter.
+/// The suspend trail (G#FD60_0F40, u64 words in the ramoops page, kept through a warm reset, cleared when Android boots): what Android's sleeps did under the hv, so a hang in deep sleep (HV.md: the one path never measured) leaves its last steps for the boot after. 0 magic "SUSPEND1"; 1 system suspends entered; 2 the counter at the last; 3 the hv core's AFFINITY_INFO after it switched itself off (1: off); 4 what EL3 answered when a system suspend came back (it only returns on failure); 5 resumes after a system suspend; 6 the counter at the last; 7 the core it came back on; 8 CPU_SUSPENDs (idle); 9 the last one's core; 10 its power state; 11 the last CPU_SUSPEND's counter; 12 the hv core's own c2 power-downs asked (`hvcore::idle`); 13 of them refused by EL3; 14 the last answer that came back (a power-down that happens never answers); 15 the hv core's warm wakes out of c2.
 const SUSP: usize = 0xFD60_0F40;
 const SUSP_MAGIC: u64 = 0x5355_5350_454E_4431; // "SUSPEND1"
 static mut SUSP_PENDING: bool = false;
@@ -2605,7 +2605,7 @@ mod hvcore {
         }
         set(0, MAGIC);
         // The suspend trail starts fresh with each Android boot.
-        for i in 0..12 {
+        for i in 0..16 {
             super::susp(i, 0, false);
         }
         super::susp(0, super::SUSP_MAGIC, false);
@@ -3005,9 +3005,47 @@ mod hvcore {
         false
     }
 
+    /// This core's CPU_INFORM word in the PMU (zuma flexpmu_cal_cpu_zuma.h: G#1546_0860 + 4 x core), written through EL3 (PRIV_REG, option 1 = write) as Linux's cpupm does around every c2.
+    const CPU_INFORM: u64 = 0x1546_0860 + (MPIDR >> 8) * 4;
+    const INFORM_C2: u64 = 1;
+    /// zuma's and akita's c2, the DTs' `arm,psci-suspend-param`: PSCI's original format, state type 1 (power down) at the core's level.
+    const C2_STATE: u64 = 0x1_0000;
+    /// Set once EL3 answers CPU_SUSPEND with an error: the core then waits in plain `wfi` as before, with no call per wait.
+    static mut C2_REFUSED: bool = false;
+    /// Set just before the power-down, so the warm boot at `_hvcore` that follows knows it is a wake, not a start.
+    static mut FROM_C2: bool = false;
+
+    /// The wait between interrupts, powered down as Linux's idle cores are (owner, 2026-11-24: the 8a's battery under the hv).
+    /// In plain `wfi` this core stays powered and clocked at EL2 forever, while Linux's cpupm counts it offline and asks the SoC for SICD whenever its own eight are idle: SICD and the cluster's shared logic need every core powered down, so they were never reached while Android was awake.
+    /// The key SPIs and the stop line still reach it: the redistributor's wake request powers the core up, EL3 warm-boots it at `_hvcore`, and `hv_core_main` sets up again and reads the interrupt that woke it.
+    /// On success the call never returns; it returns only when EL3 refused it or the power-down was abandoned for an interrupt already pending.
+    fn idle() {
+        if unsafe { read_volatile(&raw const C2_REFUSED) } {
+            unsafe { asm!("wfi") };
+            return;
+        }
+        super::susp(12, 1, true);
+        unsafe { write_volatile(&raw mut FROM_C2, true) };
+        smc(0x8200_0504, CPU_INFORM, 1, INFORM_C2);
+        let r = smc(0xC400_0001, C2_STATE, super::_hvcore as *const () as u64, 0);
+        // The hint is cleared at once: a core left with it dies at its next plain `wfi` with nothing saved (POWER.md, deep idle).
+        smc(0x8200_0504, CPU_INFORM, 1, 0);
+        unsafe { write_volatile(&raw mut FROM_C2, false) };
+        super::susp(14, r, false);
+        if r != 0 {
+            super::susp(13, 1, true);
+            unsafe { write_volatile(&raw mut C2_REFUSED, true) };
+            super::pstore::log(&[b"\nferros hv: hvcore -- CPU_SUSPEND refused, the core waits in wfi\n"]);
+        }
+    }
+
     fn off_now() -> ! {
+        // The stop line is taken back first: `stop` raised it to wake this core, and the loop sees STOP before it reads the interface, so the line stayed pending, enabled and routed to a core that is off.
+        // A pending interrupt for a core that is off is a wake request to the power controller: the suspend Linux is about to ask for has a reason to end before it starts (HV.md: "Resume caused by sleep abort (by tf-a or acpm)").
+        wr(GICD + 0x280 + (STOP_INTID as usize / 32) * 4, 1 << (STOP_INTID % 32)); // GICD_ICPENDR
+        unsafe { asm!("dsb sy") };
         // C2 hint first, as `park` and Linux's offline do.
-        smc(0x8200_0504, 0x1546_0860 + (MPIDR >> 8) * 4, 1, 1);
+        smc(0x8200_0504, CPU_INFORM, 1, INFORM_C2);
         unsafe {
             asm!("msr s3_0_c12_c12_7, xzr", "isb"); // ICC_IGRPEN1_EL1
             asm!("smc #0", in("x0") 0x8400_0002u64);
@@ -3028,7 +3066,15 @@ mod hvcore {
             asm!("msr hcr_el2, {h}", "isb", h = in(reg) (1u64 << 31) | (1 << 5) | (1 << 4) | (1 << 3));
             asm!("msr s3_4_c12_c9_5, {v}", "isb", v = in(reg) 0x9u64); // ICC_SRE_EL2: SRE | Enable
         }
-        stat(3, 1);
+        // A warm boot out of `idle`'s c2 is not a start: the hint goes back to 0 first, as Linux's cpupm clears it on every exit, and the key lines' routing in the distributor (written once per start) is left alone.
+        let woke = unsafe { read_volatile(&raw const FROM_C2) };
+        if woke {
+            unsafe { write_volatile(&raw mut FROM_C2, false) };
+            smc(0x8200_0504, CPU_INFORM, 1, 0);
+            super::susp(15, 1, true);
+        } else {
+            stat(3, 1);
+        }
         let Some(gicr) = my_gicr() else {
             set(13, 0xFF);
             super::pstore::log(&[b"\nferros hv: hvcore -- no redistributor for core 3, off\n"]);
@@ -3048,7 +3094,7 @@ mod hvcore {
             asm!("msr s3_0_c12_c12_4, xzr"); // ICC_CTLR_EL1: EOImode 0, EOI drops priority and deactivates
             asm!("msr s3_0_c12_c12_7, {v}", "isb", v = in(reg) 1u64); // ICC_IGRPEN1_EL1
         }
-        for id in KEYS.iter().map(|k| k.0).chain([STOP_INTID]) {
+        for id in KEYS.iter().map(|k| k.0).chain([STOP_INTID]).filter(|_| !woke) {
             let n = id as usize;
             unsafe { write_volatile((GICD + 0x6000 + n * 8) as *mut u64, MPIDR) };
             let pr = GICD + 0x400 + (n & !3);
@@ -3068,7 +3114,7 @@ mod hvcore {
             let id = (iar & 0xFF_FFFF) as u32;
             if (1020..1024).contains(&id) {
                 stat(6, 1);
-                unsafe { asm!("wfi") };
+                idle();
                 continue;
             }
             stat(4, 1);
