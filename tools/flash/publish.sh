@@ -43,7 +43,7 @@ sed -e "s|__BASE__|$BASE|g" -e "s|__SHA256_WINDOWS_X86_64__|$W|" tools/flash/ins
 sed -e "s|__BASE__|$BASE|g" -e "s|__SHA256_LINUX_X86_64__|$L|" -e "s|__SHA256_MACOS_ARM64__||" tools/flash/install/install.sh > "$OUT/install.sh"
 
 echo "== staged in $OUT ($CHANNEL)"
-echo "   Windows: powershell -ExecutionPolicy Bypass -c \"irm $BASE/install.ps1 | iex\""
+echo "   Windows: powershell -ExecutionPolicy Bypass -c \"iex (irm $BASE/install.ps1 | Out-String)\""
 echo "   Linux:   curl -sSfL $BASE/install.sh | sh"
 if [ $UPLOAD = 0 ]; then
     echo "   not uploaded (--upload puts it in the R2 bucket $BUCKET)"
@@ -74,6 +74,7 @@ done
 put ferros-flash-windows-x86_64.exe "$OUT/ferros-flash-windows-x86_64.exe" application/octet-stream no-cache
 put ferros-flash-linux-x86_64 "$OUT/ferros-flash-linux-x86_64" application/octet-stream no-cache
 put release.vsf "$OUT/release.vsf" application/octet-stream no-cache
-put install.ps1 "$OUT/install.ps1" "text/plain; charset=utf-8" no-cache
-put install.sh "$OUT/install.sh" "text/plain; charset=utf-8" no-cache
+# The installers as Photon's are served (text/plain, no charset): with "text/plain; charset=utf-8" the owner's Windows PowerShell 5.1 fed `irm | iex` the script a line at a time (2026-11-24); the one line's `Out-String` guards against that either way.
+put install.ps1 "$OUT/install.ps1" text/plain no-cache
+put install.sh "$OUT/install.sh" text/plain no-cache
 echo "== uploaded to $BUCKET ($BASE)"

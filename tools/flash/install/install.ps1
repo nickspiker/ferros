@@ -2,7 +2,8 @@
 # It downloads the tool, checks the download's SHA-256 against the one written into this script at publish time, and installs it for this user only (no administrator).
 # The tool then checks everything else it fetches (the boot images, the board manifests) by BLAKE3 against a release signed with the ferros key, before it writes anything to the phone.
 # PowerShell has SHA-256 built in and not BLAKE3, so this one check, of the tool itself, is SHA-256; nothing after it is.
-# Run: powershell -ExecutionPolicy Bypass -c "irm __BASE__/install.ps1 | iex"
+# Run: powershell -ExecutionPolicy Bypass -c "iex (irm __BASE__/install.ps1 | Out-String)"
+# `Out-String` makes the script one string whatever Invoke-RestMethod hands back: on 2026-11-24 the owner's Windows PowerShell gave `| iex` the script a line at a time ("trap {" alone, then "Missing closing '}'"), so a bare `irm | iex` is not trusted.
 
 $ErrorActionPreference = "Stop"
 trap {

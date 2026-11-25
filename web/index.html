@@ -430,7 +430,7 @@
 
          <h3>Windows <span class="tag">live</span></h3>
          <p>In PowerShell:</p>
-         <code class="cmd">powershell -ExecutionPolicy Bypass -c "irm https://get.ferros.org/install.ps1 | iex"</code>
+         <code class="cmd">powershell -ExecutionPolicy Bypass -c "iex (irm https://get.ferros.org/install.ps1 | Out-String)"</code>
          <p>It downloads the installer tool, checks it against the hash of this release, installs it for you alone (no administrator), and starts the guide. With the phone in its bootloader (power off, then hold power and volume down) and on the cable, the guide finds the phone, names it, reads whether its bootloader is locked, shows you the plan, and stops. This first build writes nothing to the phone.</p>
          <p class="warn">The tool is not yet code-signed for Windows, so Windows may warn that it comes from an unknown publisher. The installer checks the download against this release's hash before it runs it; the phone's images, when the tool flashes them, come in a release signed with the ferros key and are checked against it first.</p>
 

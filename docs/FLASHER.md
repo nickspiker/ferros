@@ -115,11 +115,11 @@ The install door is kernel work, approved by the owner (2026-11-24: "Yes"); it n
 ## 4. Distribution
 
 The same shape as Photon's install (photon README "Installation", installers/install-release.ps1 and .sh).
-- **The one line.** Windows: `powershell -ExecutionPolicy Bypass -c "irm <base>/install.ps1 | iex"`. Linux and macOS: `curl -sSfL <base>/install.sh | sh`. The installer downloads `ferros-flash-<platform>`, checks its SHA-256 against the one tools/flash/publish.sh wrote into it, installs it for the user only (no administrator), and starts the guide.
+- **The one line.** Windows: `powershell -ExecutionPolicy Bypass -c "iex (irm <base>/install.ps1 | Out-String)"`. Linux and macOS: `curl -sSfL <base>/install.sh | sh`. The installer downloads `ferros-flash-<platform>`, checks its SHA-256 against the one tools/flash/publish.sh wrote into it, installs it for the user only (no administrator), and starts the guide.
 - **SHA-256 at the bootstrap only.** PowerShell has SHA-256 built in and no BLAKE3, and few systems have b3sum, so the installer's one check of the tool itself is SHA-256, as Photon's. Everything the tool fetches after that is BLAKE3 in VSF.
 - **The release** (release.rs): one VSF document Ed25519-signed with the ferros key (keys/ferros.key.vsf; the tool pins keys/ferros.pub), section `release` (channel, the commit) and one `artefact` section a file (role, name, board, platform, size, BLAKE3 `hb`). Every file is served under its BLAKE3 in hex, so a host can swap nothing.
 - **publish.sh** builds the Windows (x86_64-pc-windows-gnu, from this host) and Linux executables, the board manifests, any boot images given, signs the release, writes the installers and stages it all; it uploads only when told (`FERROS_FLASH_UPLOAD=r2:<bucket>/<path>`, Photon's route). macOS waits for a mac build host.
-- **The host** (owner, 2026-11-24: "R2"): the R2 bucket `ferros`, its custom domain https://get.ferros.org (made 2026-11-24). `tools/flash/publish.sh --upload` puts the staged release there under the R2 token in keys/: files named by their BLAKE3 cached for good, the installers, the fixed-name executables and release.vsf with `no-cache`, so an edge never pairs an old executable with a new installer. The one lines: `powershell -ExecutionPolicy Bypass -c "irm https://get.ferros.org/install.ps1 | iex"` and `curl -sSfL https://get.ferros.org/install.sh | sh`.
+- **The host** (owner, 2026-11-24: "R2"): the R2 bucket `ferros`, its custom domain https://get.ferros.org (made 2026-11-24). `tools/flash/publish.sh --upload` puts the staged release there under the R2 token in keys/: files named by their BLAKE3 cached for good, the installers, the fixed-name executables and release.vsf with `no-cache`, so an edge never pairs an old executable with a new installer. The one lines: `powershell -ExecutionPolicy Bypass -c "iex (irm https://get.ferros.org/install.ps1 | Out-String)"` and `curl -sSfL https://get.ferros.org/install.sh | sh`.
 - **Code signing** (Authenticode, and Developer ID for macOS) is the owner's cost decision. Until then the executable is unsigned, the installer says Windows may warn of an unknown publisher, and the signed release is what vouches for the images.
 
 ## 5. Logging
@@ -186,7 +186,8 @@ This is not built and needs measuring on the 8a before any lock (none is ever se
 ## The first Windows test (what it looks like today)
 
 On the owner's Windows PC, with the 8a in its bootloader on the cable:
-0. `powershell -ExecutionPolicy Bypass -c "irm https://get.ferros.org/install.ps1 | iex"`.
+0. `powershell -ExecutionPolicy Bypass -c "iex (irm https://get.ferros.org/install.ps1 | Out-String)"`.
+   The first try (2026-11-24, Windows PowerShell as administrator) failed before the tool ran: the old line, `irm ... | iex`, handed Invoke-Expression the script a line at a time ("Cannot bind argument to parameter 'Command' because it is an empty string", then "trap {" alone: "Missing closing '}'"). The one served difference from Photon's installer, which works the same way, was the Content-Type (ours `text/plain; charset=utf-8`, Photon's `text/plain`); both installers are now served as Photon's is, and the line's `Out-String` joins whatever comes back into one script either way. Not reproducible here (no Windows PowerShell on this host): the owner's next run is the check.
 1. The guide finds the phone and names it, or says the phone cannot be opened (the WinUSB question, with what to install); the log says which.
 2. It reads the lock state (the 8a is unlocked), shows the plan, and stops before the backup.
 3. It offers to send the run's log to fgtw.org/report; he types yes, and quotes the hash it answers (or runs `ferros-flash log send` later, from any terminal).
