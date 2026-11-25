@@ -6,7 +6,7 @@ case $1 in
 on)
   echo 0 > $T/tracing_on; echo > $T/trace; echo 65536 > $T/buffer_size_kb
   for fn in aoc_service_write aoc_service_write_timeout; do
-    grep -q " $fn\b" /proc/kallsyms && echo "p:aoctx_$fn $fn len=%x2 svc=+0(+0(%x0)):string a=+0(%x1):x32[64] b=+256(%x1):x32[64] c=+512(%x1):x32[64] d=+768(%x1):x32[64]" >> $T/kprobe_events
+    grep -qw "$fn" /proc/kallsyms && echo "p:aoctx_$fn $fn len=%x2 svc=+0(+0(%x0)):string a=+0(%x1):x32[64] b=+256(%x1):x32[64] c=+512(%x1):x32[64] d=+768(%x1):x32[64]" >> $T/kprobe_events
   done
   for e in $T/events/kprobes/aoctx_*; do echo 1 > $e/enable; done
   echo 1 > $T/tracing_on; cat $T/kprobe_events ;;
