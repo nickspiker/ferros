@@ -202,6 +202,17 @@ pub fn secret_of(doc: &[u8]) -> Option<[u8; 32]> {
     }
 }
 
+/// The context a new device-only secret is mixed under (`device_secret_mix`).
+pub const DEVICE_SECRET_MIX: &str = "ferros 2026-11-24 device secret mix v0";
+
+/// A new device-only secret from its eggs (the owner's single egg rule, 2026-10-15: "Four eggs is good. You know my single egg rule."; critical entropy comes from several independent sources, so no single firmware, vendor or physical effect decides it): `fresh`, 256 bits KOHI gathers at that moment from the physical sources present (the firmware TRNG, RNDR where it exists, CPU timing jitter; health-tested, the byzantine threshold), and `session`, the wairua's keyed stream (itself KOHI's gather at the power session's start). BLAKE3 derive_key over both, so it is as strong as the stronger egg, and nobody reconstructs it from the ira, a counter or a time: the fresh egg is drawn for this secret alone and never kept (owner, 2026-11-24, on the secret derived from the clock until then: "yes, you should").
+pub fn device_secret_mix(fresh: &[u8; 32], session: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key(DEVICE_SECRET_MIX);
+    h.update(fresh);
+    h.update(session);
+    *h.finalize().as_bytes()
+}
+
 /// The device-only secret with the bound mark (`device_secret`).
 pub fn device_secret_document(secret: &[u8; 32], bound: bool, now: i64) -> Option<Vec<u8>> {
     let name = String::from(DEVICE_SECRET_SECTION);
@@ -307,6 +318,18 @@ mod tests {
         assert_eq!(device_secret_of(&device_secret_document(&[5; 32], true, NOW).unwrap()), Some(([5; 32], true)));
         assert_eq!(device_secret_of(&device_secret_document(&[6; 32], false, NOW).unwrap()), Some(([6; 32], false)));
         assert_eq!(kept_of(&kept_document(env.clone(), NOW).unwrap()), Some(env));
+    }
+
+    /// Two secrets made at the same counter value (so the same session egg) differ when their fresh eggs differ: a renewal is never the clock's function. And each egg moves the result.
+    #[test]
+    fn two_secrets_at_one_counter_differ() {
+        let session = [7; 32];
+        let a = device_secret_mix(&[1; 32], &session);
+        let b = device_secret_mix(&[2; 32], &session);
+        assert_ne!(a, b, "the same counter, two fresh eggs: two secrets");
+        assert_ne!(device_secret_mix(&[1; 32], &[8; 32]), a, "the session egg moves it too");
+        assert_ne!(a, [1; 32]);
+        assert_ne!(a, session);
     }
 
     /// The two secret documents are never read for each other, and a kept seed is never read as the old plain one.

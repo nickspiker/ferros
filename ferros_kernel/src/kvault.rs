@@ -88,6 +88,8 @@ const ID_PAYLOAD_CONTEXT: &str = "ferros identity vault payload v1";
 const ID_DOMAIN_CONTEXT: &str = "ferros 2026-11-07 identity vault domain";
 const ID_SECRET_CONTEXT: &str = "ferros identity secret v1";
 /// The kept seed's seal key (`kept_key`): BLAKE3 derive_key over (the ira-derived device key ‖ the device-only secret), so a renewed secret leaves a kept seed unopenable with nothing deleted (owner, 2026-11-24).
+/// The context KOHI extracts a device secret's fresh egg under (`fresh_secret`).
+const ID_SECRET_EGG_CONTEXT: &str = "ferros 2026-11-24 device secret egg v0";
 const KEPT_CONTEXT: &str = "ferros 2026-11-24 kept seed v0";
 const KEPT_DEVICE_CONTEXT: &str = "ferros 2026-11-24 kept seed device";
 /// The person's ledger key, from the identity root as the vault keys are (`IdKeys.ledger`).
@@ -336,6 +338,8 @@ pub enum KvError {
     Document(&'static str),
     /// No room in the kernel heap for a value of this many bytes (docs/NO-CEILINGS.md 1): a refusal, the value untouched.
     Memory(u64),
+    /// KOHI found too few healthy entropy sources for a new device secret (NGARO), or the wairua is not held: refused, nothing changed.
+    NoEntropy,
 }
 impl From<manifestus::Error> for KvError {
     fn from(e: manifestus::Error) -> Self {
@@ -743,8 +747,8 @@ impl KVault {
                 crate::keys::wipe_to_dram(&mut got);
             }
             None => {
-                if !crate::keys::stream(ID_SECRET_CONTEXT, &crate::platform::cntpct().to_le_bytes(), &mut secret) {
-                    return Err(KvError::NoIra);
+                if !fresh_secret(&mut secret) {
+                    return Err(KvError::NoEntropy);
                 }
                 // The secret and the bound mark in one document (not bound yet).
                 let doc = ferros_pieces::kv::device_secret_document(&secret, false, now());
@@ -1033,8 +1037,9 @@ impl KVault {
             None => false,
         };
         let mut secret = [0u8; 32];
-        if !crate::keys::stream(ID_SECRET_CONTEXT, &crate::platform::cntpct().to_le_bytes(), &mut secret) {
-            return Err(KvError::NoIra);
+        // Refused, the renewal changes nothing: the old secret stays, the device as it was (locked).
+        if !fresh_secret(&mut secret) {
+            return Err(KvError::NoEntropy);
         }
         let doc = ferros_pieces::kv::device_secret_document(&secret, false, now());
         crate::keys::wipe_to_dram(&mut secret);
@@ -1360,4 +1365,29 @@ impl KVault {
 /// The kernel vault's two mirror regions in the ferros partition (first block, blocks: A then B), for the owner's fresh start (service.rs `vault fresh`), which zeroes them: manifestus genesises a blank pair at the next open.
 pub fn regions() -> (u64, u64) {
     (MIRROR_OFFSET, 2 * REGION_BLOCKS)
+}
+
+/// A new device-only secret (the first, at an identity's first unlock here, and every renewal), from two independent eggs under the owner's single egg rule (2026-10-15: "Four eggs is good. You know my single egg rule."): KOHI gathered now, for this secret alone (the firmware TRNG, RNDR where present, CPU timing jitter, each health-tested, the byzantine threshold; kohi.rs `gather`), and the wairua's keyed stream (KOHI's gather at this power session's start, held in registers) over that fresh value. The ira seals the stored copy and never makes its contents.
+/// Until 2026-11-24 the secret was the wairua's stream over the cycle counter alone, so whoever held the wairua could find it by trying counter values around the renewal (owner: "yes, you should" fix it). False, the out wiped, when KOHI finds too few healthy sources (NGARO) or the wairua is not held: the caller refuses, never falls back to a derived value.
+/// KOHI's gather takes its W samples from each source (about a third of a second on husky, KOHI-SOURCES.md), under the kernel lock here: a first unlock and a renewal are rare.
+fn fresh_secret(out: &mut [u8; 32]) -> bool {
+    let (fresh, health) = crate::kohi::gather(ID_SECRET_EGG_CONTEXT);
+    let healthy = health.iter().filter(|h| h.ok()).count();
+    let Some(mut fresh) = fresh else {
+        crate::flashlog::line(&alloc::format!("identity: no new device secret: KOHI refused (A#{healthy} healthy sources); nothing changed"));
+        out.fill(0);
+        return false;
+    };
+    let mut session = [0u8; 32];
+    let ok = crate::keys::stream(ID_SECRET_CONTEXT, &fresh, &mut session);
+    if ok {
+        *out = ferros_pieces::kv::device_secret_mix(&fresh, &session);
+        crate::flashlog::line(&alloc::format!("identity: a new device secret from KOHI now (A#{healthy} healthy sources) and the session's wairua"));
+    } else {
+        out.fill(0);
+        crate::flashlog::line("identity: no new device secret: the wairua is not held; nothing changed");
+    }
+    crate::keys::wipe_to_dram(&mut fresh);
+    crate::keys::wipe_to_dram(&mut session);
+    ok
 }
