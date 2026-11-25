@@ -69,6 +69,11 @@ pub fn input_file(k: usize) -> Option<&'static [u8]> {
 static GRANTS: AtomicU64 = AtomicU64::new(0);
 /// The cores the clock thread is pinned to, as `ferros_sys::pin` takes them (0: as spawned); set by a bench, taken by the clock thread at its next wake (a pin applies to the calling thread).
 static PIN: AtomicU64 = AtomicU64::new(0);
+/// The clock thread's longest turn and its parts, in counter ticks (the microphones' turn, the playback's mix and writes, the amplifiers' watch): what keeps the thread from its next ring (measure before fixing: the clicks of 2026-11-24).
+static TURN_MAX: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+fn turn_part(k: usize, t: u64) {
+    TURN_MAX[k].fetch_max(t, Ordering::Relaxed);
+}
 pub fn grants() -> u64 {
     GRANTS.load(Ordering::Relaxed)
 }
@@ -300,8 +305,14 @@ extern "C" fn clock(_: u64) -> ! {
         let rang = aoc::take();
         irq_ack(irq);
         ferros_sys::pet();
+        let t0 = ferros_sys::now();
         mic::turn(rang);
+        let t1 = ferros_sys::now();
         play_turn(rang);
+        let t2 = ferros_sys::now();
+        turn_part(0, t2 - t0);
+        turn_part(1, t1 - t0);
+        turn_part(2, t2 - t1);
     }
 }
 
@@ -454,7 +465,10 @@ fn mmap_turn(st: &mut State, s: &aoc::Services, p: Play) {
 
 /// The amplifiers read once a period while sound plays (the AoC's interrupt is the clock, no timer), outside the lock: only this thread drives their port while `up` (`start` runs before it is set, `down` and `fault` after this thread clears it). Any error bit (AMP_SHORT, BST_SHORT, TEMP, BST_OVP, BST_DCM_UVP) stops everything at once (`fault`): there is no speaker protection in bypass (amp.rs), so a fault is never played thru.
 fn watch() {
-    match amp::Amps::new().status() {
+    let t = ferros_sys::now();
+    let r = amp::Amps::new().status();
+    turn_part(3, ferros_sys::now() - t);
+    match r {
         Ok(w) => {
             let st = lock();
             st.amps = w;
@@ -1058,6 +1072,7 @@ impl Bench {
         say!("audio: bench: the AoC's samples A#{} to A#{}: A#{} taken, A#{} expected at 48 kHz over the bench", self.samples0, samples1, samples1.wrapping_sub(self.samples0), us(elapsed) * 48 / 1000);
         // The mean gap over the gaps there were: one fewer than the interrupts (none for one interrupt, said as 0).
         let mean = if self.irqs > 1 { us(self.gap_sum / (self.irqs as u64 - 1)) } else { 0 };
+        say!("audio: bench: the clock thread's longest turn A#{} us: the microphones' A#{}, the playback's A#{} (of it the amplifiers' watch A#{})", us(TURN_MAX[0].load(Ordering::Relaxed)), us(TURN_MAX[1].load(Ordering::Relaxed)), us(TURN_MAX[2].load(Ordering::Relaxed)), us(TURN_MAX[3].load(Ordering::Relaxed)));
         say!("audio: bench: A#{} interrupts, gaps A#{} to A#{} us, mean A#{}; queued at a ring A#{} to A#{} bytes; taken between rings A#{} to A#{} bytes", self.irqs, us(self.gap_min), us(self.gap_max), mean, self.q_min, self.q_max, self.take_min, self.take_max);
         let mut l = Line { b: [0; 256], n: 0 };
         for (k, &c) in self.gaps.iter().enumerate().filter(|(_, c)| **c != 0) {
