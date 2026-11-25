@@ -130,13 +130,15 @@ Events, each [kind u8][length u16][body]:
 
 The `why` of a closed channel (link.rs `WHY_*`): 0 the peer closed it, 1 the client, 2 the link ended, 3 a K-frame past its credits, 4 an SDU past the MTU, 5 a K-frame past the MPS, 6 more bytes than the SDU's length, 7 a first K-frame without its length, 8 the peer's credits past 65535, 9 an ACL fragment out of place, 10 the UART lost its framing, 11 the chip restarted, 12 the peer's answer out of range, 13 no answer to the open.
 
-### The right's scope (questions for the owner, 2026-11-24; nothing decided)
+### The right's scope (decided by the owner, 2026-11-24)
 
-The right is built as KISTS.md proposed it, one right for everything a client op does. What it should cover is the owner's call:
-- **Everything near, or its own accessories.** As built, a kist with the right scans every advertiser in range and connects to any. Like "network: its places" against "network: anywhere", it could be split: its accessories only (the advertisers matching what its capsule declares, an address list or a manufacturer tag), and everything near (a scanner, a pairing tool).
-- **A scan says where you are.** The addresses and data in range are as telling as a location (Android asks for location to scan). Should a kist's scan see only what its capsule declares, the rest never reaching it?
-- **Whose address.** AUTH.md "Pairings" has the person's devices knowing the identity's address, derived from the identity key; the driver today uses a static random address drawn at its start. Derived per person (the same on every device, so an accessory paired once knows the person anywhere, the one-radio-at-a-time rule then deciding which device holds it), or per person and kist (unlinkable across kists)? The driver would need the ira right (`ira_person_key`, as pcie1 has) for either.
-- **Out of view.** Lumis keeps the mount's channel while recording; may a kist hold links when it is not in front, and does the console show a live link as it shows the camera?
+The owner: "a simple bluetooth permission yes/no and when yes, it lets the app bluetooth whenever it wants. we may add more granularity later."
+- **One right, yes or no**, asked once (permissions_asked_once), as built (0f99b62c, in the kernel since ebfc18ee).
+- **Everything near:** a kist with the right scans every advertiser in range and sees what it hears; no filtering by what its capsule declares.
+- **Anything:** it connects to any device, as an LE central, and opens channels on it.
+- **Whenever it wants:** it keeps its scans, links and channels while it is not in front (Lumis holding the mount's channel while it records).
+- **Later, maybe:** finer grains (its own accessories only, scans filtered by the capsule, a console mark for a live link) are the owner's to add when wanted; none is built or planned now.
+- **Still open, apart from the scope:** whose address the driver wears (the person's, derived from the identity, or per kist; AUTH.md "Pairings"), today a static random address drawn when the driver starts.
 
 ## Links and channels
 
