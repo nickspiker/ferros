@@ -418,9 +418,8 @@ impl FluorApp for Scope {
         Some(PixelRect::new(0, 0, viewport.width_px as usize, viewport.height_px as usize))
     }
 
-    fn hit_test_map(&self) -> Option<(&[HitId], usize, usize)> {
-        let (w, h) = self.chrome.dims();
-        Some((self.chrome.hit_test_map(), w, h))
+    fn hit_test_map(&mut self) -> Option<(&mut [HitId], usize, usize)> {
+        Some(self.chrome.hit_map_mut())
     }
 
     fn overlay_deltas(&mut self) -> Vec<u32> {
@@ -437,6 +436,8 @@ impl FluorApp for Scope {
         self.chrome.rasterize_bg(ctx.damage, |canvas| canvas.pixels.fill(pack_argb(10, 14, 22, 255)));
         self.chrome.rasterize_perimeter(target, buf_w, buf_h, ctx.clip_mask);
         self.chrome.rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
+        // Front to back: the window's controls first, then the readout, the widgets and the trace under them, the bg layer last.
+        self.chrome.flatten_chrome_into(target, buf_w, buf_h, None);
         let span = ctx.viewport.effective_span();
         let font = span / 40.;
         let label = pack_argb(200, 208, 220, 255);
@@ -467,7 +468,7 @@ impl FluorApp for Scope {
         if x.len() >= 2 {
             self.draw_trace(target, buf_w, &x, ctx.damage);
         }
-        self.chrome.flatten_into(target, buf_w, buf_h, None);
+        self.chrome.flatten_bg_into(target, buf_w, buf_h, None);
     }
 
     fn cursor_for(&self, x: Coord, y: Coord, ctx: &Context) -> CursorIcon {

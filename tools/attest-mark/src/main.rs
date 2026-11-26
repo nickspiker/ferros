@@ -449,9 +449,8 @@ impl FluorApp for App {
         }
     }
 
-    fn hit_test_map(&self) -> Option<(&[HitId], usize, usize)> {
-        let (w, h) = self.chrome.dims();
-        Some((self.chrome.hit_test_map(), w, h))
+    fn hit_test_map(&mut self) -> Option<(&mut [HitId], usize, usize)> {
+        Some(self.chrome.hit_map_mut())
     }
 
     fn overlay_deltas(&mut self) -> Vec<u32> {
@@ -498,19 +497,20 @@ impl FluorApp for App {
             self.mark_key = key;
         }
 
-        // Front to back: the window's edge and controls, the textbox, then the mark under everything.
+        // Front to back: the window's edge and controls, the textbox, the mark under both, then the chrome's bg layer behind everything.
         self.chrome.rasterize_perimeter(target, w, h, ctx.clip_mask);
         self.chrome.rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
+        self.chrome.flatten_chrome_into(target, w, h, None);
         {
             let mut canvas = Canvas::new(target, w, h, ctx.damage);
             self.textbox.render_blinkey_into(&mut canvas, 0., 0.);
             let id = self.textbox.hit_id();
             self.textbox.render_content_into(&mut canvas, 0., 0., ctx.text, None, None, Some(&mut self.chrome.hit_test_map), id);
         }
-        self.chrome.flatten_into(target, w, h, None);
         for (dst, &src) in target.iter_mut().zip(self.mark.iter()) {
             *dst = dst.under(src, BlendMode::Normal);
         }
+        self.chrome.flatten_bg_into(target, w, h, None);
         ctx.damage.add_bounds(0, 0, w, h);
     }
 

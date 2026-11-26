@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use detect::Device;
 use ferros_flash::runlog::{self, Ev, RunLog};
-use fluor::canvas::{Canvas, PixelRect};
+use fluor::canvas::Canvas;
 use fluor::coord::Coord;
 use fluor::event::{CursorIcon, ElementState, Event, ModifiersState, MouseButton};
 use fluor::geom::Viewport;
@@ -484,7 +484,6 @@ impl FluorApp<G2t16> for App {
         // The chrome first: the window's edge, then its strip and controls, which take their hits before anything of ours.
         self.ui.chrome.rasterize_perimeter(target, w, h, ctx.clip_mask);
         self.ui.chrome.rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
-        self.ui.chrome.clear_hits(PixelRect::new(0, 0, w, h));
         self.ui.chrome.flatten_chrome_into(target, w, h, None);
         self.ui.chrome.settle_bg();
         apply_pressed(&mut self.ui, ctx.pressed_hit);
@@ -637,9 +636,8 @@ impl FluorApp<G2t16> for App {
         if self.ui.chrome.hit_at(x, y) != HIT_NONE { CursorIcon::Pointer } else { CursorIcon::Default }
     }
 
-    fn hit_test_map(&self) -> Option<(&[HitId], usize, usize)> {
-        let (w, h) = self.ui.chrome.dims();
-        Some((self.ui.chrome.hit_test_map(), w, h))
+    fn hit_test_map(&mut self) -> Option<(&mut [HitId], usize, usize)> {
+        Some(self.ui.chrome.hit_map_mut())
     }
 
     fn overlay_deltas(&mut self) -> Vec<u32> {

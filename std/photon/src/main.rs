@@ -419,7 +419,7 @@ impl FluorApp<Px> for Ferros {
     fn overlay_bboxes(&mut self, viewport_w: usize, viewport_h: usize) -> Vec<Option<fluor::canvas::PixelRect>> {
         self.app.overlay_bboxes(viewport_w, viewport_h)
     }
-    fn hit_test_map(&self) -> Option<(&[fluor::paint::HitId], usize, usize)> {
+    fn hit_test_map(&mut self) -> Option<(&mut [fluor::paint::HitId], usize, usize)> {
         self.app.hit_test_map()
     }
     fn builtin_zoom_chords(&self) -> bool {

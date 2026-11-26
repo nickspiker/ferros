@@ -362,9 +362,8 @@ impl FluorApp for App {
         Some(PixelRect::new(0, 0, viewport.width_px as usize, viewport.height_px as usize))
     }
 
-    fn hit_test_map(&self) -> Option<(&[HitId], usize, usize)> {
-        let (w, h) = self.chrome.dims();
-        Some((self.chrome.hit_test_map(), w, h))
+    fn hit_test_map(&mut self) -> Option<(&mut [HitId], usize, usize)> {
+        Some(self.chrome.hit_map_mut())
     }
 
     fn overlay_deltas(&mut self) -> Vec<u32> {
@@ -377,7 +376,8 @@ impl FluorApp for App {
         self.chrome.rasterize_perimeter(target, w, h, ctx.clip_mask);
         self.chrome.rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
 
-        // Front to back: the page names, the page's front (sliders, text), the chrome, the page's back (its pictures), then the grounds.
+        // Front to back: the chrome, the page names, the page's front (sliders, text), the page's back (its pictures), the grounds, then the chrome's bg layer.
+        self.chrome.flatten_chrome_into(target, w, h, None);
         let font = font(ctx.viewport.effective_span());
         for (i, (p, name)) in PAGES.iter().enumerate() {
             let mut canvas = Canvas::new(target, w, h, ctx.damage);
@@ -389,11 +389,11 @@ impl FluorApp for App {
             Page::Orbs => self.orbs.render_front(target, ctx, &mut self.chrome.hit_test_map, dragging),
             Page::Wall => self.wall.render_front(target, ctx, &mut self.chrome.hit_test_map),
         }
-        self.chrome.flatten_into(target, w, h, None);
         match self.page {
             Page::Orbs => self.orbs.render_back(target, w, h),
             Page::Wall => self.wall.render_back(target, w, h),
         }
+        self.chrome.flatten_bg_into(target, w, h, None);
         ctx.damage.add_bounds(0, 0, w, h);
         if self.page == Page::Orbs && self.orbs.alive() {
             ctx.window.request_redraw();

@@ -403,8 +403,8 @@ impl FluorApp<G2t16> for Pad {
         self.draw_all(target, w, h, &mut *ctx.text, pressed, ctx.damage);
     }
 
-    fn hit_test_map(&self) -> Option<(&[HitId], usize, usize)> {
-        Some((&self.hits, self.size.0, self.size.1))
+    fn hit_test_map(&mut self) -> Option<(&mut [HitId], usize, usize)> {
+        Some((&mut self.hits, self.size.0, self.size.1))
     }
 
     fn opaque(&self) -> bool {
@@ -424,8 +424,7 @@ impl Pad {
             self.place();
         }
         let Some(layout) = self.layout else { return };
-        // The map starts each frame empty: the whole frame is drawn again (fluor's default damage).
-        self.hits.fill(HIT_NONE);
+        // The map starts each frame empty: the host clears it over the frame's damage before `render`, and the damage is the whole frame (fluor's default).
         let mut canvas = Canvas::new(target, w, h, damage);
         // Front to back (AGENT.md "Compositing"): the text in front of everything, then each key (its label in front of its body), then the ground behind it all.
         self.draw_display(&mut canvas, text, &layout);
