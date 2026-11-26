@@ -65,6 +65,8 @@ pub mod kind {
     pub const CHOSEN: u8 = 13;
     /// The person's number base (SETTINGS.md "The number base", 2026-11-22: settings flow identity to device only, as the language): chosen on the settings page of a device that follows it, written to each device that follows it, never read back from one.
     pub const BASE: u8 = fgtw::prefs::BASE;
+    /// The person's own preferred name and avatar pin (the owner, 2026-11-26: kept by whatever manages the identity, so every kist sees them and they stay stable across device changes), one entry per field, read and written thru fgtw::profile (`own`, `set_own`), which Photon uses too.
+    pub const SELF: u8 = fgtw::profile::SELF;
 }
 
 /// The scope of the fleet's shared arrangement.
