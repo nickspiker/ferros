@@ -362,7 +362,16 @@ impl FluorApp for Scope {
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
-                if self.chrome.set_hover(self.chrome.hit_at(x, y)) {
+                let hit = self.chrome.hit_at(x, y);
+                if self.chrome.set_hover(hit) {
+                    widget::apply_hover(self as &mut dyn Container, hit);
+                    ctx.window.request_redraw();
+                }
+                EventResponse::Pass
+            }
+            Event::CursorLeft => {
+                if self.chrome.set_hover(HIT_NONE) {
+                    widget::apply_hover(self as &mut dyn Container, HIT_NONE);
                     ctx.window.request_redraw();
                 }
                 EventResponse::Pass

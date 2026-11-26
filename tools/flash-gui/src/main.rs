@@ -27,7 +27,7 @@ use fluor::host::WakeSender;
 use fluor::host::app::{Context, EventResponse, FluorApp, run_app};
 use fluor::host::chrome::{ResizeEdge, get_resize_edge, strip_height};
 use fluor::host::chrome_widget::DefaultChrome;
-use fluor::host::widget::{Container, Widget, apply_pressed, build_overlay_deltas, dispatch_release};
+use fluor::host::widget::{Container, Widget, apply_hover, apply_pressed, build_overlay_deltas, dispatch_release};
 use fluor::paint::{self, HIT_NONE, HitId, claim_hits, draw_squircle_rrect, fill_rect};
 use fluor::pixel::{Blend, BlendMode, G2t16, Pixel};
 use fluor::text::{TextRenderer, TextStyle};
@@ -370,9 +370,16 @@ impl FluorApp<G2t16> for App {
         match event {
             Event::CursorMoved { x, y } => {
                 let hit = self.ui.chrome.hit_at(*x, *y);
-                self.ui.chrome.set_hover(hit);
-                for b in [&mut self.ui.install, &mut self.ui.send, &mut self.ui.later].into_iter().flatten() {
-                    b.set_hovered(hit == b.hit_id());
+                if self.ui.chrome.set_hover(hit) {
+                    apply_hover(&mut self.ui, hit);
+                    ctx.window.request_redraw();
+                }
+                EventResponse::Handled
+            }
+            Event::CursorLeft => {
+                if self.ui.chrome.set_hover(HIT_NONE) {
+                    apply_hover(&mut self.ui, HIT_NONE);
+                    ctx.window.request_redraw();
                 }
                 EventResponse::Handled
             }

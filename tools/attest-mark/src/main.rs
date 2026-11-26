@@ -279,12 +279,14 @@ impl FluorApp for App {
             Event::CursorMoved { .. } => {
                 let hit = self.chrome.hit_at(ctx.cursor_x, ctx.cursor_y);
                 if self.chrome.set_hover(hit) {
+                    widget::apply_hover(self as &mut dyn Container, hit);
                     ctx.window.request_redraw();
                 }
                 EventResponse::Pass
             }
             Event::CursorLeft => {
                 if self.chrome.set_hover(HIT_NONE) {
+                    widget::apply_hover(self as &mut dyn Container, HIT_NONE);
                     ctx.window.request_redraw();
                 }
                 EventResponse::Pass

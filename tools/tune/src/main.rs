@@ -162,6 +162,10 @@ impl App {
         }
         self.change_focus(None, ctx);
         self.dragging = None;
+        // The page that goes leaves the visit walk, so a slider of it under the cursor is unhovered now, while the walk still reaches it; the next cursor move hovers what is under it on the new page.
+        if self.chrome.set_hover(HIT_NONE) {
+            widget::apply_hover(self as &mut dyn Container, HIT_NONE);
+        }
         self.page = p;
         self.chrome.resize(ctx.viewport);
         self.chrome.set_full_edge(ctx.is_maximized);
@@ -290,13 +294,16 @@ impl FluorApp for App {
                     }
                     return EventResponse::Handled;
                 }
-                if self.chrome.set_hover(self.chrome.hit_at(x, y)) {
+                let hit = self.chrome.hit_at(x, y);
+                if self.chrome.set_hover(hit) {
+                    widget::apply_hover(self as &mut dyn Container, hit);
                     ctx.window.request_redraw();
                 }
                 EventResponse::Pass
             }
             Event::CursorLeft => {
                 if self.chrome.set_hover(HIT_NONE) {
+                    widget::apply_hover(self as &mut dyn Container, HIT_NONE);
                     ctx.window.request_redraw();
                 }
                 EventResponse::Pass
