@@ -1,9 +1,11 @@
 //! The fastboot transport on a real phone: nusb (plain Rust on Linux, macOS and Windows, no libusb), the crate the bridge already uses.
 //! A bootloader in fastboot shows one interface of class G#FF, subclass G#42, protocol G#03 with a bulk endpoint each way; that triple finds it, whatever its USB ids.
 //! On Windows nusb needs the WinUSB driver bound to that interface; when it is not, the guide installs Google's own USB driver package (the CLI's driver.rs).
+//! `watch` is the live detector (the GUI's device silhouette): nusb's hotplug stream, a scan on each arrival or departure, never a poll.
 
 use crate::fastboot::Transport;
 use nusb::transfer::{Direction, EndpointType, RequestBuffer};
+use std::sync::Arc;
 use std::time::Duration;
 
 const CLASS: u8 = 0xFF;
@@ -26,13 +28,18 @@ pub struct Found {
 pub enum Seen {
     /// A bootloader in fastboot, its interface found.
     Fastboot(Found),
-    /// A Google device this computer cannot open (on Windows: no WinUSB driver bound to it), with the system's own words.
+    /// A Google device this computer cannot open (on Windows: no WinUSB driver bound to it; on Linux: no udev rule), with the system's own words.
     NoDriver { vid: u16, pid: u16, why: String },
-    /// A Google device that is not in fastboot (the phone in Android): its USB ids.
-    Other { vid: u16, pid: u16 },
+    /// A Google device that is not in fastboot (the device in Android): its USB ids and the product its descriptor names ("Pixel 8a").
+    Other { vid: u16, pid: u16, product: String },
+    /// A device already running ferros (its own USB ids).
+    Ferros { product: String },
 }
 
 const GOOGLE: u16 = 0x18D1;
+/// ferros's own USB ids (pid.codes, docs/FLASHER.md).
+pub const FERROS_VID: u16 = 0x1209;
+pub const FERROS_PID: u16 = 0x4665;
 /// The ADB interface (G#FF, G#42, G#01) of a phone in Android, checked on Windows so the driver goes on before the phone is even in its bootloader.
 const ADB_PROTOCOL: u8 = 0x01;
 
@@ -73,15 +80,16 @@ pub fn scan() -> Result<Vec<Seen>, String> {
             out.push(Seen::Fastboot(found(&d, i.interface_number())));
             continue;
         }
-        // A phone already running ferros (its own USB ids): not in its bootloader either.
-        if d.vendor_id() == 0x1209 && d.product_id() == 0x4665 {
-            out.push(Seen::Other { vid: d.vendor_id(), pid: d.product_id() });
+        // A device already running ferros (its own USB ids): not in its bootloader either.
+        if d.vendor_id() == FERROS_VID && d.product_id() == FERROS_PID {
+            out.push(Seen::Ferros { product: d.product_string().unwrap_or("ferros").to_string() });
             continue;
         }
         if d.vendor_id() != GOOGLE {
             continue;
         }
         let (vid, pid) = (d.vendor_id(), d.product_id());
+        let product = d.product_string().unwrap_or("").to_string();
         if d.interfaces().next().is_none() {
             match d.open() {
                 Err(e) => out.push(Seen::NoDriver {
@@ -91,7 +99,7 @@ pub fn scan() -> Result<Vec<Seen>, String> {
                 }),
                 Ok(dev) => match fastboot_interface(&dev) {
                     Some(n) => out.push(Seen::Fastboot(found(&d, n))),
-                    None => out.push(Seen::Other { vid, pid }),
+                    None => out.push(Seen::Other { vid, pid, product }),
                 },
             }
             continue;
@@ -111,13 +119,46 @@ pub fn scan() -> Result<Vec<Seen>, String> {
                         pid,
                         why: e.to_string(),
                     }),
-                    Ok(()) => out.push(Seen::Other { vid, pid }),
+                    Ok(()) => out.push(Seen::Other { vid, pid, product }),
                 }
             }
-            _ => out.push(Seen::Other { vid, pid }),
+            _ => out.push(Seen::Other { vid, pid, product }),
         }
     }
     Ok(out)
+}
+
+/// A waker that unparks the thread waiting on the hotplug stream.
+struct Unpark(std::thread::Thread);
+
+impl std::task::Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// The devices on this computer as they change: `seen` is called once with what is there now, and again after every USB arrival or departure (nusb's hotplug stream: udev's netlink on Linux, IOKit on macOS, device notifications on Windows), each time with a fresh `scan`.
+/// Nothing is asked on a timer: between events the thread is parked, woken by the stream's own waker.
+/// It holds the thread it runs on and returns only when the stream ends, or when `seen` returns false.
+pub fn watch(mut seen: impl FnMut(Result<Vec<Seen>, String>) -> bool) -> Result<(), String> {
+    use std::task::{Context, Poll};
+    let mut stream = Box::pin(nusb::watch_devices().map_err(|e| format!("watching USB devices: {e}"))?);
+    if !seen(scan()) {
+        return Ok(());
+    }
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match futures_core::Stream::poll_next(stream.as_mut(), &mut cx) {
+            Poll::Ready(Some(_)) => {
+                if !seen(scan()) {
+                    return Ok(());
+                }
+            }
+            Poll::Ready(None) => return Ok(()),
+            Poll::Pending => std::thread::park(),
+        }
+    }
 }
 
 /// Every phone in fastboot on this computer.

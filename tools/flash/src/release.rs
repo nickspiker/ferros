@@ -27,6 +27,8 @@ pub enum Role {
     Capsule = 3,
     /// The AVB public key blob for `fastboot flash avb_custom_key`, which the re-lock needs.
     AvbKey = 4,
+    /// The ferros mark as analytic VSF shapes (logo.vsf): the installer draws it from here, never from a copy baked into its executable.
+    Logo = 5,
 }
 
 impl Role {
@@ -37,6 +39,7 @@ impl Role {
             Role::Boot,
             Role::Capsule,
             Role::AvbKey,
+            Role::Logo,
         ]
         .into_iter()
         .find(|r| *r as u64 == v)

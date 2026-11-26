@@ -12,7 +12,7 @@ path = "src/main.rs"
 [features]
 default = ["usb"]
 # The fastboot transport on a real phone (usb.rs); off, the library is the host-tested protocol alone.
-usb = ["dep:nusb", "dep:tokio"]
+usb = ["dep:nusb", "dep:tokio", "dep:futures-core"]
 # Signing a release (the publisher's side, keys from keys/, never in the tool people download).
 publish = ["vsf/crypto", "dep:ed25519-dalek", "dep:ferros_kist"]
 
@@ -21,6 +21,8 @@ blake3 = "1"
 # Every document the tool reads or writes: board manifests, the signed release, the run log (`text-encode` for words in `x`).
 vsf = { path = "../../../vsf", features = ["crypto-verify", "text-encode"] }
 nusb = { version = "0.1", optional = true }
+# The hotplug stream's trait (usb.rs `watch`): nusb speaks futures-core's Stream and re-exports nothing of it.
+futures-core = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["rt", "time", "macros"], optional = true }
 ed25519-dalek = { version = "2", optional = true }
 # Google's USB driver package checked against its pinned SHA-256 (driver.rs): the hash Google's manifest does not give (it gives SHA-1).

@@ -833,6 +833,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "ferros_kist",
+ "futures-core",
  "nusb",
  "sha2",
  "tokio",

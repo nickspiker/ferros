@@ -11,6 +11,8 @@ So the flasher offers no keep-Android option, and every hosted image is a produc
 
 Owner, 2026-11-24, on the boot: "no 1s boot gate or green arrow, just straight to ferros since the google nag is already obnoxious."
 
+Owner, 2026-11-25: the installer is a GUI, in fluor, "supa easy", and its one word is consent; the brand it speaks is docs/BRAND.md.
+
 The owner's answers, 2026-11-24 (relayed by the coordinator):
 - Hosting: "R2", ferros.org on R2 as Photon's is served; deploys to ferros.org need no further go. Built: the bucket `ferros` at https://get.ferros.org.
 - The image: "Bare ferros, no hypervisor".
@@ -46,7 +48,8 @@ Every step says what it will do before it does it, every write is read back, and
 | 5 Logging | built and live: the run log, `log send` to fgtw.org/report on a typed yes, the endpoint, `reports.sh` to read what came | tools/flash/src/runlog.rs, reports.sh; fgtw-bootstrap `handle_report` |
 | Production images | Android paths compiled out of the kernel and the hv; image composition proposed (bare ferros) | below |
 | Updating while locked | designed, for the owner | below |
-| The fluor GUI, code signing | later; signing is the owner's cost decision | |
+| The fluor GUI | built to screen 1 (below, "The GUI"): the welcome with the live device silhouette, the steps screen, the log offer; three targets built | tools/flash-gui |
+| Code signing | later; the owner's cost decision | |
 
 ## 0. Firmware from the phone's own partitions
 
@@ -121,7 +124,8 @@ The same shape as Photon's install (photon README "Installation", installers/ins
 - **The one line.** Windows: two lines in PowerShell, `irm <base>/install.ps1 -OutFile $env:TEMP\ferros-install.ps1` then `powershell -ExecutionPolicy Bypass -File $env:TEMP\ferros-install.ps1` (run as a file, never thru `iex`: "The first Windows test"). Linux and macOS: `curl -sSfL <base>/install.sh | sh`. The installer downloads `ferros-flash-<platform>`, checks its SHA-256 against the one tools/flash/publish.sh wrote into it, installs it for the user only (no administrator), and starts the guide.
 - **SHA-256 at the bootstrap only.** PowerShell has SHA-256 built in and no BLAKE3, and few systems have b3sum, so the installer's one check of the tool itself is SHA-256, as Photon's. Everything the tool fetches after that is BLAKE3 in VSF.
 - **The release** (release.rs): one VSF document Ed25519-signed with the ferros key (keys/ferros.key.vsf; the tool pins keys/ferros.pub), section `release` (channel, the commit) and one `artefact` section a file (role, name, board, platform, size, BLAKE3 `hb`). Every file is served under its BLAKE3 in hex, so a host can swap nothing.
-- **publish.sh** builds the Windows (x86_64-pc-windows-gnu, from this host) and Linux executables, the board manifests, any boot images given, signs the release, writes the installers and stages it all; it uploads only when told (`FERROS_FLASH_UPLOAD=r2:<bucket>/<path>`, Photon's route). macOS waits for a mac build host.
+- **publish.sh** builds the Windows (x86_64-pc-windows-gnu), Linux and macOS (aarch64-apple-darwin, cross-built with osxcross at /mnt/Harbor/Code/osxcross as Photon's deploy.sh builds it) executables, the CLI and the GUI each, the board manifests, the mark (logo.vsf, role `logo`), any boot images given, signs the release, writes the installers and stages it all; it uploads only with `--upload`.
+- **The installers** fetch both executables (`ferros-flash-gui-<platform>` and `ferros-flash-<platform>`), check each against its SHA-256 written in at publish time, install them for the user, and open the window. On macOS the executables are unsigned and unnotarized, so Gatekeeper warns; install.sh clears the quarantine flag, and the person allows the rest in Privacy & Security.
 - **The host** (owner, 2026-11-24: "R2"): the R2 bucket `ferros`, its custom domain https://get.ferros.org (made 2026-11-24). `tools/flash/publish.sh --upload` puts the staged release there under the R2 token in keys/: files named by their BLAKE3 cached for good, the installers, the fixed-name executables and release.vsf with `no-cache`, so an edge never pairs an old executable with a new installer. The one lines: the two PowerShell lines above and `curl -sSfL https://get.ferros.org/install.sh | sh`.
 - **Code signing** (Authenticode, and Developer ID for macOS) is the owner's cost decision. Until then the executable is unsigned, the installer says Windows may warn of an unknown publisher, and the signed release is what vouches for the images.
 
@@ -186,6 +190,20 @@ With ONE-VAULT.md the boot slots hold the seed, not the kernel, and a kernel upd
 A locked bootloader verifies the top-level `vbmeta` against that key, and Google's top `vbmeta` chains `boot` to Google's key, so the phone also needs a top `vbmeta` signed by the ferros key. That `vbmeta` carries Google's hash descriptors for `dtbo`, `vendor_boot`, `vendor_kernel_boot`, `init_boot` and `pvmfw` (the bootloader still loads them), which differ per Android build: one signed `vbmeta` a (board, Android build) pair, hosted, the tool matching the phone's build (read by ferros from `vbmeta_a`/`_b`, `diag part avb` today) and refusing the lock on a build it has none for. The boot image's rollback index must not be below the one the phone stored under Google's build.
 This is not built and needs measuring on the 8a before any lock (none is ever sent by the tool).
 
+## The GUI (built 2026-11-25, to screen 1)
+
+The owner, 2026-11-25: the installer must be a GUI, in fluor, "supa easy", anyone can follow it; its one word is **consent** (docs/BRAND.md has the thesis, the voice, the look and the lines).
+tools/flash-gui is that window: a crate of its own beside tools/flash (as tools/attest-mark and tools/tune are, so fluor's host build stays out of the workspace lock and the CLI stays small), on the same library: the same detection (usb.rs), the same signed release (release.rs), the same run log (runlog.rs). The CLI stays as it is.
+
+- **Screen 0, the welcome.** The mark (logo.vsf from the release, drawn at the window's size by vsf's analytic rasterizer, composed under by fluor), "Consent." large with one warm glow breathing behind it, the three dim lines, the device silhouette, the bottom line "This replaces Android and erases the device. You're choosing that." Nothing else but a small "send the log" in a corner.
+- **The silhouette is the live detector**, on every screen: `ferros_flash::usb::watch` holds nusb's hotplug stream on a thread (udev's netlink, IOKit, Windows device notifications), scans on each arrival or departure, and the window gets each change as a user event; nothing polls. Grey `?` with nothing seen; amber `no access` ("driver needed" on Windows, where the one-prompt Google driver install from driver.rs is the next step; "no permission to open it" on Linux without the udev rule); warm with the model name and "in Android" or "in its bootloader" (a bootloader is opened just long enough to ask its product); orange `ferros` for a device already running ferros. While a device is seen, one button wakes under it, **Install ferros**; unplugged, it goes grey and the button goes.
+- **Screen 1, after Install ferros.** "Welcome!" and the owner's words (BRAND.md), one short paragraph on the signed release, the steps ahead one line each (plug in, turn on unlocking, unlock on the device (this erases it), install, lock it back, done), the silhouette still live, and the honest line that this build goes no further yet. The irreversible step's button, when the flow reaches it, reads **Erase and install**.
+- **send the log**, on every screen: the consent words (where it goes, what it never holds, the serial blinded, 32 days), "Send it" or "Not now", the answer's name shown; the same report and endpoint as `ferros-flash log send`, the consent recorded in the run's own log.
+- **No timers.** The glow's phase is the count of shown frames; the detector is event-driven; nothing waits or delays.
+- **Looking at it:** `ferros-flash-gui --release <staged dir> --snap out.vsf` writes the first settled frame as a VSF visual (tools/vsf2web turns it into AV1 for a browser), `--steps` opens on screen 1, `--pretend bootloader` shows a device state in place of the detector, without a device on the cable. The first captures of 2026-11-25 were taken this way on Linux with the Pro on the bench (orange, `ferros`).
+- **Three targets built** on this host: Linux x86_64 (run here), Windows x86_64 (x86_64-pc-windows-gnu, a GUI-subsystem executable, no console), macOS arm64 (osxcross, unsigned, unnotarized).
+- **Not yet:** the steps after screen 1 (they wait on the install door and the production image, above), the Windows driver step from the window itself (the CLI has it; the window names it), and a run on Windows or macOS.
+
 ## The first Windows test (what it looks like today)
 
 On the owner's Windows PC, with the 8a in its bootloader on the cable:
@@ -202,6 +220,6 @@ That run tests the install, the executable, USB on Windows and the log, and writ
 
 ## Open for the owner
 
-- Code signing for Windows and macOS.
+- Code signing for Windows and macOS (the macOS executables warn in Gatekeeper until then).
 - (b)'s path once measured, and whether Titan may be asked.
 - Whether captured register sequences (camera, GNSS) may be hosted.

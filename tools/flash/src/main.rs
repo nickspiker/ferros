@@ -214,6 +214,7 @@ mod phone {
                 })
                 .collect();
             let other = seen.iter().any(|s| matches!(s, usb::Seen::Other { .. }));
+            let ferros = seen.iter().any(|s| matches!(s, usb::Seen::Ferros { .. }));
             for (vid, pid, why) in &nodriver {
                 note(
                     log,
@@ -263,6 +264,8 @@ mod phone {
                 format!("This computer sees the phone but cannot open it ({why}). On Linux, reaching it without root needs a udev rule for USB vendor 18d1 (most distributions' android-udev package has it).")
             } else if other {
                 "The phone is plugged in but not in its bootloader. Power it off, then hold power and volume down until the bootloader screen shows.".to_string()
+            } else if ferros {
+                "The device plugged in is already running ferros.".to_string()
             } else {
                 "No phone found. Plug it in, in its bootloader (power it off, then hold power and volume down).".to_string()
             };
@@ -678,6 +681,7 @@ mod publish {
                 "boot" => Role::Boot,
                 "capsule" => Role::Capsule,
                 "avbkey" => Role::AvbKey,
+                "logo" => Role::Logo,
                 r => die(format!("role `{r}`?")),
             };
             let bytes = read(&f[4]);
