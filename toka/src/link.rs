@@ -85,6 +85,7 @@ pub fn link(module: &Module<'_>, plan: &Plan, compiled: Vec<Compiled>, opts: &Op
         globals.extend_from_slice(&g.init);
     }
     put(&mut bytes, DATA_GLOBALS, 16, &globals);
+    put(&mut bytes, DATA_SYSCALL_X1, 8, &[0u8; 8]);
     let mut table_at = vec![];
     for (t, table) in module.tables.iter().enumerate() {
         let at = put(&mut bytes, DATA_TABLE | t as u32, 16, &vec![0u8; table.slots.len() * TABLE_ENTRY as usize]);

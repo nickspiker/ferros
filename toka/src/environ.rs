@@ -27,6 +27,8 @@ pub const DATA_TABLE: u32 = 1 << 16;
 pub const DATA_MEMORY: u32 = 2 << 16;
 pub const DATA_MEMORY_PAGES: u32 = 3 << 16;
 pub const DATA_SEGMENT: u32 = 4 << 16;
+/// The second register (x1) the last `syscall` answered, for `syscall_x1` (one cell: toka images run one thread today).
+pub const DATA_SYSCALL_X1: u32 = 5 << 16;
 
 /// toka's runtime functions, compiled by toka itself (runtime.rs).
 pub const RUNTIME_MEMMOVE: u32 = 0;
@@ -35,6 +37,9 @@ pub const RUNTIME_MEMSET: u32 = 1;
 pub const RUNTIME_SYSCALL: u32 = 2;
 /// The image's entry (runtime.rs `entry`): the kernel's x0 to x2 (grants, input, input's length) to the module's start function and `_ferros_main`, then exit.
 pub const RUNTIME_ENTRY: u32 = 3;
+/// `now()` and `freq()`: the generic timer's count (`isb; mrs x0, cntvct_el0`) and rate (`mrs x0, cntfrq_el0`), the two system registers the checker lets EL0 read.
+pub const RUNTIME_NOW: u32 = 4;
+pub const RUNTIME_FREQ: u32 = 5;
 
 /// Each global's slot in the globals area (a v128 needs 16).
 pub const GLOBAL_SLOT: u32 = 16;
@@ -534,6 +539,10 @@ impl<'a> FuncEnvironment<'a> {
     /// A call of a function imported from "ferros" (docs/TOKA.md "Intrinsics"), its results; None for any other callee.
     /// - `syscall(n, a0, a1, a2, a3, a4, a5: i64) -> i64`: the kernel's call `n` (process.rs's numbers, ferros_sys `nr`), thru the image's one native stub.
     /// - `arc_offset(p: i32 or i64) -> i64`: memory 0's address `p` as an offset into the process's arc, what every syscall takes for a buffer (the kernel masks it).
+    /// - `syscall_x1() -> i64`: the second register the last `syscall` answered.
+    /// - `arc_load8(at: i64) -> i32`, `arc_load64(at: i64) -> i64`: the arc at an arc offset (the grants page, the preferences), a masked load from x28.
+    /// - `now() -> i64`, `freq() -> i64`: the generic timer.
+    /// - `handle_base`, `handle_mask (slot: i32) -> i64`; `handle_load8`, `handle_load32 (slot: i32, off: i64) -> i32`, `handle_load64 -> i64`; `handle_store8`, `handle_store32 (slot, off, v: i32)`, `handle_store64 (slot, off, v: i64)`: a granted region thru handle `slot`, a constant (ferros_sys `Handle<SLOT>`), in the handle forms.
     fn intrinsic(&mut self, builder: &mut FunctionBuilder, callee: FuncIndex, args: &[ir::Value]) -> WasmResult<Option<Vec<ir::Value>>> {
         let k = callee.as_u32() as usize;
         if k >= self.module.num_imported_funcs() || self.module.imports[k].module != "ferros" {
@@ -554,6 +563,8 @@ impl<'a> FuncEnvironment<'a> {
                 want(&[w64; 7], &[w64])?;
                 let mut sig = ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV);
                 sig.params.extend((0..7).map(|_| ir::AbiParam::new(I64)));
+                // x0 and x1 both: the kernel answers in x1 too (an arc's sizes, a block's ticks).
+                sig.returns.push(ir::AbiParam::new(I64));
                 sig.returns.push(ir::AbiParam::new(I64));
                 let sig = builder.func.import_signature(sig);
                 let fname = builder.func.declare_imported_user_function(ir::UserExternalName::new(NS_RUNTIME, RUNTIME_SYSCALL));
@@ -564,7 +575,82 @@ impl<'a> FuncEnvironment<'a> {
                     patchable: false,
                 });
                 let call = builder.ins().call(f, args);
+                let r = builder.inst_results(call).to_vec();
+                // x1 kept for `syscall_x1`.
+                let cell = self.data_address(builder, DATA_SYSCALL_X1);
+                let flags = Self::flags(builder.func, REGION_GLOBALS, "globals".into());
+                builder.ins().store(flags, r[1], cell, Offset32::new(0));
+                Ok(Some(vec![r[0]]))
+            }
+            "syscall_x1" => {
+                want(&[], &[w64])?;
+                let cell = self.data_address(builder, DATA_SYSCALL_X1);
+                let flags = Self::flags(builder.func, REGION_GLOBALS, "globals".into());
+                Ok(Some(vec![builder.ins().load(I64, flags, cell, Offset32::new(0))]))
+            }
+            "arc_load8" | "arc_load64" => {
+                let wide = name == "arc_load64";
+                want(&[w64], &[if wide { w64 } else { WasmValType::I32 }])?;
+                let arc = builder.ins().get_pinned_reg(I64);
+                let at = builder.ins().iadd(arc, args[0]);
+                let v = if wide { builder.ins().load(I64, MemFlagsData::trusted(), at, Offset32::new(0)) } else { builder.ins().uload8(I32, MemFlagsData::trusted(), at, Offset32::new(0)) };
+                Ok(Some(vec![v]))
+            }
+            "now" | "freq" => {
+                want(&[], &[w64])?;
+                let which = if name == "now" { RUNTIME_NOW } else { RUNTIME_FREQ };
+                let mut sig = ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+                sig.returns.push(ir::AbiParam::new(I64));
+                let sig = builder.func.import_signature(sig);
+                let fname = builder.func.declare_imported_user_function(ir::UserExternalName::new(NS_RUNTIME, which));
+                let f = builder.func.import_function(ir::ExtFuncData { name: ir::ExternalName::user(fname), signature: sig, colocated: true, patchable: false });
+                let call = builder.ins().call(f, &[]);
                 Ok(Some(builder.inst_results(call).to_vec()))
+            }
+            "handle_base" | "handle_mask" | "handle_load8" | "handle_load32" | "handle_load64" | "handle_store8" | "handle_store32" | "handle_store64" => {
+                let w32 = WasmValType::I32;
+                let (params, results): (&[WasmValType], &[WasmValType]) = match name.as_str() {
+                    "handle_base" | "handle_mask" => (&[w32], &[w64]),
+                    "handle_load8" | "handle_load32" => (&[w32, w64], &[w32]),
+                    "handle_load64" => (&[w32, w64], &[w64]),
+                    "handle_store8" | "handle_store32" => (&[w32, w64, w32], &[]),
+                    _ => (&[w32, w64, w64], &[]),
+                };
+                want(params, results)?;
+                // The slot is in the instruction (`ldp x23, x22, [x28, #16 * slot]`), so it must be a constant here.
+                let slot = match builder.func.dfg.value_def(args[0]) {
+                    ir::ValueDef::Result(inst, _) => match builder.func.dfg.insts[inst] {
+                        ir::InstructionData::UnaryImm { opcode: ir::Opcode::Iconst, imm } => imm.bits() as u64,
+                        _ => u64::MAX,
+                    },
+                    _ => u64::MAX,
+                };
+                if slot >= 32 {
+                    return Err(wasm_unsupported!("ferros.{name}: the handle slot must be a constant under 32 (it is in the instruction)"));
+                }
+                let slot = slot as u8;
+                if name == "handle_base" || name == "handle_mask" {
+                    let arc = builder.ins().get_pinned_reg(I64);
+                    let at = 16 * i32::from(slot) + if name == "handle_mask" { 8 } else { 0 };
+                    return Ok(Some(vec![builder.ins().load(I64, MemFlagsData::trusted(), arc, Offset32::new(at))]));
+                }
+                let mut flags = MemFlagsData::new();
+                flags.set_endianness(ir::Endianness::Little);
+                flags.set_ferros_handle(Some(slot));
+                let off = args[1];
+                Ok(Some(match name.as_str() {
+                    "handle_load8" => vec![builder.ins().uload8(I32, flags, off, Offset32::new(0))],
+                    "handle_load32" => vec![builder.ins().load(I32, flags, off, Offset32::new(0))],
+                    "handle_load64" => vec![builder.ins().load(I64, flags, off, Offset32::new(0))],
+                    "handle_store8" => {
+                        builder.ins().istore8(flags, args[2], off, Offset32::new(0));
+                        vec![]
+                    }
+                    _ => {
+                        builder.ins().store(flags, args[2], off, Offset32::new(0));
+                        vec![]
+                    }
+                }))
             }
             "arc_offset" => {
                 let memory = MemoryIndex::from_u32(0);
@@ -583,7 +669,7 @@ impl<'a> FuncEnvironment<'a> {
                 let from_arc = builder.ins().isub(base, arc);
                 Ok(Some(vec![builder.ins().iadd(from_arc, p)]))
             }
-            other => Err(wasm_unsupported!("no intrinsic ferros.{other} (toka has syscall and arc_offset)")),
+            other => Err(wasm_unsupported!("no intrinsic ferros.{other} (TOKA.md \"Intrinsics\" lists toka's)")),
         }
     }
 

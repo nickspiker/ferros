@@ -130,6 +130,22 @@ pub fn syscall_stub(bti: bool) -> Vec<u8> {
     w.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+/// The timer stubs, `now()` and `freq()` as AAPCS64 (`isb; mrs x0, cntvct_el0` and `mrs x0, cntfrq_el0`, the two system registers the checker lets EL0 read), `bti c` before each under BTI and `br x30` for the return.
+pub fn timer_stub(count: bool, bti: bool) -> Vec<u8> {
+    let mut w: Vec<u32> = vec![];
+    if bti {
+        w.push(0xD503_245F); // bti c
+    }
+    if count {
+        w.push(0xD503_3FDF); // isb
+        w.push(0xD53B_E040); // mrs x0, cntvct_el0
+    } else {
+        w.push(0xD53B_E000); // mrs x0, cntfrq_el0
+    }
+    w.push(if bti { 0xD61F_03C0 } else { 0xD65F_03C0 });
+    w.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
 /// The image's entry, reached from the header's branch with the kernel's x0 to x2 (the grants offset, the input's offset and length): the module's start function, then its `_ferros_main(grants, input, length: i64)` if it exports one, else its `_start()`, then exit (syscall 0) with 0.
 pub fn entry(module: &Module<'_>, config: TargetFrontendConfig) -> Result<ir::Function, String> {
     let name = ir::UserExternalName::new(NS_RUNTIME, RUNTIME_ENTRY);
@@ -172,6 +188,7 @@ pub fn entry(module: &Module<'_>, config: TargetFrontendConfig) -> Result<ir::Fu
     // exit(0): syscall 0 thru the stub, which never returns; a trap after it, should it.
     let mut ssig = ir::Signature::new(CallConv::SystemV);
     ssig.params.extend((0..7).map(|_| AbiParam::new(I64)));
+    ssig.returns.push(AbiParam::new(I64));
     ssig.returns.push(AbiParam::new(I64));
     let ssig = b.func.import_signature(ssig);
     let sname = b.func.declare_imported_user_function(ir::UserExternalName::new(NS_RUNTIME, crate::environ::RUNTIME_SYSCALL));

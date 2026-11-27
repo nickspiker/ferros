@@ -65,17 +65,20 @@ toka's runtime (`memmove`, `memset`) is Cranelift IR built by toka and compiled 
 ## Intrinsics
 
 Functions imported from "ferros" are toka's, not linked from anywhere:
-- `syscall(n, a0, a1, a2, a3, a4, a5: i64) -> i64`: the kernel's call `n` (process.rs, ferros_sys `nr`), thru the stub (`mov x8, x0`, the arguments down a register, `svc #0`, back).
+- `syscall(n, a0, a1, a2, a3, a4, a5: i64) -> i64`: the kernel's call `n` (process.rs, ferros_sys `nr`), thru the stub (`mov x8, x0`, the arguments down a register, `svc #0`, back); `syscall_x1() -> i64` the second register it answered (an arc's sizes, a block's ticks), kept in a cell of the image (one: a toka image runs one thread today).
+- `arc_load8(at: i64) -> i32`, `arc_load64(at: i64) -> i64`: the arc at an arc offset (the grants page, the preferences), a masked load from x28.
+- `now() -> i64`, `freq() -> i64`: the generic timer, two more stubs (`isb; mrs x0, cntvct_el0` and `mrs x0, cntfrq_el0`, the two system registers the checker lets EL0 read).
+- `handle_base`, `handle_mask (slot: i32) -> i64`, `handle_load8`, `handle_load32 (slot: i32, off: i64) -> i32`, `handle_load64 -> i64`, `handle_store8`, `handle_store32 (slot, off, v: i32)`, `handle_store64 (slot, off, v: i64)`: a granted region thru handle `slot`, a constant (it is in the instruction), in the handle forms: ferros_sys `Handle<SLOT>`.
 - `arc_offset(p) -> i64`: memory 0's address `p` (i32, or i64 for a 64-bit memory 0) as an offset into the arc, inline (`adrp` memory 0, less x28, plus `p`): every syscall takes buffers as arc offsets and masks them.
 - The console, for example, is grant slot 0: its token at the grants offset + G#204, a write `syscall(1, token, arc_offset(text), len, arc_offset(reply), reply_len, 0)` (tests/wat/hello.wat).
-ferros_sys for wasm32 (its `svc` and `off` over these two) is the next step, so Rust payloads build for toka unchanged.
+**ferros_sys builds for wasm32** (2026-11-26): every instruction it writes natively has its twin over these (`svc`, `off`, the arc's reads, the timer, the barriers as fences, `Handle<SLOT>`, `entry!` as an exported `_ferros_main`), the native build untouched (the clock payload's `.text` byte-identical before and after); the PMU's counters are native only (the checker refuses their registers in a masked image). toka/tests/rust-hello is a payload over it: three console lines, built for wasm32 and compiled by toka checker-clean.
 
 ## Status
 
 - **M0, built 2026-11-26:** the fork masks at emission and toka compiles modules end to end, checker-clean.
   A hand-written module touching every path (loads and stores at every offset class, globals, `call_indirect`, `br_table`, loops, f64 and v128 constants, shuffles, bulk memory, `memory.grow`, atomics, tail calls, division) and a Rust crate built for wasm32 by rustc (BLAKE3, `core::fmt`, sorting, `dyn` calls, i128): every instruction accepted in ring, fixed, BTI and exact mode (the Rust crate 45 functions, 14,057 instructions in ring mode, 18,185 in exact).
   Nothing has run yet.
-- **M1, built 2026-11-26, not yet run:** the header, the entry, the `syscall` and `arc_offset` intrinsics, the zeroed tail for memory 0's reserve; tests/wat/hello.wat (a console line) builds checker-clean with and without BTI (`toka tests/wat/hello.wat -o hello.bin --reserve 20`, then `bridge capsule hello.bin hello.vsf --masked --text-len N`, seal and spawn). `--lib` compiles a module with no entry for checking alone.
+- **M1, built 2026-11-26, not yet run** (hello.wat, and tests/rust-hello over ferros_sys): the header, the entry, the `syscall` and `arc_offset` intrinsics, the zeroed tail for memory 0's reserve; tests/wat/hello.wat (a console line) builds checker-clean with and without BTI (`toka tests/wat/hello.wat -o hello.bin --reserve 20`, then `bridge capsule hello.bin hello.vsf --masked --text-len N`, seal and spawn). `--lib` compiles a module with no entry for checking alone.
 - **Then:** threads (the kernel's wait and wake on a word), the capsule section for toka bytecode and stow-time compiling on the device (toka as a std process, the seal over the bytecode's and the compiler's hashes, KERNEL.md "Stow, compile, seal, go"), std for wasm through ferros's own target, Photon; and toka's extensions to WebAssembly in CPU-FEATURES.md's order (AES and PMULL, SHA, CRC, dot product and I8MM, FP16 and BF16, 128-bit atomics, then SVE2; spirix's types when hardware runs them).
 
 ## Open for the owner

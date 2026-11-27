@@ -6,8 +6,38 @@
 
 #![no_std]
 
+#[cfg(target_arch = "aarch64")]
 use core::arch::asm;
 use core::sync::atomic::{compiler_fence, Ordering};
+
+/// A WebAssembly build's machine (docs/TOKA.md "Intrinsics"): the functions toka compiles in place of the instructions ferros_sys writes natively, so a payload builds for toka unchanged. The native build never sees them.
+#[cfg(target_arch = "wasm32")]
+mod toka {
+    #[link(wasm_import_module = "ferros")]
+    unsafe extern "C" {
+        /// The kernel's call `n`, its answer (x0).
+        pub fn syscall(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64;
+        /// The second register (x1) of the last `syscall` this thread made.
+        pub fn syscall_x1() -> u64;
+        /// Memory 0's address as an offset into the arc.
+        pub fn arc_offset(p: u32) -> u64;
+        /// A byte and a word of the arc at an arc offset (the grants page, the preferences).
+        pub fn arc_load8(at: u64) -> u32;
+        pub fn arc_load64(at: u64) -> u64;
+        /// The generic timer's count and rate.
+        pub fn now() -> u64;
+        pub fn freq() -> u64;
+        /// A granted region thru handle `slot` (a constant): its pair, and loads and stores at an offset into it.
+        pub fn handle_base(slot: u32) -> u64;
+        pub fn handle_mask(slot: u32) -> u64;
+        pub fn handle_load8(slot: u32, off: u64) -> u32;
+        pub fn handle_load32(slot: u32, off: u64) -> u32;
+        pub fn handle_load64(slot: u32, off: u64) -> u64;
+        pub fn handle_store8(slot: u32, off: u64, v: u32);
+        pub fn handle_store32(slot: u32, off: u64, v: u32);
+        pub fn handle_store64(slot: u32, off: u64, v: u64);
+    }
+}
 
 /// A syscall failed: unknown or wrong token, out-of-range offset, no such object.
 pub const ERR: u64 = u64::MAX;
@@ -154,6 +184,7 @@ pub mod notify {
 /// The caller's own arc, grown or shrunk on demand (kernel SYS_ARC, docs/ARCS.md step 2; owner, 2026-11-11: "why we cannot scale on demand, that was the whole point of ring memory"). No capability: a process reaches only its own arc, and only up to its ceiling (the heap its build declared, counted whole; fixed mode's size). A top is an arc offset: the arc's size, or exact mode's limit.
 pub mod arc {
     use super::{nr, ERR};
+    #[cfg(target_arch = "aarch64")]
     use core::arch::asm;
     use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -166,6 +197,13 @@ pub mod arc {
     pub const WHY_OP: u64 = 6;
 
     /// The trap with both result registers: (x0, x1).
+    #[cfg(target_arch = "wasm32")]
+    fn call(op: u64, n: u64) -> (u64, u64) {
+        unsafe { (super::toka::syscall(nr::ARC, op, n, 0, 0, 0, 0), super::toka::syscall_x1()) }
+    }
+
+    /// The trap with both result registers: (x0, x1).
+    #[cfg(target_arch = "aarch64")]
     fn call(op: u64, n: u64) -> (u64, u64) {
         let (a, b): (u64, u64);
         compiler_fence(Ordering::SeqCst);
@@ -208,7 +246,13 @@ pub mod arc {
     pub fn release(off: u64, len: usize) -> Result<usize, u64> {
         let (a, b): (u64, u64);
         compiler_fence(Ordering::SeqCst);
+        #[cfg(target_arch = "aarch64")]
         unsafe { asm!("svc #0", inlateout("x0") 3u64 => a, inlateout("x1") off => b, in("x2") len as u64, in("x8") nr::ARC, options(nostack)) };
+        #[cfg(target_arch = "wasm32")]
+        unsafe {
+            a = super::toka::syscall(nr::ARC, 3, off, len as u64, 0, 0, 0);
+            b = super::toka::syscall_x1();
+        }
         compiler_fence(Ordering::SeqCst);
         if a == ERR { Err(b) } else { Ok(a as usize) }
     }
@@ -677,7 +721,7 @@ pub mod gpu {
 
     /// Whether a region lies in a window of frames: a surface (the surfaces' window) or a GPU block (the blocks' window, since 2026-11-13), whose frames the stamp carries.
     pub const fn in_window(b: u64, size: u64) -> bool {
-        (b >= super::SURFACES_WINDOW && b + size <= super::SURFACES_WINDOW + (super::SURFACE_SLOTS * super::SURFACE_BYTES) as u64) || (b >= super::GPU_BLOCKS_WINDOW && b + size <= super::GPU_BLOCKS_WINDOW + (super::GPU_BLOCK_SLOTS * super::GPU_BLOCK_MOST) as u64) || is_camera(b, size)
+        (b >= super::SURFACES_WINDOW && b + size <= super::SURFACES_WINDOW + (super::SURFACE_SLOTS * super::SURFACE_BYTES) as u64) || (b >= super::GPU_BLOCKS_WINDOW && b + size <= super::GPU_BLOCKS_WINDOW + (super::GPU_BLOCK_SLOTS as u64 * super::GPU_BLOCK_MOST as u64)) || is_camera(b, size)
     }
 
     /// The camera's view window (the kernel's cachemap CAM_VIEW_VA): a stamp names the camera view there for its holder alone, with its frames (2026-11-20, docs/GPU-KISTS.md "The camera ring on the GPU"); the service maps them read-only at `CAMERA_VA`.
@@ -693,7 +737,7 @@ pub mod gpu {
 
     /// Whether a region is a GPU block: in the blocks' window.
     pub const fn is_block(b: u64, size: u64) -> bool {
-        b >= super::GPU_BLOCKS_WINDOW && b + size <= super::GPU_BLOCKS_WINDOW + (super::GPU_BLOCK_SLOTS * super::GPU_BLOCK_MOST) as u64
+        b >= super::GPU_BLOCKS_WINDOW && b + size <= super::GPU_BLOCKS_WINDOW + (super::GPU_BLOCK_SLOTS as u64 * super::GPU_BLOCK_MOST as u64)
     }
 
     impl<'a> Stamp<'a> {
@@ -1124,7 +1168,7 @@ pub mod audio {
 pub fn pref(index: u64) -> u8 {
     // The two blocks: 0-31 at PREFS, 32-47 at PREFS_HI. WHY the min and the mask: the index is the caller's; one past 31 stays inside the first block (as it always has) and one past 47 inside the second, never the tokens or the ihi.
     let at = if index < 32 { PREFS + index } else { PREFS_HI + (index & 15) };
-    unsafe { core::ptr::read_volatile((arc_base() + at) as *const u8) }
+    arc_u8(at)
 }
 
 /// The language the shell speaks (kernel lang.rs, SYS_LANG; SETTINGS.md): this device's own and the identity's, each a language by its ISO 639-3 code, and the switch that says which rules. The state is read from the preferences block; the calls change it.
@@ -1227,7 +1271,7 @@ pub mod base {
 
 /// The device's number base right now (tatau's code: 10 arabic, 12 DMS, 16 hex, G#8C DLS). Read it at draw time, not once: the person can change it while the app runs.
 pub fn device_base() -> u8 {
-    unsafe { core::ptr::read_volatile((arc_base() + PREFS + PREF_BASE) as *const u8) }
+    arc_u8(PREFS + PREF_BASE)
 }
 
 /// The bottom of the camera cutout, in panel rows: a fact of this panel, not a knob. husky's (Pixel 8 Pro, 1344 x 2992), measured on the glass (owner, 2026-11-08, tools/cutout-scan), under the white rule: a pixel is dead unless it shows pure white (the hole's edge shows the subpixels' fringe, cyan, magenta and the rest, and those count dead). The 5776 dead pixels, both sides marked row by row, rows 33 to 116, every row centred on x 671.5 (half a pixel left of the panel's middle), top and bottom mirrored about y 75.0 but for rows 34 to 37, a pixel wider on the left than their mirrors; checked by lighting the ring of pixels just outside them white on black (every one pure white). The knockout is the smallest circle covering every one of them whole, radius 43.56 about (671.5, 75.0) (the farthest dead centres 43.06 out, the ends of the flat sides, rows 65 and 84 at columns 629 and 713, plus half a pixel); its bottom edge, row 118.56, is what the app circle is tangent to. The dead area is flatter than a circle (one column for 20 rows at each side, 21 pixels across the top row), so the circle also covers 54 live pixels whole and 266 in part; the owner keeps the circle. The first map (pixels hidden completely, fringe counted live) gave radius 42.96; Android's DisplayCutout said (672, 75) radius 43.25, bottom 118.25.
@@ -1923,7 +1967,7 @@ pub enum BootLock {
 /// Local wall time: (seconds since 1970 in local time — UTC plus the zone, `device.tz` — and the counter ticks into the current second), or None until the kernel has read the PMIC's clock. From the kernel's base (facts 8, 9) and this process's own counter.
 /// The zone's two offsets as the kernel last handed them (preferences bytes 24-31, kernel rtc.rs `packed`): (standard, legal), seconds east of UTC. Legal is daylight time while it is in effect; without a zone's rule (a manual offset) the two are the same.
 pub fn zone_offsets() -> (i64, i64) {
-    let v = unsafe { core::ptr::read_volatile((arc_base() + PREFS + 24) as *const u64) };
+    let v = arc_u64(PREFS + 24);
     (v as u32 as i32 as i64, (v >> 32) as u32 as i32 as i64)
 }
 
@@ -1935,7 +1979,7 @@ pub fn zone() -> i64 {
 
 pub fn local_time() -> Option<(i64, u64)> {
     // From the preferences block (bytes 16-31, the kernel's PREF_WALL): no syscall — the first version asked SYS_FACTS on every frame, and facts samples the battery gauge over I2C under the kernel lock (it hung the kernel, 2026-10-23).
-    let base = unsafe { core::ptr::read_volatile((arc_base() + PREFS + 16) as *const u64) };
+    let base = arc_u64(PREFS + 16);
     if base == 0 {
         return None;
     }
@@ -2066,7 +2110,15 @@ pub fn block_read_timed(cap: u64, at: u64, buf: &mut [u8]) -> (u64, Option<(u64,
     let op = 2 | ((buf.len() as u64 >> 12) & 0xFFFF) << 8;
     let (r, cmd, copy): (u64, u64, u64);
     compiler_fence(Ordering::SeqCst);
+    #[cfg(target_arch = "aarch64")]
     unsafe { asm!("svc #0", inlateout("x0") cap => r, inlateout("x1") op => cmd, inlateout("x2") at => copy, in("x3") off(buf.as_mut_ptr()), in("x4") 0u64, in("x8") nr::BLOCK, options(nostack)) };
+    // A WebAssembly build reads x0 and x1 only: the copy's ticks (x2) are not to be had, so the timing is reported as absent, as from a kernel that does not time.
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        r = toka::syscall(nr::BLOCK, cap, op, at, off(buf.as_mut_ptr()), 0, 0);
+        cmd = op;
+        copy = at;
+    }
     compiler_fence(Ordering::SeqCst);
     // A kernel that does not time leaves x1 and x2 as they went in.
     (r, (r == 0 && (cmd, copy) != (op, at)).then_some((cmd, copy)))
@@ -2077,7 +2129,13 @@ pub fn block_flush(cap: u64) -> Option<(u64, u64)> {
     let op = 64u64;
     let (r, ticks): (u64, u64);
     compiler_fence(Ordering::SeqCst);
+    #[cfg(target_arch = "aarch64")]
     unsafe { asm!("svc #0", inlateout("x0") cap => r, inlateout("x1") op => ticks, in("x2") 0u64, in("x3") 0u64, in("x4") 0u64, in("x8") nr::BLOCK, options(nostack)) };
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        r = toka::syscall(nr::BLOCK, cap, op, 0, 0, 0, 0);
+        ticks = toka::syscall_x1();
+    }
     compiler_fence(Ordering::SeqCst);
     (ticks != op).then_some((r, ticks))
 }
@@ -2310,8 +2368,8 @@ pub fn alias(cap: u64) -> Option<[u8; 32]> {
 
 /// UTC wall time: (seconds since 1970, the counter ticks into the current second, the counter's rate), or None until the kernel has read the PMIC's clock. `local_time` with the zone taken back out — for stamps that cross the network (Photon's eagle time).
 pub fn utc_time() -> Option<(i64, u64, u64)> {
-    let at = arc_base() + PREFS + 16;
-    let rd = |o: u64| unsafe { core::ptr::read_volatile((at + o) as *const u64) };
+    let at = PREFS + 16;
+    let rd = |o: u64| arc_u64(at + o);
     let base = rd(0);
     if base == 0 {
         return None;
@@ -2372,7 +2430,12 @@ pub fn facts() -> Facts {
 pub fn svc(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     let r: u64;
     compiler_fence(Ordering::SeqCst);
+    #[cfg(target_arch = "aarch64")]
     unsafe { asm!("svc #0", inlateout("x0") a0 => r, in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4, in("x8") n, options(nostack)) };
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        r = toka::syscall(n, a0, a1, a2, a3, a4, 0);
+    }
     compiler_fence(Ordering::SeqCst);
     r
 }
@@ -2381,6 +2444,13 @@ pub fn svc(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 ///
 /// # Safety
 /// Must run exactly once, before any other code of the image, from the image this crate was linked into.
+#[cfg(target_arch = "wasm32")]
+pub unsafe fn relocate() {
+    // A toka image reaches everything PC-relatively: nothing to relocate.
+}
+
+/// See the WebAssembly build's `relocate`; this is the native one.
+#[cfg(target_arch = "aarch64")]
 #[inline(never)]
 pub unsafe fn relocate() {
     unsafe extern "C" {
@@ -2404,7 +2474,26 @@ pub unsafe fn relocate() {
     }
 }
 
-/// The process's arc base (x28, set by the kernel at entry and never written by compiled code).
+/// A byte of the process's arc at arc offset `at` (the grants page, the preferences): thru the arc's base natively, thru toka's `arc_load8` in a WebAssembly build, whose code names no arc address.
+#[inline(always)]
+pub fn arc_u8(at: u64) -> u8 {
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { core::ptr::read_volatile((arc_base() + at) as *const u8) };
+    #[cfg(target_arch = "wasm32")]
+    return unsafe { toka::arc_load8(at) as u8 };
+}
+
+/// An 8-byte word of the arc at arc offset `at`, as `arc_u8`.
+#[inline(always)]
+pub fn arc_u64(at: u64) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { core::ptr::read_volatile((arc_base() + at) as *const u64) };
+    #[cfg(target_arch = "wasm32")]
+    return unsafe { toka::arc_load64(at) };
+}
+
+/// The process's arc base (x28, set by the kernel at entry and never written by compiled code). Native only: a WebAssembly build names no arc address (`arc_u8`, `off`).
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub fn arc_base() -> u64 {
     let b: u64;
@@ -2415,17 +2504,27 @@ pub fn arc_base() -> u64 {
 /// The generic timer count (EL0 may read it: CNTHCTL_EL2.EL0VCTEN).
 #[inline(always)]
 pub fn now() -> u64 {
-    let t: u64;
-    unsafe { asm!("isb", "mrs {}, cntvct_el0", out(reg) t, options(nomem, nostack, preserves_flags)) };
-    t
+    #[cfg(target_arch = "wasm32")]
+    return unsafe { toka::now() };
+    #[cfg(target_arch = "aarch64")]
+    {
+        let t: u64;
+        unsafe { asm!("isb", "mrs {}, cntvct_el0", out(reg) t, options(nomem, nostack, preserves_flags)) };
+        t
+    }
 }
 
 /// Timer ticks per second.
 #[inline(always)]
 pub fn freq() -> u64 {
-    let f: u64;
-    unsafe { asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
-    f
+    #[cfg(target_arch = "wasm32")]
+    return unsafe { toka::freq() };
+    #[cfg(target_arch = "aarch64")]
+    {
+        let f: u64;
+        unsafe { asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+        f
+    }
 }
 
 /// Busy-wait `us` microseconds on the timer.
@@ -2442,13 +2541,19 @@ pub fn us_since(t0: u64) -> u64 {
 /// Order this process's writes to device-visible memory (its DMA region) before what follows — typically a doorbell write telling the device to look (`dsb sy`).
 #[inline(always)]
 pub fn dma_barrier() {
+    #[cfg(target_arch = "aarch64")]
     unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
+    #[cfg(target_arch = "wasm32")]
+    core::sync::atomic::fence(Ordering::SeqCst);
 }
 
 /// Arc offset of something in this process's arc.
 #[inline(always)]
 pub fn off<T: ?Sized>(p: *const T) -> u64 {
-    p as *const u8 as u64 - arc_base()
+    #[cfg(target_arch = "aarch64")]
+    return p as *const u8 as u64 - arc_base();
+    #[cfg(target_arch = "wasm32")]
+    return unsafe { toka::arc_offset(p as *const u8 as u32) };
 }
 
 /// The token for grant `slot`, given the grants offset the kernel passed at entry (x0): the handle table in the page's first 512 bytes, then at 0x200 a u32 count, then 32-byte tokens; slot 0 is the console.
@@ -2500,9 +2605,9 @@ fn spawn_with(grants: u64, name: &[u8], key: &[u8], slots: &[u64], flags: u64) -
     req[at] = n as u8;
     at += 1;
     for &slot in &slots[..n] {
-        let tok = (arc_base() + cap(grants, slot)) as *const u8;
+        let tok = cap(grants, slot);
         for i in 0..32 {
-            req[at + i] = unsafe { core::ptr::read_volatile(tok.add(i)) };
+            req[at + i] = arc_u8(tok + i as u64);
         }
         at += 32;
     }
@@ -2528,9 +2633,9 @@ fn kist_call(grants: u64, kists: u64, name: &[u8], capsule: &[u8; 32], codes: &[
     at += 1 + name.len();
     req[at..at + 32].copy_from_slice(capsule);
     at += 32;
-    let tok = (arc_base() + cap(grants, kists)) as *const u8;
+    let tok = cap(grants, kists);
     for i in 0..32 {
-        req[at + i] = unsafe { core::ptr::read_volatile(tok.add(i)) };
+        req[at + i] = arc_u8(tok + i as u64);
     }
     at += 32;
     req[at] = codes.len() as u8;
@@ -2573,9 +2678,9 @@ pub mod stow {
 pub fn stow_kist(grants: u64, stow: u64, capsule: &[u8; 32], word: &core::sync::atomic::AtomicU64) -> u64 {
     let mut req = [0u8; 72];
     req[..32].copy_from_slice(capsule);
-    let tok = (arc_base() + cap(grants, stow)) as *const u8;
+    let tok = cap(grants, stow);
     for i in 0..32 {
-        req[32 + i] = unsafe { core::ptr::read_volatile(tok.add(i)) };
+        req[32 + i] = arc_u8(tok + i as u64);
     }
     req[64..].copy_from_slice(&off(word as *const _ as *const u8).to_le_bytes());
     svc(nr::SPAWN, off(req.as_ptr()), req.len() as u64, 8, 0, 0)
@@ -2585,9 +2690,9 @@ pub fn stow_kist(grants: u64, stow: u64, capsule: &[u8; 32], word: &core::sync::
 pub fn stow_check(grants: u64, stow: u64, capsule: &[u8; 32], word: &core::sync::atomic::AtomicU64) -> u64 {
     let mut req = [0u8; 72];
     req[..32].copy_from_slice(capsule);
-    let tok = (arc_base() + cap(grants, stow)) as *const u8;
+    let tok = cap(grants, stow);
     for i in 0..32 {
-        req[32 + i] = unsafe { core::ptr::read_volatile(tok.add(i)) };
+        req[32 + i] = arc_u8(tok + i as u64);
     }
     req[64..].copy_from_slice(&off(word as *const _ as *const u8).to_le_bytes());
     svc(nr::SPAWN, off(req.as_ptr()), req.len() as u64, 8 | 16, 0, 0)
@@ -2978,6 +3083,7 @@ pub fn panic_tell(message: &[u8], file: &[u8], line: u32, column: u32) {
 }
 
 /// The performance monitors, which the kernel opens to EL0 on every core (ferros_kernel/src/pmu.rs). Core-wide: counts include whatever else ran on the core, so a measurement wants the process pinned and the loop long against a slice. Event counters are 32 bits.
+#[cfg(target_arch = "aarch64")]
 pub mod pmu {
     /// Common ARMv8 events (PMEVTYPER evtCount).
     pub const SW_INCR: u32 = 0x00;
@@ -3687,6 +3793,51 @@ pub mod nfc {
 /// A granted region reached through its handle (SANDBOX.md, "Handles"): slot `SLOT`'s pair in the handle table at the arc's start (its base and its mask, written by the kernel, read-only to the process), every access `base + (offset & mask)` in exactly the instruction forms the sandbox checker admits: the pair load `ldp x23, x22, [x28, #16·SLOT]`, the masked offset `and x21, off, x22`, the access `[x23, x21]`. Native and masked code run the same instructions; a masked process can reach a granted region no other way. An offset past the region wraps inside it. A grant with no region (an endpoint, a right) has a zero pair: every access lands on address 0 and faults, which is the right answer.
 pub struct Handle<const SLOT: u64>;
 
+/// The WebAssembly build's handle (docs/TOKA.md "Intrinsics"): the same accesses thru toka's handle intrinsics, which compile to the same forms (the slot a constant, the select before every access).
+#[cfg(target_arch = "wasm32")]
+impl<const SLOT: u64> Handle<SLOT> {
+    #[inline(always)]
+    pub fn pair() -> (u64, u64) {
+        unsafe { (toka::handle_base(SLOT as u32), toka::handle_mask(SLOT as u32)) }
+    }
+    #[inline(always)]
+    pub fn len() -> u64 {
+        let (b, m) = Self::pair();
+        if b == 0 { 0 } else { m + 1 }
+    }
+    #[inline(always)]
+    pub fn read8(off: u64) -> u8 {
+        unsafe { toka::handle_load8(SLOT as u32, off) as u8 }
+    }
+    #[inline(always)]
+    pub fn read32(off: u64) -> u32 {
+        unsafe { toka::handle_load32(SLOT as u32, off) }
+    }
+    #[inline(always)]
+    pub fn read64(off: u64) -> u64 {
+        unsafe { toka::handle_load64(SLOT as u32, off) }
+    }
+    #[inline(always)]
+    pub fn write8(off: u64, v: u8) {
+        unsafe { toka::handle_store8(SLOT as u32, off, v as u32) }
+    }
+    #[inline(always)]
+    pub fn write32(off: u64, v: u32) {
+        unsafe { toka::handle_store32(SLOT as u32, off, v) }
+    }
+    #[inline(always)]
+    pub fn write64(off: u64, v: u64) {
+        unsafe { toka::handle_store64(SLOT as u32, off, v) }
+    }
+    #[inline(always)]
+    pub fn fill64(off: u64, n: u64, v: u64) {
+        for k in 0..n {
+            Self::write64(off + 8 * k, v);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
 impl<const SLOT: u64> Handle<SLOT> {
     /// The region's base and mask as the table holds them.
     #[inline(always)]
@@ -3775,9 +3926,14 @@ impl<const SLOT: u64> Handle<SLOT> {
 
 /// The heap a growing image declares when nothing but the device bounds it (docs/NO-CEILINGS.md step 3; owner, 2026-11-23: "if I open notepad and it requests 1mb of memory and it's happy, then I go and open a video ... and it malloc's 4GB of RAM, it better work"): 2^47, the largest block of the arcs' 48-bit space, more than any device holds. The kernel takes the least of it and its pool (process.rs `image_tail_ceiling`), and every grow past the free frames is refused as it comes (ARC_WHY_MEMORY).
 /// Not the largest word: the bridge and the kernel add the image's other words to it, and 2^47 leaves those sums far from wrapping.
+#[cfg(target_pointer_width = "64")]
 pub const HEAP_DEVICE: usize = 1 << 47;
+/// A WebAssembly build's (32-bit) heap ceiling: its memory's whole address space, the most a wasm32 memory holds.
+#[cfg(target_pointer_width = "32")]
+pub const HEAP_DEVICE: usize = 1 << 31;
 
 /// A payload's entry with ferros_rt's image header (process.rs `image_tail`): `b main`, a pad word, "ferrosRT" at offset 8, the zeroed tail (.bss + 16, payload.ld's `__ferros_tail`), three unused words and a heap of 0. The kernel sizes the process's arc from the flat image plus that tail and refuses an image without the header (2026-11-09: the display's and bt's stacks sat on their own statics because the kernel never counted their .bss). `main` is `extern "C" fn(grants: u64, input: u64, input_len: u64) -> !`.
+#[cfg(target_arch = "aarch64")]
 #[macro_export]
 macro_rules! entry {
     ($main:path) => {
@@ -3844,6 +4000,18 @@ _entry:
             flags = const 1 | (($log2 & 63) << 8),
             ceiling = const $ceiling
         );
+    };
+}
+
+/// The WebAssembly build's entry (docs/TOKA.md "The image"): toka's image calls the module's exported `_ferros_main` with the kernel's grants offset, input offset and input length, so this exports one that calls `main`; the growing heap's words are the image's toka writes, so they are taken and not used here.
+#[cfg(target_arch = "wasm32")]
+#[macro_export]
+macro_rules! entry {
+    ($main:path $(, $($rest:tt)*)?) => {
+        #[unsafe(no_mangle)]
+        pub extern "C" fn _ferros_main(grants: u64, input: u64, input_len: u64) {
+            $main(grants, input, input_len)
+        }
     };
 }
 

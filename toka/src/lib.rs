@@ -145,6 +145,13 @@ pub fn compile(bytes: &[u8], opts: &Options) -> Result<link::Image, String> {
         code: runtime::syscall_stub(opts.bti),
         relocs: vec![],
     });
+    for (which, count) in [(environ::RUNTIME_NOW, true), (environ::RUNTIME_FREQ, false)] {
+        compiled.push(Compiled {
+            name: ir::UserExternalName::new(environ::NS_RUNTIME, which),
+            code: runtime::timer_stub(count, opts.bti),
+            relocs: vec![],
+        });
+    }
     link::link(&module, &plan, compiled, opts)
 }
 

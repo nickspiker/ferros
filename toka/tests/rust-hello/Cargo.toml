@@ -1,0 +1,17 @@
+[package]
+name = "toka-rust-hello"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferros_sys = { path = "../../../ferros_sys" }
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true
+
+[workspace]
