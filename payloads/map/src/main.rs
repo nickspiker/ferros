@@ -4267,6 +4267,22 @@ impl Map {
                         self.push_row(cx - half, cx + half, y_row - uu(2, 1), y, Choice::Link(k as u8));
                     }
                 }
+                // The network's knobs (ferros_sys::control `NETWORK`, the ip process their driver; owner, 2026-11-27: "this needs to be in network settings. they may prefer ipv6 all the time or cellular first"): each a radio group in its values' order, unset reading as the default (WiFi first, IPv6 first on the same link).
+                use ferros_sys::control as ctl;
+                let c = ferros_sys::controls(ctl::NETWORK);
+                y += uu(1, 2);
+                b.text(cx, y, note as u16, dim(), 1, tr(Msg::Settings));
+                y += uu(2, 1);
+                let links = [tr(Msg::NetWifiFirst), tr(Msg::NetCellFirst), tr(Msg::NetWifiOnly), tr(Msg::NetCellOnly)];
+                let family = [tr(Msg::NetV6SameLink), tr(Msg::NetV6First), tr(Msg::NetV4First)];
+                for (slot, title, names) in [(ctl::NET_LINK, tr(Msg::NetLinks), &links[..]), (ctl::NET_FAMILY, tr(Msg::NetFamily), &family[..])] {
+                    let v = c[slot as usize];
+                    let now = if (v as usize) < names.len() { v as usize } else { 0 };
+                    b.text(cx, y, note as u16, dim(), 1, title);
+                    y += uu(2, 1);
+                    radios(self, b, &mut y, names, now, &|v| Choice::KnobSet(ctl::NETWORK as u8, slot as u8, v as u8));
+                }
+                notes(b, &mut y, tr(Msg::NetNote));
             }
             name @ ("cellular" | "WiFi" | "Bluetooth" | "NFC" | "GPS" | "USB") => {
                 // A link's own page (owner, 2026-11-07: "the radio details that actually show numbers and config"; the console's circles carry none): its switch, its state, and every measure its driver publishes, each by name in its unit, in the device's base.

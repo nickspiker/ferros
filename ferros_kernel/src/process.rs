@@ -2396,8 +2396,8 @@ const LIVE_REC: usize = 42;
 const LOG_REC: usize = 50;
 /// Each link's control block: words 1 to CONTROLS - 1 (word 0 is the generation, `CONTROL_GEN`), all ones until set.
 pub const CONTROLS: usize = 1 << 4;
-/// The links with a control block: the six of the facts, the clock and the battery.
-pub const CONTROL_LINKS: usize = 8;
+/// The links with a control block: the six of the facts, the clock, the battery and the network (8, the `ip` process its driver: which link and family a connection takes).
+pub const CONTROL_LINKS: usize = 9;
 /// The clock's link, and its zone's slot.
 pub const CONTROL_CLOCK: usize = 6;
 pub const CONTROL_ZONE: usize = 1;

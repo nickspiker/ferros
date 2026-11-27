@@ -1425,6 +1425,12 @@ pub mod control {
     pub const WIFI_BAND: u64 = 2;
     /// The clock: the zone, seconds east of UTC (signed, within a day). Kept as the settings document's `tz`.
     pub const CLOCK_ZONE: u64 = 1;
+    /// The network: which link and which family a connection takes (the `ip` process is its driver; owner, 2026-11-27: "this needs to be in network settings. they may prefer ipv6 all the time or cellular first").
+    pub const NETWORK: u64 = 8;
+    /// The network, kept: the family a name is looked up for first, 0 IPv6 first when both leave on the same link, else the family on the link first in `NET_LINK` (the default, as unset); 1 IPv6 first always; 2 IPv4 first always. Applied at the next lookup.
+    pub const NET_FAMILY: u64 = 1;
+    /// The network, kept: the links, 0 both, WiFi first (the default, as unset); 1 both, cellular first; 2 WiFi only; 3 cellular only. Applied to the next connection: one open keeps its link.
+    pub const NET_LINK: u64 = 2;
     /// The battery: the kernel is its driver (the MAX77759 charger on hsi2c_11, docs/CHARGING.md).
     pub const BATTERY: u64 = 7;
     /// The battery, kept: the charge voltage cap in mV, the charger's CV (CHG_CNFG_04, 10 mV steps), from `CHARGE_CV_FLOOR` to the battery's own ceiling; unset, `CHARGE_CV_DEFAULT` (owner, 2026-11-24: "I'd set it to 4.2 v by default and allow the user to set it above").

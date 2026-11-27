@@ -202,6 +202,21 @@ messages! {
     /// Two lines.
     BandNote,
     NothingToSetYet,
+    // The network's knobs on Connections (owner, 2026-11-27): the links' order and the families' order.
+    /// "WiFi or cellular".
+    NetLinks,
+    NetWifiFirst,
+    NetCellFirst,
+    NetWifiOnly,
+    NetCellOnly,
+    /// "IPv4 or IPv6".
+    NetFamily,
+    /// "IPv6 first on the same network".
+    NetV6SameLink,
+    NetV6First,
+    NetV4First,
+    /// One line.
+    NetNote,
     // The GPS page (owner, 2026-11-10): where the device is (under `RightGps`, "where you are"), and who is using GPS now.
     /// The seven Dymaxion words (vsf WorldCoord) that name the place.
     PositionWords,

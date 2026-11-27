@@ -21,6 +21,7 @@ And one way in:
   - **An action** (do this now): a counter the page counts up; the driver acts once when it sees it change. Never kept: a count means nothing across a boot.
 - **Link 6 is the clock**, whose driver is the kernel: its zone is the settings document's `tz`, applied the moment it is set.
 - **Link 7 is the battery**, whose driver is the kernel too: slot 1 the charge voltage cap in mV (`charge_cv`, docs/CHARGING.md), checked by the kernel and written to the charger by the service loop the moment it is set.
+- **Link 8 is the network**, whose driver is the `ip` process: which link and which family a connection takes ("Network" below).
 
 The kernel checks only the capability and the slot; whether a value means anything is the driver's (it owns the hardware), and a value it cannot use it ignores and shows as it is.
 
@@ -76,6 +77,15 @@ What each driver reports and what can be turned, as of 2026-11-07. "Next" is wha
 - **Shown:** the local time and UTC in the device's base, the zone by name with its standard and legal offsets and where it came from (the cellular network, GPS, by hand, a fixed offset), where the time comes from (the PMIC's clock, read at boot and every hour after), and the network's zone as heard.
 - **Knobs:** the zone (docs/TIME.md, `SYS_ZONE`): "follow my identity", automatic or by hand, a picker by region then place; a fixed offset a quarter hour either way per tap (kept as the settings document's `tz`), only with no zone. The number base is the Numbers page's.
 - **Next:** network time (NITZ, above) and GPS time as sources, and setting the PMIC's clock from them.
+
+### Network (payloads/ip; link 8 of the controls)
+
+The owner, 2026-11-27: "this needs to be in network settings. they may prefer ipv6 all the time or cellular first, who knows". Its knobs sit on Connections, under the links.
+
+- **Knobs** (both kept, as `net_link` and `net_family`):
+  - *Links*: WiFi first (the default), cellular first, WiFi only, cellular only. A packet leaves on the first link in that order that holds an address of its family; a link-local or multicast one stays on WiFi. Applied to the next connection: one open keeps the link it opened on.
+  - *Families*: IPv6 first on the same network (the default), IPv6 first always, IPv4 first always. The default looks a name up for IPv6 first only when both families leave on the same link, else for the family on the first link first (the owner: IPv6 preferred "given the same network, otherwise it's no longer apples to apples"; 2026-11-27, a cellular call's IPv6 had carried Mahere's fetches at 0.01 MB/s while WiFi's IPv4 stood idle). Applied at the next lookup; an application that asks for one family gets that one whatever the knob.
+- ip reads the block with the person and the screen, once a second at most (no wake of its own), and says the order it took on the console when it changes.
 
 ## Kernel calls
 

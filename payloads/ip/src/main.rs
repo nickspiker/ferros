@@ -24,7 +24,7 @@
 //! - 9 LINK: mode → [0]: 0 both links, WiFi preferred (the default); 1 cellular only; 2 WiFi only. A test can take the cellular path with WiFi up; existing connections keep their link.
 //! - 10 RESOLVE: family (0 either, 4, 6), wait (seconds), host name (dotted, up to 253 bytes) → status, family, address (16; IPv4 in the first 4), TTL left in seconds (u32 BE): 22 bytes. The device's one resolver (2026-11-12; httptest, the kist stower, fgtw and Mahere each carried a copy of their own, drifted apart), its pure parts in ferros_dns (tested on the host).
 //!   - Status: 0 found; 1 still asking (wait 0, or the wait ran out first: the lookup goes on and its answer is kept); 2 no such address (the name does not exist, or has no address of the families asked); 3 not a host name (or a family other than 0, 4, 6); 4 no way to ask (no route of the families asked, or no DNS server, or no entropy for the question's id); 5 no answer (the servers silent or failing, four tries a second apart); 6 busy (every cache record in a lookup).
-//!   - Family 0 asks for each family that has a route: AAAA first when both families leave on the same link (IPv6 preferred: owner, 2026-10-29, on the same network only: 2026-11-27), else the family on WiFi first, so a cellular call's IPv6 never goes ahead of WiFi's IPv4. 4 or 6 asks for that type whatever the routes.
+//!   - Family 0 asks for each family that has a route: AAAA first when both families leave on the same link (IPv6 preferred: owner, 2026-10-29, on the same network only: 2026-11-27), else the family on the link first (WiFi unless the network settings put the call first), so a cellular call's IPv6 never goes ahead of WiFi's IPv4; the network settings can put IPv6 or IPv4 first always (docs/RADIO-CONTROLS.md "Network"). 4 or 6 asks for that type whatever the routes.
 //!   - Wait 1 to 255 holds the call until the lookup ends, that long at most; 0 answers at once from the cache (a lookup started when it holds nothing fresh, the last good address meanwhile, else "still asking"). Held RESOLVEs: sixteen (`RQN`), the oldest answered "still asking" when a seventeenth comes.
 //!   - The cache (`ferros_dns::Cache`): 32 records (a name and a type each), searched in order, the least recently asked giving way. An address holds for its TTL (the least along a chain of aliases), then is kept as the last good one: asked for, it is answered at once while a lookup for it runs, and a lookup that brings no answer keeps it for another TTL (Mahere's rules, 2026-11-11, now every client's). No such address is kept for the SOA's negative TTL (RFC 2308 5), at most 256 s (8 s without an SOA). A TCP connection that opens clears its address's failures; four failures in a row (resets, or what it sent unanswered) make the address stale, so its name is asked again.
 //!   - One lookup a name and type, however many ask: the calls hold on it. A question goes from the resolver's one port (random for the session) with a random id (the entropy grant, each question), to the DNS server of each family's link (INFO's, IPv6's first, turn about), four tries a second apart (the one timer: a lost datagram never comes back); a try ip cannot send yet for want of the next hop goes again 2^-6 s on. An answer counts only from port 53 of a server a try went to, with the id, repeating the question (`ferros_dns::read`); a SERVFAIL or REFUSED moves to the next try at once. Nothing an application sends may leave from the resolver's port (op 1 answers [3]).
@@ -226,8 +226,14 @@ struct Ip {
     /// The screen off (read with `person`, once a second): idle passes back off from 1 to 8 ms, `backoff` the shift of the next idle sleep (0 to 3).
     dark: bool,
     backoff: u32,
-    /// LINK mode (request 9): 0 both, WiFi preferred; 1 cellular only; 2 WiFi only.
+    /// LINK mode (request 9, and the network block's `NET_LINK`): 0 both; 1 cellular only; 2 WiFi only.
     mode: u8,
+    /// Both links up, the cellular call first (`NET_LINK` 1).
+    cell_first: bool,
+    /// The family a lookup asks first (`NET_FAMILY`): 0 IPv6 first on the same link, 1 IPv6 always, 2 IPv4 always.
+    family: u64,
+    /// The network block's generation last applied (`ferros_sys::control::NETWORK`; all ones before the first look).
+    net_gen: u64,
     /// UDP receives held until something comes (op 2 with a wait), answered by `answer_held`.
     held: [Held; HELDN],
     /// Each connection's held receive (op 6 with a wait) and held wait for room (op 14), answered by `answer_held` too: statics, not the 64 KiB stack.
@@ -1368,10 +1374,14 @@ impl Ip {
     /// The link and source address for an IPv4 destination: WiFi once DHCP has bound it, else the cellular call if it has an IPv4 address; broadcast, multicast and the WiFi subnet's broadcast stay on WiFi. None: no address of this family on an allowed link.
     fn pick4(&self, dst: &[u8; 4]) -> Option<(bool, [u8; 4])> {
         let local = *dst == [255; 4] || dst[0] & 0xF0 == 0xE0 || (self.bound && (0..4).all(|k| dst[k] == self.v4[k] | !self.mask[k]));
+        let cell = self.mode != 2 && !local && self.cell.flags & 3 == 3;
+        if self.cell_first && cell {
+            return Some((true, self.cell.v4));
+        }
         if self.mode != 1 && self.bound {
             return Some((false, self.v4));
         }
-        if self.mode != 2 && !local && self.cell.flags & 3 == 3 {
+        if cell {
             return Some((true, self.cell.v4));
         }
         None
@@ -1383,10 +1393,14 @@ impl Ip {
         if self.mode != 1 && self.wifi && link_local {
             return Some((false, self.ll));
         }
+        let cell = self.mode != 2 && !link_local && dst[0] != 0xFF && self.cell.flags & 5 == 5;
+        if self.cell_first && cell {
+            return Some((true, self.cell.v6));
+        }
         if self.mode != 1 && self.have_global && !link_local {
             return Some((false, self.global));
         }
-        if self.mode != 2 && !link_local && dst[0] != 0xFF && self.cell.flags & 5 == 5 {
+        if cell {
             return Some((true, self.cell.v6));
         }
         None
@@ -2440,14 +2454,18 @@ impl Ip {
         let name = if m.len() >= 4 && (m[1] == 0 || m[1] == 4 || m[1] == 6) { ferros_dns::Name::from_host(&m[3..]) } else { None };
         let Some(name) = name else { return Some(res_put(out, res_answer(RES_BAD, 0, [0; 16], 0))) };
         let (want, wait) = (m[1], m[2]);
-        // The types to ask, in order: the family asked for; for either, each family that has a route, IPv6 first when both leave on the same link (owner, 2026-10-29: IPv6 preferred; 2026-11-27: "given the same network, otherwise it's no longer apples to apples"), else the one on WiFi first.
+        // The types to ask, in order: the family asked for; for either, each family that has a route, IPv6 first when both leave on the same link (owner, 2026-10-29: IPv6 preferred; 2026-11-27: "given the same network, otherwise it's no longer apples to apples"), else the one on the link first (WiFi unless the network block puts the call first); or as the network block's `NET_FAMILY` says.
         // 2026-11-27: with IPv6 only on the cellular call and IPv4 on WiFi, every AAAA answer was dialed over the call (Mahere's cells at 10 KB/s, connections never opened) while WiFi stood idle at 864 Mbit/s.
         let mut r = Rq { used: true, tok: *tok, name, until: now + wait as u64 * self.freq, ..RQ_FREE };
         let route6 = self.pick6(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).map(|(cell, _)| cell);
         let route4 = self.pick4(&[8, 8, 8, 8]).map(|(cell, _)| cell);
         let ask6 = want == 6 || (want == 0 && route6.is_some());
         let ask4 = want == 4 || (want == 0 && route4.is_some());
-        let six_first = !(route6 == Some(true) && route4 == Some(false));
+        let six_first = match self.family {
+            1 => true,
+            2 => false,
+            _ => !(route6 == Some(!self.cell_first) && route4 == Some(self.cell_first)),
+        };
         let types = if six_first { [(ask6, ferros_dns::AAAA), (ask4, ferros_dns::A)] } else { [(ask4, ferros_dns::A), (ask6, ferros_dns::AAAA)] };
         for (ask, qtype) in types {
             if ask {
@@ -3569,6 +3587,44 @@ impl Ip {
         any
     }
 
+    /// The network block (ferros_sys::control `NETWORK`, docs/RADIO-CONTROLS.md "Network"), applied when its generation has moved: the link order and the family order, for the next connection and the next lookup (a connection open keeps its link). A value this build does not know reads as unset.
+    /// Looked at with the person and the screen, once a second at most: no wake of its own.
+    fn network_controls(&mut self) {
+        use ferros_sys::control as ctl;
+        let c = ferros_sys::controls(ctl::NETWORK);
+        if c[0] == self.net_gen {
+            return;
+        }
+        self.net_gen = c[0];
+        let (mode, cell_first) = match c[ctl::NET_LINK as usize] {
+            1 => (0, true),
+            2 => (2, false),
+            3 => (1, false),
+            _ => (0, false),
+        };
+        let family = match c[ctl::NET_FAMILY as usize] {
+            v @ (1 | 2) => v,
+            _ => 0,
+        };
+        if (mode, cell_first, family) != (self.mode, self.cell_first, self.family) {
+            self.mode = mode;
+            self.cell_first = cell_first;
+            self.family = family;
+            self.put(b"network settings: links ");
+            self.put(match (mode, cell_first) {
+                (0, false) => b"both, WiFi first".as_slice(),
+                (0, true) => b"both, cellular first",
+                (2, _) => b"WiFi only",
+                _ => b"cellular only",
+            });
+            self.put(match family {
+                1 => b", IPv6 first always\n".as_slice(),
+                2 => b", IPv4 first always\n",
+                _ => b", IPv6 first on the same link\n",
+            });
+        }
+    }
+
     /// INFO's flags byte: bit 0 an IPv4 route, bit 1 an IPv6 one, bit 2 the cellular call up, bit 3 a person present.
     fn flags(&self) -> u8 {
         let a4 = self.pick4(&[8, 8, 8, 8]);
@@ -4049,6 +4105,9 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         dark: false,
         backoff: 0,
         mode: 0,
+        cell_first: false,
+        family: 0,
+        net_gen: u64::MAX,
         held: [HELD_FREE; HELDN],
         rd: unsafe { &mut *(&raw mut RD) },
         wr: unsafe { &mut *(&raw mut WR) },
@@ -4218,6 +4277,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
             ip.person_t = t;
             ip.person = ferros_sys::facts().0[83] == 2;
             ip.dark = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
+            ip.network_controls();
         }
         // Applications: a polling recv on `udp`, the requests waiting taken a few to a pass (sixteen connections' readers and writers share it).
         for _ in 0..REQS_PASS {
