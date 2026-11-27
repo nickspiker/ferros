@@ -54,7 +54,7 @@ From the image's start (arc offset G#1000, a 4 KiB boundary, so ADRP's pages are
 - the entry (runtime.rs `entry`, AAPCS64): it takes the kernel's x0 to x2 (the grants offset, the input's offset and length), runs the module's start function, then `_ferros_main(grants, input, length: i64)` if exported, else `_start()`, then exits (syscall 0);
 - the code, each function on 16 bytes, padding `brk #0`;
 - (a shared memory has no place here: its bytes are its server's, reached thru its handle);
-- the globals, 16 bytes each (an immutable global is folded into the code as its constant);
+- from the next 4 KiB page (the kernel maps the declared text's pages read-only and executable, the rest of the last page with them), the globals, 16 bytes each (an immutable global is folded into the code as its constant);
 - each table: per slot the callee's canonical type id and its offset from the table (a null slot's type matches none, so calling it traps);
 - each memory's size in pages;
 - each data segment's bytes (for `memory.init`);
@@ -78,7 +78,7 @@ Functions imported from "ferros" are toka's, not linked from anywhere:
 - **M0, built 2026-11-26:** the fork masks at emission and toka compiles modules end to end, checker-clean.
   A hand-written module touching every path (loads and stores at every offset class, globals, `call_indirect`, `br_table`, loops, f64 and v128 constants, shuffles, bulk memory, `memory.grow`, atomics, tail calls, division) and a Rust crate built for wasm32 by rustc (BLAKE3, `core::fmt`, sorting, `dyn` calls, i128): every instruction accepted in ring, fixed, BTI and exact mode (the Rust crate 45 functions, 14,057 instructions in ring mode, 18,185 in exact).
   Nothing has run yet.
-- **M1, built 2026-11-26, not yet run** (hello.wat, and tests/rust-hello over ferros_sys): the header, the entry, the `syscall` and `arc_offset` intrinsics, the zeroed tail for memory 0's reserve; tests/wat/hello.wat (a console line) builds checker-clean with and without BTI (`toka tests/wat/hello.wat -o hello.bin --reserve 20`, then `bridge capsule hello.bin hello.vsf --masked --text-len N`, seal and spawn). `--lib` compiles a module with no entry for checking alone.
+- **M1, run on the Pro 2026-11-26** (b1192; hello.wat, and tests/rust-hello over ferros_sys: both sealed by the device and spawned masked, "hello from toka" and the Rust payload's three lines, the timer at husky's 24.576 MHz, exit 0; the first run faulted until the data areas started on the page after the code, as payload.ld has them): the header, the entry, the `syscall` and `arc_offset` intrinsics, the zeroed tail for memory 0's reserve; tests/wat/hello.wat (a console line) builds checker-clean with and without BTI (`toka tests/wat/hello.wat -o hello.bin --reserve 20`, then `bridge capsule hello.bin hello.vsf --masked --text-len N`, seal and spawn). `--lib` compiles a module with no entry for checking alone.
 - **Then:** threads (the kernel's wait and wake on a word), the capsule section for toka bytecode and stow-time compiling on the device (toka as a std process, the seal over the bytecode's and the compiler's hashes, KERNEL.md "Stow, compile, seal, go"), std for wasm through ferros's own target, Photon; and toka's extensions to WebAssembly in CPU-FEATURES.md's order (AES and PMULL, SHA, CRC, dot product and I8MM, FP16 and BF16, 128-bit atomics, then SVE2; spirix's types when hardware runs them).
 
 ## Open for the owner

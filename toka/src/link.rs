@@ -1,7 +1,7 @@
 //! The toka image: functions laid out, their references resolved, every instruction held to the sandbox checker (docs/TOKA.md "The image").
 //!
 //! Layout, from the image's start (which the kernel places at arc offset G#1000, a 4 KiB boundary, so ADRP's pages are the arc's):
-//! the header (ferros_rt's: a branch to the entry, flags, "ferrosRT", the zeroed tail's size; 56 bytes, padded to 64); the code (the entry first, each function on a 16-byte boundary, padding `brk #0`); the globals area; each table; each memory's size cell; each data segment's bytes; then each memory, on a 64 KiB boundary, its active segments in place.
+//! the header (ferros_rt's: a branch to the entry, flags, "ferrosRT", the zeroed tail's size; 56 bytes, padded to 64); the code (the entry first, each function on a 16-byte boundary, padding `brk #0`); from the next 4 KiB page the globals area; each table; each memory's size cell; each data segment's bytes; then each memory, on a 64 KiB boundary, its active segments in place.
 //! Everything is reached PC-relatively, so the image runs wherever its arc is.
 
 use crate::environ::*;
@@ -39,6 +39,8 @@ pub struct Image {
 /// `brk #0`: padding the checker accepts and that ends the process if ever reached.
 const BRK_0: u32 = 0xD420_0000;
 const MEMORY_ALIGN: usize = 1 << 16;
+/// The kernel's page in the arc: what the text's mapping is rounded to.
+const PAGE: usize = 1 << 12;
 
 fn align(x: usize, a: usize) -> usize {
     (x + a - 1) & !(a - 1)
@@ -71,7 +73,8 @@ pub fn link(module: &Module<'_>, plan: &Plan, compiled: Vec<Compiled>, opts: &Op
     }
     let text_len = bytes.len();
 
-    // The data areas.
+    // The data areas, from the page after the code: the kernel maps the declared text's pages read-only and executable, the rest of its last page with them (2026-11-26, the first run on the Pro: the `syscall_x1` cell 8 bytes past the code took a write permission fault), as payload.ld aligns .rodata.
+    bytes.resize(align(bytes.len(), PAGE), 0);
     let mut symbols: Vec<(UserExternalName, usize)> = functions.iter().map(|f| (f.name.clone(), f.offset)).collect();
     let mut put = |bytes: &mut Vec<u8>, sym: u32, at_align: usize, data: &[u8]| -> usize {
         bytes.resize(align(bytes.len(), at_align), 0);
