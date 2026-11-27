@@ -24,11 +24,11 @@ cargo +nightly build -Zjson-target-spec -Zbuild-std=core,alloc,std,panic_abort -
     --config "resolver.lockfile-path='$mahere/ferros/Cargo.lock'" \
     --config "patch.crates-io.fluor.path='$fluor'" \
     --config "patch.crates-io.kete.path='$kete'" \
-    --config "patch.crates-io.valhall.path='$here/valhall'" \
+    --config "patch.crates-io.valhall.path='$here/crates/valhall'" \
     --config "patch.crates-io.libc.path='$code/ferros/forks/libc'" \
-    --config "patch.crates-io.ferros_fluor.path='$here/ferros_fluor'" \
-    --config "patch.crates-io.ferros_theme.path='$here/ferros_theme'" \
-    --config "patch.crates-io.ferros_sys.path='$here/ferros_sys'" \
+    --config "patch.crates-io.ferros_fluor.path='$here/crates/fluor'" \
+    --config "patch.crates-io.ferros_theme.path='$here/crates/theme'" \
+    --config "patch.crates-io.ferros_sys.path='$here/crates/sys'" \
     -p mahere-ferros --features fluor/host-ferros $profile_flag "$@"
 out="$CARGO_TARGET_DIR/aarch64-unknown-ferros/$profile/mahere"
 aarch64-linux-gnu-objcopy -O binary "$out" "$out.bin" && echo "$out.bin: $(stat -c %s "$out.bin") bytes"
