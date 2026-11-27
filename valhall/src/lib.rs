@@ -591,7 +591,7 @@ pub enum Clamp {
 
 /// A branch target, bound to an instruction index by [`Kernel::bind`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Label(u8);
+pub struct Label(u32);
 
 // ---------------------------------------------------------------------------
 // One instruction under construction
@@ -733,20 +733,16 @@ impl Ins {
 // The builder
 // ---------------------------------------------------------------------------
 
-/// Branch targets one kernel may declare: the SSA compiler takes two a loop, and the wallpaper's refine kernel has seventeen loops (one orbit for the far layer, one for each of its 4 × 4 samples).
-const LABELS: usize = 1 << 6;
-/// Branches one kernel may emit (two a loop).
-const BRANCHES: usize = 1 << 7;
-
 /// A kernel under construction, holding at most `N` instruction words with no allocator.
-/// Running past `N` words, [`LABELS`] labels or [`BRANCHES`] branches panics on the array index: a kernel that does not fit is a bug in the caller's sizing.
+/// Its labels and branches are sized by `N` too, never by a count of their own (2026-11-27: a fixed 2^6 labels refused Mahere's still frames at nine samples a pixel): every branch is one of the words, so `N` holds them all; every label a caller makes is some branch's target (the SSA compiler takes two a loop, each loop two branches), so its labels never outnumber its words.
+/// Running past `N` words, or making more labels than `N`, panics on the array index: a kernel that does not fit is a bug in the caller's sizing.
 pub struct Kernel<const N: usize> {
     words: [u64; N],
     len: usize,
-    labels: [Option<u32>; LABELS],
+    labels: [Option<u32>; N],
     nlabels: usize,
     /// (instruction index, label) for every branch, resolved by [`Kernel::finish`].
-    branches: [(u32, u8); BRANCHES],
+    branches: [(u32, u32); N],
     nbranches: usize,
 }
 
@@ -807,7 +803,7 @@ impl<const N: usize> Kernel<N> {
     pub const fn new() -> Self {
         // A branch offset is a 27-bit signed field in instructions (ISA.xml:822); with N at most 2^26, every offset between two of this kernel's instructions fits, so no branch needs a range check.
         const { assert!(N <= 1 << 26, "valhall: a kernel is at most 2^26 instructions") };
-        Kernel { words: [0; N], len: 0, labels: [None; LABELS], nlabels: 0, branches: [(0, 0); BRANCHES], nbranches: 0 }
+        Kernel { words: [0; N], len: 0, labels: [None; N], nlabels: 0, branches: [(0, 0); N], nbranches: 0 }
     }
 
     /// Number of instructions emitted so far.
@@ -830,10 +826,10 @@ impl<const N: usize> Kernel<N> {
     /// A new label, not yet bound.
     pub fn label(&mut self) -> Label {
         let l = self.nlabels;
-        // Already None; the write is here so a kernel past LABELS labels panics on this index, at the label's creation.
+        // Already None; the write is here so a kernel past `N` labels panics on this index, at the label's creation.
         self.labels[l] = None;
         self.nlabels = l + 1;
-        Label(l as u8)
+        Label(l as u32)
     }
 
     /// Binds `l` to the next instruction emitted.
