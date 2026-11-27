@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The Pixel 8a (akita) dev loop (ferros_kernel/src/board.rs): the usb process as a native capsule the kernel carries (akita has no vault yet, so no init and no stored capsule), the bare kernel (no hv: it lives in husky's top RAM, past akita's 8 GB), wrapped as ABL boots it, then booted on the 8a.
+# The Pixel 8a (akita) dev loop (kernel/src/board.rs): the usb process as a native capsule the kernel carries (akita has no vault yet, so no init and no stored capsule), the bare kernel (no hv: it lives in husky's top RAM, past akita's 8 GB), wrapped as ABL boots it, then booted on the 8a.
 # Default: `fastboot boot`, from RAM, nothing flashed. --flash-a: boot_a only, then slot a active; slot b keeps Android as the escape (ABL falls back to it once slot a's retries run out, since this ferros marks no slot).
 # Every fastboot call names the 8a by serial: with husky on the same host an unnamed one can land on the wrong phone.
 set -euo pipefail
@@ -34,7 +34,7 @@ if [ "${1:-}" = --flash-a ]; then
 else
     fastboot -s "$S" boot "$IMG"
 fi
-# Either ferros on USB, or (a FERROS_PROBE build, ferros_kernel/src/board.rs) the 8a back in fastboot: the boot reached the probe. Give fastboot time to drop off first.
+# Either ferros on USB, or (a FERROS_PROBE build, kernel/src/board.rs) the 8a back in fastboot: the boot reached the probe. Give fastboot time to drop off first.
 sleep 6
 for i in $(seq 60); do
     if lsusb -d 1209:4665 >/dev/null; then

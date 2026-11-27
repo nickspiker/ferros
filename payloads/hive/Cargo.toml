@@ -9,7 +9,7 @@ name = "hive"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-honeycomb = { path = "../../honeycomb" }
+ferros_sys = { path = "../../crates/sys" }
+honeycomb = { path = "../../crates/honeycomb" }
 # The keys' words and the hint in the person's language.
-ferros_lang = { path = "../../ferros_lang", features = ["process"] }
+ferros_lang = { path = "../../crates/lang", features = ["process"] }

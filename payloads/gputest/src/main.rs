@@ -37,7 +37,7 @@ macro_rules! say {
     }};
 }
 
-/// The Mandelbrot kernel (valhall/tests/kernels.rs `mandelbrot`, verified word for word): per invocation one pixel of a 2^shift-wide grid, its escape count to the output.
+/// The Mandelbrot kernel (crates/valhall/tests/kernels.rs `mandelbrot`, verified word for word): per invocation one pixel of a 2^shift-wide grid, its escape count to the output.
 fn mandelbrot(k: &mut Kernel<32>) {
     k.rshift_or_i32(r(13), r(60), u(1).w0(), Byte::B0, Lut::ZERO);
     k.lshift_or_i32(r(12), r(13), u(1).w0(), Byte::B0, Lut::ZERO);

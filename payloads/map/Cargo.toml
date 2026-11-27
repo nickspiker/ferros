@@ -9,24 +9,24 @@ name = "map"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
+ferros_sys = { path = "../../crates/sys" }
 # A link's detail document (docs/RADIO-CONTROLS.md).
-ferros_detail = { path = "../../ferros_detail" }
+ferros_detail = { path = "../../crates/detail" }
 # The heap the links' detail documents are read in (ferros_sys::detail, docs/RADIO-CONTROLS.md).
-ferros_heap = { path = "../../ferros_heap", features = ["process"] }
+ferros_heap = { path = "../../crates/heap", features = ["process"] }
 # The map's copy (its places, the view, Developer) as VSF documents (docs/VSF-AUDIT.md P17), one definition with ferros_space's sync.
-ferros_kept = { path = "../../ferros_kept" }
+ferros_kept = { path = "../../crates/kept" }
 # Each circle as a thing (`ht`) and its icon by content (`hp`).
-ferros_thing = { path = "../../ferros_thing" }
+ferros_thing = { path = "../../crates/thing" }
 libm = "0.2"
 tatau = { path = "../../../tatau" }
 # Kists (KISTS.md): the person's list for the kist circles, the first-launch question and the permission pages.
-ferros_kist = { path = "../../ferros_kist", features = ["process"] }
+ferros_kist = { path = "../../crates/kist", features = ["process"] }
 # The words on the settings pages in the person's language (Photon's sixteen; the fleet's words are fgtw's, thru it).
-ferros_lang = { path = "../../ferros_lang", features = ["process"] }
+ferros_lang = { path = "../../crates/lang", features = ["process"] }
 # The kist circles' states as their glows (display op 57): the state's byte.
-ferros_glow = { path = "../../ferros_glow" }
+ferros_glow = { path = "../../crates/glow" }
 # Attest to approve (docs/AUTH.md "Approve on the attest screen"): the requests the settings pages ask the kernel for, and the "require attest" guards.
-ahau_core = { path = "../../ahau_core" }
+ahau_core = { path = "../../crates/ahau_core" }
 # The Security page as one model with Photon (fgtw::security; owner, 2026-11-24: "so ferros and Photon render the same"): its rows, their order, confirmations and words.
 fgtw = { path = "../../../fgtw", default-features = false, features = ["security"] }

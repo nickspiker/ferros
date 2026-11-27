@@ -9,5 +9,5 @@ name = "udplat"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-ferros_netring = { path = "../../ferros_netring" }
+ferros_sys = { path = "../../crates/sys" }
+ferros_netring = { path = "../../crates/netring" }

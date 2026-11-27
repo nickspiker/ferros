@@ -1,6 +1,6 @@
 //! The link (the payload's script, position-independent), and the queue test's band coder (input 14): ferros_clip's GPU kernel recorded on the host for the binned main's geometry, written as words for the test to load (RAW-VIDEO.md "On the GPU": the device never runs that compiler).
 
-#[path = "../../ferros_clip/src/gpu_kernel.rs"]
+#[path = "../../crates/clip/src/gpu_kernel.rs"]
 #[allow(dead_code)]
 mod gpu_kernel;
 
@@ -18,7 +18,7 @@ fn main() {
     println!("cargo:rustc-link-arg=-z");
     println!("cargo:rustc-link-arg=notext");
     println!("cargo:rerun-if-changed={}", ld.display());
-    println!("cargo:rerun-if-changed=../../ferros_clip/src/gpu_kernel.rs");
+    println!("cargo:rerun-if-changed=../../crates/clip/src/gpu_kernel.rs");
     let k = gpu_kernel::kernel(4080, 0x1400);
     let mut s = String::new();
     let _ = write!(s, "/// ferros_clip's band coder for 4080 samples on G#1400-byte rows (build.rs).\npub const BAND_REGS64: bool = {};\npub static BAND_WORDS: &[u64] = &[", k.regs64);

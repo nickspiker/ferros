@@ -9,11 +9,11 @@ name = "wallgen"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-ferros_heap = { path = "../../ferros_heap", features = ["process"] }
+ferros_sys = { path = "../../crates/sys" }
+ferros_heap = { path = "../../crates/heap", features = ["process"] }
 # The picture as GPU kernels (its `gpu` feature: valhall's recorder), wallgen's only way to draw it.
-wallpaper = { path = "../../wallpaper", features = ["gpu"] }
+wallpaper = { path = "../../crates/wallpaper", features = ["gpu"] }
 vsf = { path = "../../../vsf", default-features = false }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 # The made wallpaper's key kept as a VSF document (docs/VSF-AUDIT.md P18).
-ferros_kept = { path = "../../ferros_kept" }
+ferros_kept = { path = "../../crates/kept" }

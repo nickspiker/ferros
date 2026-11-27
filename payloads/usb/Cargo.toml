@@ -13,7 +13,7 @@ path = "src/main.rs"
 msos = ["ferros_hal/msos"]
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-ferros_pt = { path = "../../ferros_pt" }
-ferros_hal = { path = "../../ferros_hal", default-features = false }
-ferros_ledger = { path = "../../ferros_ledger" }
+ferros_sys = { path = "../../crates/sys" }
+ferros_pt = { path = "../../crates/pt" }
+ferros_hal = { path = "../../crates/hal", default-features = false }
+ferros_ledger = { path = "../../crates/ledger" }

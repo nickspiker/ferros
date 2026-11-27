@@ -5,7 +5,7 @@ ferros is a mobile OS distilled down to what an OS actually is, in Rust; inspire
 
 ## Conventions
 - All numeric output uses `[base36]#[number]` format (G# for hex, A# for decimal) — NEVER use 0x prefix
-- Pure Rust in the hypervisor, kernel, seed, runtime and payloads: no C. Four hand-written `global_asm!` entry stubs (hv header/copy, kernel `_entry`, seed start, ferros_rt `_entry`) and one chainlifted listing (keyreg/keys.s: safe Rust lifted to assembly by tools/keyreg-lift.sh, audited, frozen). std processes (tools/std-build.sh) may link C crates (blake3 NEON, PQClean) through the cc crate. `unsafe` only at audited hardware boundaries
+- Pure Rust in the hypervisor, kernel, seed, runtime and payloads: no C. Four hand-written `global_asm!` entry stubs (hv header/copy, kernel `_entry`, seed start, ferros_rt `_entry`) and one chainlifted listing (kernel/keyreg/keys.s: safe Rust lifted to assembly by tools/keyreg-lift.sh, audited, frozen). std processes (tools/std-build.sh) may link C crates (blake3 NEON, PQClean) through the cc crate. `unsafe` only at audited hardware boundaries
 - Binary OCD: powers of 2 for counts, timeouts, loops
 - EWE encoding on disk — no fixed-width integers on persistent storage, ever
 - Write-verify-then-mirror protocol for all persistent writes
@@ -197,11 +197,11 @@ M1N1DEVICE=/dev/ttyACM0 python3 tools/m1n1-boot.py
 ### Implementation status
 All code written, never run on hardware. Next step is boot + validate.
 
-- `ferros_hal_m1/src/dart.rs` (346 LOC) — DONE. T8020 DART, dual register banks, L1/L2 16KB pages, 128MB IOVA.
-- `ferros_hal_m1/src/usb.rs` (966 LOC) — DONE. Full DWC3 device-mode, all 13 UsbBulk trait methods.
+- `crates/hal_m1/src/dart.rs` (346 LOC) — DONE. T8020 DART, dual register banks, L1/L2 16KB pages, 128MB IOVA.
+- `crates/hal_m1/src/usb.rs` (966 LOC) — DONE. Full DWC3 device-mode, all 13 UsbBulk trait methods.
   EP0 control (SET_ADDRESS, GET_DESCRIPTOR, SET_CONFIG), EP1 bulk IN/OUT, TRB-based I/O.
   USB descriptors: VID=G#1209, PID=G#4665 (pid.codes PR #1208, merged 2026-09-28), "ferros M1". 28 diagnostic fields.
-- `ferros_kernel/src/main.rs` M1 path — DONE. DART setup, DWC3 init, USB event loop, PT dispatch stub.
+- `kernel/src/main.rs` M1 path — DONE. DART setup, DWC3 init, USB event loop, PT dispatch stub.
 
 ### Hardcoded M1 register addresses (from m1n1 ADT dump)
 - DWC3 core:    G#3_8228_0000

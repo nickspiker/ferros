@@ -7,9 +7,9 @@ fn main() {
     }
     println!("cargo:rerun-if-changed={}", ld.display());
 
-    // Every station document in ferros_tide/stations/, and the catalog, bundled by name.
+    // Every station document in crates/tide/stations/, and the catalog, bundled by name.
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let dir = manifest.join("../../ferros_tide/stations");
+    let dir = manifest.join("../../crates/tide/stations");
     println!("cargo:rerun-if-changed={}", dir.display());
     let mut docs: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.to_string_lossy().ends_with(".tide.vsf")).collect();
     docs.sort();

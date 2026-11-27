@@ -7,4 +7,4 @@ description = "Host side: list and copy files out of an f2fs image through ferro
 [workspace]
 
 [dependencies]
-ferros_f2fs = { path = "../../ferros_f2fs" }
+ferros_f2fs = { path = "../../crates/f2fs" }

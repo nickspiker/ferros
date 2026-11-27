@@ -343,7 +343,7 @@ Tightening (a lower cap, another blocked key) can be allowed without one, which 
 
 ## 13. Where the Code Is Today
 
-- **The seed exists.** [ferros_pt/src/command.rs](ferros_pt/src/command.rs) defines `[cap: 32][op: 1][params]` with dev caps that are unauthenticated BLAKE3 hashes of well-known names. Dispatch runs inside the kernel's USB event loop in [ferros_kernel/src/main.rs](ferros_kernel/src/main.rs), in two copies (M1 and husky).
+- **The seed exists.** [crates/pt/src/command.rs](crates/pt/src/command.rs) defines `[cap: 32][op: 1][params]` with dev caps that are unauthenticated BLAKE3 hashes of well-known names. Dispatch runs inside the kernel's USB event loop in [kernel/src/main.rs](kernel/src/main.rs), in two copies (M1 and husky).
 - **There is no userspace yet**, so the portal starts as a kernel module that replaces both dispatch loops, shaped to move out into a server once processes and IPC exist.
 - **Wire format changes.** [BRIDGE.md](BRIDGE.md) plans for production to "delegate real credentials over the identical wire format," which would send capability tokens as bearer tokens: whoever holds one can use it, and nothing ties a request to an identity for the ledger. The portal instead sends signed VSF requests and keeps capabilities on the device. The op/params shape can carry over.
 - **`ferros-bridge terminal`** (one line per PT transfer) becomes a text front end that builds VSF requests from the published pattern table.

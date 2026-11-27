@@ -9,4 +9,4 @@ name = "ufsreset"
 path = "src/main.rs"
 
 [dependencies]
-ferros_hal = { path = "../../ferros_hal", default-features = false }
+ferros_hal = { path = "../../crates/hal", default-features = false }

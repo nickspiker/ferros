@@ -1,6 +1,6 @@
 # Boards
 
-ferros runs on two Tensor G3 (zuma) phones. The kernel tells them apart at entry from the root `model` of the device tree ABL hands over (`ferros_kernel/src/board.rs`), before anything board-specific runs.
+ferros runs on two Tensor G3 (zuma) phones. The kernel tells them apart at entry from the root `model` of the device tree ABL hands over (`kernel/src/board.rs`), before anything board-specific runs.
 
 | | husky (Pixel 8 Pro) | akita (Pixel 8a) |
 |---|---|---|
@@ -22,7 +22,7 @@ akita's repeater tune, from its MP board overlay (`repeater_tune1..5`): G#50 = G
 ## Memory map: where arcs come from (ARCS.md step 0, 2026-11-11)
 
 Every process's arc is made of 2 MiB frames from one pool (ARCS.md).
-The pool's ranges are listed here and in `ferros_kernel/src/frames.rs`, in the order frames are taken; `diag frames` reads them back from the running kernel.
+The pool's ranges are listed here and in `kernel/src/frames.rs`, in the order frames are taken; `diag frames` reads them back from the running kernel.
 A range goes in only with memblock's proof that nothing else owns it, never a device tree node alone (HV.md "the reservation that never was"), or because ferros has run processes there since before this map.
 
 | Range | Size | husky | akita | Proof |

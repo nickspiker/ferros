@@ -54,7 +54,7 @@ Power-up (`fts_chip_powercycle`): reset low, DVDD on, 1 ms, AVDD on, 5 ms, 10 ms
 
 ## Cold bring-up in ferros (2026-10-19): WORKS
 
-`ferros_kernel/src/touch.rs`, driven over PT:
+`kernel/src/touch.rs`, driven over PT:
 
 ```bash
 ferros-bridge diag "touch state"   # clocks, pins, rails, read only

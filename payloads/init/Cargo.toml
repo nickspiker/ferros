@@ -9,8 +9,8 @@ name = "init"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-ferros_shell = { path = "../../ferros_shell" }
+ferros_sys = { path = "../../crates/sys" }
+ferros_shell = { path = "../../crates/shell" }
 # Kists (KISTS.md): the person's list read to launch one with exactly its granted rights; a heap to read it in.
-ferros_kist = { path = "../../ferros_kist", features = ["process"] }
-ferros_heap = { path = "../../ferros_heap", features = ["process"] }
+ferros_kist = { path = "../../crates/kist", features = ["process"] }
+ferros_heap = { path = "../../crates/heap", features = ["process"] }

@@ -9,6 +9,6 @@ name = "sensors"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
+ferros_sys = { path = "../../crates/sys" }
 # The kernel's free-list allocator: the protocol builds and parses its messages on the heap, a few a second for as long as the session runs.
-ferros_heap = { path = "../../ferros_heap", features = ["process"] }
+ferros_heap = { path = "../../crates/heap", features = ["process"] }

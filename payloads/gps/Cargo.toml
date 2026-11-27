@@ -9,15 +9,15 @@ name = "gps"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-ferros_spi = { path = "../../ferros_spi" }
+ferros_sys = { path = "../../crates/sys" }
+ferros_spi = { path = "../../crates/spi" }
 # The last fix kept as a VSF document (docs/VSF-AUDIT.md P15: the place as `w`, when it came as `e`).
-ferros_kept = { path = "../../ferros_kept" }
+ferros_kept = { path = "../../crates/kept" }
 # The heap that document is built and read in.
-ferros_heap = { path = "../../ferros_heap", features = ["process"] }
+ferros_heap = { path = "../../crates/heap", features = ["process"] }
 # The rough place combined from its sources (the single egg rule), and the predicted sky: the orbits carried forward and seen from that place.
-ferros_gnss = { path = "../../ferros_gnss" }
+ferros_gnss = { path = "../../crates/gnss" }
 # A place on the earth for the predicted sky (the sun and moon engine's, which ferros_gnss shares).
-ferros_sky = { path = "../../ferros_sky" }
+ferros_sky = { path = "../../crates/sky" }
 # The orbits' plain HTTP GET decoded as it arrives (ferros_kist::fetch, the stower's and the weather puck's).
-ferros_kist = { path = "../../ferros_kist" }
+ferros_kist = { path = "../../crates/kist" }

@@ -145,7 +145,7 @@ The option is ORACLE.md's: `hp` (stable across versions) by default, chosen by t
 
 ## Found while mapping the kernel's vault (2026-11-07)
 
-- **The layout is manifestus**, not the `vault/` crate (`ferros_vault`): the kernel uses `ferros_vault` only for `AnchorKey`. `ferros_vault/` at the repo root is not a crate at all (no Cargo.toml; a host-file prototype).
+- **The layout is manifestus**, not the `crates/vault/` crate (`ferros_vault`): the kernel uses `ferros_vault` only for `AnchorKey`. `ferros_vault/` at the repo root is not a crate at all (no Cargo.toml; a host-file prototype).
 - **The UFS link is shared:** the flash log, the ira (devinfo on LUN 3), slot marking, partfs (the modem's partition grants), the write-protect flag and the `diag ufs` tools all use it, under the kernel lock. The vault process cannot own the link outright until those have somewhere to go.
 - **The kernel reads the vault itself:** `init`, `sealed`, `device`, `boot`, `genesis`, `android.allowed`, `home.off`, `aoc.fw.*`, `cam.*`. It needs a client channel of its own to the vault process.
 - **`vault_probe` stays in the kernel:** it derives the ira, puts it in the key registers and sets the oracle's system secret before anything is stored.

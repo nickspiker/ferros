@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 vsf = { path = "../../../vsf", default-features = false, features = ["std"] }
-ferros_clip = { path = "../../ferros_clip" }
+ferros_clip = { path = "../../crates/clip" }
 
 [profile.release]
 debug = 1

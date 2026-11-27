@@ -7,20 +7,20 @@
 pub mod futex;
 pub mod sys;
 
-#[path = "../../../ferros_rt/src/tlsf.rs"]
+#[path = "../../../crates/rt/src/tlsf.rs"]
 pub mod tlsf;
 
-#[path = "../../../ferros_rt/src/lock.rs"]
+#[path = "../../../crates/rt/src/lock.rs"]
 pub mod lock;
 
-#[path = "../../../ferros_rt/src/layout.rs"]
+#[path = "../../../crates/rt/src/layout.rs"]
 pub mod layout;
 
-#[path = "../../../ferros_rt/src/alloc.rs"]
+#[path = "../../../crates/rt/src/alloc.rs"]
 pub mod alloc;
 
 /// The C allocator's size arithmetic (cabi.rs): its tests run with these.
-#[path = "../../../ferros_rt/src/csize.rs"]
+#[path = "../../../crates/rt/src/csize.rs"]
 pub mod csize;
 
 /// SplitMix64: a small deterministic generator for the tests and the benchmark.

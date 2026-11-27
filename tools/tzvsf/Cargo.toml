@@ -7,4 +7,4 @@ edition = "2024"
 
 [dependencies]
 vsf = { path = "../../../vsf" }
-ferros_tz = { path = "../../ferros_tz" }
+ferros_tz = { path = "../../crates/tz" }

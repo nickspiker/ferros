@@ -5,7 +5,7 @@ metadata:
   type: project
 ---
 
-Since 2026-10-23 the kernel brings up the four Cortex-A715s (MPIDR Aff1 4-7) as workers from the X3 (`ferros_kernel/src/smp.rs`): hand-over blocks in the result page at RESULT+G#200, idle loop = run_slice or wfe, every enqueue does sev. One kernel lock (process.rs `lock()`), one global run queue, per-thread core masks: processes default to the workers (G#F0), the display's render thread pins to the X3 (G#100) via `ferros_sys::pin`. A RELOAD CPU_OFFs the workers first (`smp::stop_all`). `FERROS_SMP=0` builds stay single-core.
+Since 2026-10-23 the kernel brings up the four Cortex-A715s (MPIDR Aff1 4-7) as workers from the X3 (`kernel/src/smp.rs`): hand-over blocks in the result page at RESULT+G#200, idle loop = run_slice or wfe, every enqueue does sev. One kernel lock (process.rs `lock()`), one global run queue, per-thread core masks: processes default to the workers (G#F0), the display's render thread pins to the X3 (G#100) via `ferros_sys::pin`. A RELOAD CPU_OFFs the workers first (`smp::stop_all`). `FERROS_SMP=0` builds stay single-core.
 
 **Why:** the drag at 114 fps needs the render thread on the X3 (unpinned it wandered to A715s: 70-81 fps); everything else on the workers so a call hands off on the caller's own core (4 µs wait, 7 µs server).
 

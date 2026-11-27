@@ -1,0 +1,19 @@
+[package]
+name = "ferros_sys"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The one place a ferros process touches the machine: syscalls, the timer, its arc base."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Numbers in the device base (SETTINGS.md): `numbers()` hands an app a ready tatau formatter.
+tatau = { path = "../../../tatau" }
+# Mailboxes (`mailbox`): the header, the seqlock and the payload layouts, host-tested there.
+ferros_mailbox = { path = "../mailbox" }
+# The GPU queue (`gpu::queue`): its layout and its records, host-tested there.
+ferros_gpuq = { path = "../gpuq" }
+# The device's themes, the one table (moved out of here 2026-11-20 so a kist's host tests read it too); re-exported as `theme`.
+ferros_theme = { path = "../theme" }

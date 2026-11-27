@@ -7,7 +7,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-ferros_sys = { path = "../../../ferros_sys" }
+ferros_sys = { path = "../../../crates/sys" }
 
 [profile.release]
 panic = "abort"

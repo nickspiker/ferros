@@ -12,7 +12,8 @@ set -euo pipefail
 # Resolve repo root so the gate works from any CWD (standalone or as a git hook).
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-offenders=$(find "$root" -name "*.rs" -not -path "*/target/*" | while read -r f; do
+# forks/ is upstream's code (Rust's library, libc) as it came, never restyled: the gate holds ferros's own.
+offenders=$(find "$root" -name "*.rs" -not -path "*/target/*" -not -path "$root/forks/*" | while read -r f; do
     awk -v F="$f" '
         FNR == 1 { pm = ""; prev = "" }
         {

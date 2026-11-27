@@ -1,4 +1,4 @@
-//! flame — where a ferros device's cores spend their time: drives the kernel's sampling profiler (ferros_kernel/src/prof.rs, `diag prof`) over the bridge, reads its rings, names every address from the right ELF, and prints the report: each core's share by process, the hottest functions (self and total), the syscalls that held ticks, and the folded stacks. `--html <file>` also writes a flame graph to look at in a browser (a host-side view: it never goes to the device or into the repo).
+//! flame — where a ferros device's cores spend their time: drives the kernel's sampling profiler (kernel/src/prof.rs, `diag prof`) over the bridge, reads its rings, names every address from the right ELF, and prints the report: each core's share by process, the hottest functions (self and total), the syscalls that held ticks, and the folded stacks. `--html <file>` also writes a flame graph to look at in a browser (a host-side view: it never goes to the device or into the repo).
 //!
 //! What the samples mean (prof.rs has the detail): each tick records where its core was. A tick that waited on masked IRQs (every syscall runs masked) is weighed by the periods it waited, and when it waited inside a syscall it is drawn under the caller's own stack, ending in `[syscall NAME]`; time spent in the kernel's masked code is visible as that leaf, not inside the kernel.
 //!
@@ -286,7 +286,7 @@ fn decode(core: u64, words: &[u64], head: usize) -> (Vec<Sample>, bool) {
 
 // ------------------------------------------------------------------ names
 
-/// The syscall numbers (ferros_kernel/src/process.rs SYS_*).
+/// The syscall numbers (kernel/src/process.rs SYS_*).
 fn syscall_name(nr: u64) -> String {
     let n = match nr {
         0 => "exit",

@@ -9,6 +9,6 @@ name = "camtest"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
+ferros_sys = { path = "../../crates/sys" }
 # The camera ring on the GPU (fourth byte 11): its two kernels by the builder, no recorder (no allocator here).
-valhall = { path = "../../valhall" }
+valhall = { path = "../../crates/valhall" }

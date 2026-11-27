@@ -9,10 +9,10 @@ name = "camera"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-ferros_heap = { path = "../../ferros_heap", features = ["process"] }
+ferros_sys = { path = "../../crates/sys" }
+ferros_heap = { path = "../../crates/heap", features = ["process"] }
 # `list`: the endpoint's list built from each camera's IDT in the vault (ferros_cam list).
-ferros_cam = { path = "../../ferros_cam", features = ["list"] }
+ferros_cam = { path = "../../crates/cam", features = ["list"] }
 # vsf hashes with blake3; pure Rust, as the display's and the vault's have it: its C and assembly do not build for the bare target.
 blake3 = { version = "1", default-features = false, features = ["pure"] }
-ferros_layout = { path = "../../ferros_layout" }
+ferros_layout = { path = "../../crates/layout" }

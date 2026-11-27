@@ -4,7 +4,7 @@ The controller is an ST54L (ST21NFC NCI 2.0 interface plus an eSE) on hsi2c_0 (P
 
 ## Split
 
-- **Kernel** (`ferros_kernel/src/nfc.rs`, power switch `nfc`):
+- **Kernel** (`kernel/src/nfc.rs`, power switch `nfc`):
   - the bus's pin modes (gpp19-0/1, function 3) and the controller from cold, if nothing has brought it up;
   - the PMU clock pad: CLKOUT1 G#1546_3E84 bit 16 EXTPAD_CONTROL_EN, set through EL3's atomic alias G#1546_FE84;
   - the reset pulse on gph1-6. The modem process drives other pins in that bank (gph1-0/1/2/7), so the pulse stays in the kernel;

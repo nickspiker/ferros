@@ -4,7 +4,7 @@ The BCM4398's Bluetooth core is on the APM's USI1 UART: serial_18, G#155D_0000, 
 
 ## Split
 
-- **Kernel** (`ferros_kernel/src/bt.rs`, power switch `bt`):
+- **Kernel** (`kernel/src/bt.rs`, power switch `bt`):
   - USI1's mode word: SYSREG_APM G#1542_04E4, 1 = UART.
   - The power lines, in nitrous.c's order:
     - BT_REG_ON gpn8-0;

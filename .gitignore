@@ -17,21 +17,14 @@ Intellectual Property/*.aux
 Intellectual Property/*.out
 Intellectual Property/*.synctex.gz
 
-# Signed binaries
-kernel.signed
-
 # Temp / generated
 *.tmp.*
-compact.txt
 
-# Local memory — not for repo
-memory/
-CLAUDE MEMORY.md
 tools/pixel8/
 texput.log
 
 # Raw averaged camera frames from the calibration session: they carry this unit's sensor pixel-response pattern (a per-device fingerprint) and capture-location fields. The spectral results derived from them are committed; these stay on Harbor.
-pixel 8 pro calibration data/*average.vsf
+data/pixel-8-pro-calibration/*average.vsf
 __pycache__/
 web/.wrangler/
 # The kists Worker's worker-build output and wrangler's state.

@@ -241,7 +241,7 @@ FERROS_HV_NO_PMU_READ=1 FERROS_HV_STAGE2=1 FERROS_HV_ORACLE=1 FERROS_HV_MODEM_RI
 
 ## ferros cold bring-up: `diag modem sN` (written 2026-10-19 night, not yet run)
 
-`ferros_kernel/src/modem.rs` runs stages 0..=N, each repeating the ones before it so a hang points at the stage that caused it (the payloads/pcie1 pattern, ported to ch0):
+`kernel/src/modem.rs` runs stages 0..=N, each repeating the ones before it so a hang points at the stage that caused it (the payloads/pcie1 pattern, ported to ch0):
 
 | Stage | What | Pass looks like |
 |---|---|---|

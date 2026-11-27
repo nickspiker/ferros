@@ -6,7 +6,7 @@
 set -uo pipefail
 REPO=/mnt/Harbor/Code/ferros
 B=$REPO/target/debug/ferros-bridge
-OUT=${1:-$REPO/oracle/display/husky-hk3/calib-$(date +%Y%m%d-%H%M).csv}
+OUT=${1:-$REPO/data/oracle/display/husky-hk3/calib-$(date +%Y%m%d-%H%M).csv}
 run() { timeout 60 "$B" "$@" >/dev/null 2>&1; }
 dbv() { local v=$1; run display dcs "f0 5a 5a / 51 $(printf '%02x %02x' $((v >> 8)) $((v & 255))) / f0 a5 a5"; }
 read_yxy() {

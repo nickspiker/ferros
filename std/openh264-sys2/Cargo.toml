@@ -17,7 +17,7 @@ source = []
 
 [dependencies]
 # The C++ runtime, POSIX and stdio calls openh264 makes: an app's copy of the runtime beside std's (`runtime` off), with `cxx`.
-ferros-rt = { path = "../../ferros_rt", default-features = false, features = ["cxx"] }
+ferros-rt = { path = "../../crates/rt", default-features = false, features = ["cxx"] }
 
 [build-dependencies]
 cc = { version = "1.0", features = ["parallel"] }

@@ -32,7 +32,7 @@ MIPI receiver (CSI) D-PHY: G#1C10_1000..G#1C10_3FFF, shared (`dcphy_m0s4s4s4s4s4
 
 ## The controller
 
-Exynos USI HS-I2C in auto mode, the same block `ferros_kernel/src/hsi2c.rs` already drives for the PMIC (the oracle confirmed the register map on a second instance): ADDR G#70 holds the 7-bit target at [16:10], AUTO_CONF G#44 carries length [15:0] + READ (16) + STOP (17) + RUN (31), TX_DATA G#34 / RX_DATA G#38 are the FIFOs, and the driver polls STATUS/FIFO in a tight loop (most of the raw trap volume is that poll, filtered out by the decoder).
+Exynos USI HS-I2C in auto mode, the same block `kernel/src/hsi2c.rs` already drives for the PMIC (the oracle confirmed the register map on a second instance): ADDR G#70 holds the 7-bit target at [16:10], AUTO_CONF G#44 carries length [15:0] + READ (16) + STOP (17) + RUN (31), TX_DATA G#34 / RX_DATA G#38 are the FIFOs, and the driver polls STATUS/FIFO in a tight loop (most of the raw trap volume is that poll, filtered out by the decoder).
 
 ## Oracle tooling notes
 
@@ -67,7 +67,7 @@ Order, rails, voltages and delays come from the device tree (`module_power_seq@0
 
 ## ferros brings the main camera up cold (2026-10-19)
 
-`diag cam bus`, `diag cam up`, `diag cam off` (ferros_kernel/src/camera.rs, acpm.rs, hsi2c.rs), on slot b with no Linux: the main sensor answers with model ID G#08EF, the value Linux reads. What it took, in order:
+`diag cam bus`, `diag cam up`, `diag cam off` (kernel/src/camera.rs, acpm.rs, hsi2c.rs), on slot b with no Linux: the main sensor answers with model ID G#08EF, the value Linux reads. What it took, in order:
 
 1. **ACPM client** for the sub-PMIC (acpm.rs): its GPIOs and LDOs are reached only through the power-management firmware's channel 2. Worked first try.
 2. **Both camera HS-I2C controllers from cold**: pins muxed (PMIC bus gpp16-0/1 function 2; sensor bus gpp2-0/1 function 3 with pull-ups), USI in I2C mode, controller reset and timed, on the 24.576 MHz oscillator. Two traps: the transfer **timeout enable comes out of reset on** (G#48 bit 31; the kernel clears it every message), and the **error interrupt sources must be enabled** or a no-acknowledge never shows and looks like a hang.
@@ -146,7 +146,7 @@ Linux's descriptor ring is count G#3E8 and the HAL builds a **fresh list per fra
 
 ### The register map was in the tree all along
 
-`zuma-isp-event-info.dtsi` (7847 lines) names every interrupt source, mask, overflow and reset register of every block in the ISP, and `dt-bindings/lwis/platform/zuma/*.h` names every bit. LWIS's *logic* is a passthrough, which is why it was written off — but its device tree is where the front end's register semantics are written down in the open. The bring-up harness generated `ferros_kernel/src/camera_events.rs` from it: 203 sources with named bits. `diag cam events` read them all and printed the ones reporting, counting a source as interesting when its status is live **or** its mask is armed — an armed mask with no status is a channel that was set up and never fired.
+`zuma-isp-event-info.dtsi` (7847 lines) names every interrupt source, mask, overflow and reset register of every block in the ISP, and `dt-bindings/lwis/platform/zuma/*.h` names every bit. LWIS's *logic* is a passthrough, which is why it was written off — but its device tree is where the front end's register semantics are written down in the open. The bring-up harness generated `kernel/src/camera_events.rs` from it: 203 sources with named bits. `diag cam events` read them all and printed the ones reporting, counting a source as interesting when its status is live **or** its mask is armed — an armed mask with no status is a channel that was set up and never fired.
 
 That immediately re-read words this driver had been printing for days. `CSIS_LINK1 + G#14 = G#100`, recorded as the link "latching its interrupt sources", is **ERR_DESKEW_OVER** — a D-PHY lane deskew overflow. The rest of the snapshot decodes as `+G#1C` LINE_END, `+G#24` FRAME_START on channels 0-2, `+G#2C` FRAME_END on channels 0-2.
 
@@ -245,7 +245,7 @@ The configuration is legible enough to say it is right. Link 1's channels: CH0 R
 - every LWIS event status and mask register;
 - CSI links 0 and 1.
 
-The same script turned the log into `ferros_kernel/src/camera_snap.rs`, and `diag cam pdma` read the same list three frames into its own stream (`snap_compare`) and reported every word that differed (both gone with the harness).
+The same script turned the log into `kernel/src/camera_snap.rs`, and `diag cam pdma` read the same list three frames into its own stream (`snap_compare`) and reported every word that differed (both gone with the harness).
 
 Capture:
 ```
@@ -304,7 +304,7 @@ Also ruled out tonight, worth not repeating:
 
 ## First colour (2026-10-21, night)
 
-`tools/camera-raw2vsf` turns a pulled frame into a VSF visual characterised by the main camera's Absolute IDT (`pixel 8 pro calibration data/derived/cam2-main.idt.vsf`, derived from the Android/Lumis captures), plus a preview PNG. The Lumis main-camera capture is the template: same sensor, same 4080 × 3072 mosaic, black 64, white 1023.
+`tools/camera-raw2vsf` turns a pulled frame into a VSF visual characterised by the main camera's Absolute IDT (`data/pixel-8-pro-calibration/derived/cam2-main.idt.vsf`, derived from the Android/Lumis captures), plus a preview PNG. The Lumis main-camera capture is the template: same sensor, same 4080 × 3072 mosaic, black 64, white 1023.
 
 - **The mosaic is G B / R G** in the channel order the IDT was fitted in (Lumis records `cfa` [1, 2, 0, 1] over channels R, G, B). ferros's readout uses the same mode and orientation, so the same layout applies.
 - **`ProfileEntry.matrix` is row-major** (vsf `spectral_image.rs`). `apply_matrix_3x3_f32` reads vsf's own column-major constants, so an IDT matrix must be applied by rows. The first render went through the helper and came out transposed.
@@ -312,7 +312,7 @@ Also ruled out tonight, worth not repeating:
 
 ```
 tools/camera-pull.sh target/cam/shot [base]
-tools/camera-raw2vsf/target/release/camera-raw2vsf target/cam/shot.raw10 "<lumis main capture>.vsf" "pixel 8 pro calibration data/derived/cam2-main.idt.vsf" shot.vsf shot.png [exposure_s]
+tools/camera-raw2vsf/target/release/camera-raw2vsf target/cam/shot.raw10 "<lumis main capture>.vsf" "data/pixel-8-pro-calibration/derived/cam2-main.idt.vsf" shot.vsf shot.png [exposure_s]
 ```
 
 The exposure is about 71 ms, estimated from frame timing (G#535E of G#5372 lines at roughly 14 frames a second); the sensor's pixel clock is not yet read, so it is marked as estimated in the file. That figure, and the f-number, are what the IDT's absolute scale needs. Comparing ferros's own calibration capture against the Android-derived IDT needs both exact.

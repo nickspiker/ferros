@@ -1,5 +1,5 @@
 //! A captured ftrace of the panel driver's DSI traffic (dsi_tx, dsi_rx, dsi_label_scope, te2_update_settings) as a clean command list: relative ms, packet type, bytes, delay, labels. Pure text; carries no secret.
-//! `oracle-decode dsi <root>` reads every `<root>/<state>/dsi-trace.txt` (oracle/display/husky-hk3/tools/sweep.sh writes them) and writes `<root>/<state>/dsi-commands.txt` beside it.
+//! `oracle-decode dsi <root>` reads every `<root>/<state>/dsi-trace.txt` (data/oracle/display/husky-hk3/tools/sweep.sh writes them) and writes `<root>/<state>/dsi-commands.txt` beside it.
 
 use crate::{die, read_text};
 

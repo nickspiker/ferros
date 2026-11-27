@@ -592,7 +592,7 @@ The owner's go ("add the memory and barriers to the GPU compiler and do all the 
 
 0. **The kernel's form in a capsule:** WGSL text means a parser for untrusted text on the device (the rule against string parsers); proposal: WGSL parsed on the developer's side, the capsule carrying a typed form (naga's IR as VSF, or SPIR-V), validated on the device.
 1. **One source language?** System kernels stay Rust recorded (one source for NEON and GPU), or move to WGSL so every kernel takes the kist path.
-2. **The wallpaper's promise:** wallpaper/src/lib.rs promises the same pixels bit for bit everywhere; on the GPU, "looks the same" or still bit for bit (which costs the fast forms)?
+2. **The wallpaper's promise:** crates/wallpaper/src/lib.rs promises the same pixels bit for bit everywhere; on the GPU, "looks the same" or still bit for bit (which costs the fast forms)?
 3. **Keep `wallpaper.made`?** If the GPU makes it in well under a second, store it (24 MB, a 2.9 s read) or make it at each boot?
 4. **No GPU service after a jump:** the wallpaper and the mark then have no path; black until the GPU, or the jump brings the service up? Answered 2026-11-21 (the owner: bring the GPU up after a jump); built 2026-11-22 for a GPU found powered (GPU.md "After a jump: the crowbar").
 5. **The `gpu` right:** a right at all (the MMU separates kists; power, heat and timing side channels remain), default off? Closed: no right (2026-11-11, again 2026-11-12).

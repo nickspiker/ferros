@@ -1,5 +1,5 @@
 //! heapgrow: the owner's test of docs/NO-CEILINGS.md step 3 (2026-11-23): "if I open notepad and it requests 1mb of memory and it's happy, then I go and open a video because I want to search thru the frame metadata and it malloc's 4GB of RAM, it better work."
-//! Built with no `--defsym __ferros_heap` (no build.rs): its ceiling is what the device holds (ferros_rt/ferros.ld, ferros_sys::HEAP_DEVICE).
+//! Built with no `--defsym __ferros_heap` (no build.rs): its ceiling is what the device holds (crates/rt/ferros.ld, ferros_sys::HEAP_DEVICE).
 //! `ferros-bridge spawn heapgrow.bin --name heapgrow`; every line goes to the console:
 //! 0. 1 MiB held and written (the notepad).
 //! 1. 4 GiB asked for with `try_reserve_exact` and every byte written (the video): its time, or the refusal as the device gave it.

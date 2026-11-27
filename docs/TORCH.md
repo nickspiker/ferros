@@ -1,7 +1,7 @@
 # TORCH: the rear flash LED as a torch
 
 Owner, 2026-11-11: "would be nice to have the torch", then "can we vary the brightness of it at all?".
-The quick settings' ring calls the `torch` endpoint; `payloads/torch` serves it behind the kernel's `torch` power switch (`ferros_kernel/src/torch.rs`), the KERNEL-OUT.md pattern from the start.
+The quick settings' ring calls the `torch` endpoint; `payloads/torch` serves it behind the kernel's `torch` power switch (`kernel/src/torch.rs`), the KERNEL-OUT.md pattern from the start.
 Torch mode only: the chip's flash and IR modes and its strobe input are never set; the strobe on the torch page is the driver's own, torch mode switched on and off by its clock ("Settings" below).
 
 ## The hardware (husky and akita alike)

@@ -57,7 +57,7 @@ This is not a new permutation — it is a well-understood one, run in both direc
 
 ## Measured (not asserted)
 
-From the prototype harness [ferros_miro/src/main.rs](ferros_miro/src/main.rs), x86-64, `opt-level=3` + LTO, scalar (no SIMD):
+From the prototype harness [tools/miro/src/main.rs](tools/miro/src/main.rs), x86-64, `opt-level=3` + LTO, scalar (no SIMD):
 
 - **Round-trip:** `permute ∘ permute_inv == identity` over A#200000 random states × {1,7,8,16,24} rounds — **all identity.** Invertibility is mechanical and verified.
 - **Avalanche:** one input bit flipped diffuses to the ideal **50.0% of the 512 output bits by round 2** (A#37.1% after 1 round). Full statistical diffusion is immediate.
@@ -173,7 +173,7 @@ Any defensible claim is on the **adjustable-allocation mechanism and its systems
 
 ## Status / Next
 
-- [x] MIRO-P prototype + measurement harness ([ferros_miro/](ferros_miro/)) — round-trip, avalanche, detection, perf all measured.
+- [x] MIRO-P prototype + measurement harness ([tools/miro/](tools/miro/)) — round-trip, avalanche, detection, perf all measured.
 - [ ] `ferros_miro` as a proper `no_std` workspace crate using the ferros BLAKE3, with the Circle-style invertible-newtype `G`/`G⁻¹` (idiom lifted from `sha_inv`).
 - [ ] BLAKE3-faithful round-constant schedule.
 - [ ] NEON path so seal/open lives in the KEY_REGISTERS pinned-asm zone.

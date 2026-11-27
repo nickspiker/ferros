@@ -6,7 +6,7 @@ description = "ferros_rt's TCP client on the device (docs/STD-TARGET.md \"TCP\")
 
 [dependencies]
 # The runtime as a library beside std's own copy: its clients (tcp) without its entry and symbols (`runtime` off), which std's copy gives the link.
-ferros-rt = { path = "../../ferros_rt", default-features = false }
+ferros-rt = { path = "../../crates/rt", default-features = false }
 
 [[bin]]
 name = "tcptest"

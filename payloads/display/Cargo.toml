@@ -10,25 +10,25 @@ path = "src/main.rs"
 
 [dependencies]
 tatau = { path = "../../../tatau" }
-ferros_sys = { path = "../../ferros_sys" }
+ferros_sys = { path = "../../crates/sys" }
 # The quick row's words in the person's language (QUICK.md), read at draw time as the map reads its pages' words.
-ferros_lang = { path = "../../ferros_lang", features = ["process"] }
+ferros_lang = { path = "../../crates/lang", features = ["process"] }
 # The radio circles' orbs, the maths tools/tune's orbs page tunes (console_draw).
-orb = { path = "../../orb" }
+orb = { path = "../../crates/orb" }
 # A kist circle's state as light: the spectral lines, the glow's falloff and reach, the rim's arc (op 57; tools/tune's glow page shares it).
-ferros_glow = { path = "../../ferros_glow" }
+ferros_glow = { path = "../../crates/glow" }
 # Pucks (docs/PUCKS.md): the lists of drawing ops the pucks send, checked and drawn into their circles (puck.rs).
-ferros_puck = { path = "../../ferros_puck" }
+ferros_puck = { path = "../../crates/puck" }
 # The icon cache (ferros_kept::icon: slots by `hp`, an icon's texels in pieces), the map's icons handed over by their content identity (ferros_thing `Hp`).
-ferros_kept = { path = "../../ferros_kept" }
-ferros_thing = { path = "../../ferros_thing" }
+ferros_kept = { path = "../../crates/kept" }
+ferros_thing = { path = "../../crates/thing" }
 # The person's own wallpaper, a VSF visual read from their space over the vault (main.rs `wall_own`).
 vsf = { path = "../../../vsf", default-features = false }
 # vsf hashes with blake3; pure Rust, as ahau has it: its C and assembly do not build for the bare target.
 blake3 = { version = "1", default-features = false, features = ["pure"] }
-ferros_dsi = { path = "../../ferros_dsi" }
+ferros_dsi = { path = "../../crates/dsi" }
 # The boot modeset's DSC picture parameters (modeset.rs).
-ferros_dsc = { path = "../../ferros_dsc" }
+ferros_dsc = { path = "../../crates/dsc" }
 fluor = { path = "../../../fluor", default-features = false, features = ["host-bare"] }
 # Text: swash in no_std (its libm feature), native f32 — outlines transformed before rasterising, so text turns at any angle (glyphs.rs). fontdue is gone.
 swash = { version = "0.2.9", default-features = false, features = ["scale", "render", "libm"] }
@@ -38,4 +38,4 @@ libm = "0.2"
 # The ferros mark read from logo.vsf on the host into a table (build.rs, draw::logo).
 vsf = { path = "../../../vsf" }
 # The compose kernel (GPU-COMPOSE.md step 2, gpu_kernel.rs) recorded on the host into words, as compbench's are: the device compiles nothing.
-valhall = { path = "../../valhall", features = ["ssa"] }
+valhall = { path = "../../crates/valhall", features = ["ssa"] }

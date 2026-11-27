@@ -11,8 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 ferros-link = { path = "../ferros-link" }
-ferros_pt = { path = "../../ferros_pt", features = ["std"] }
+ferros_pt = { path = "../../crates/pt", features = ["std"] }
 # The offer's states and the reasons a stow is refused, in words (ferros_kist::offer), and the kist's name and version read from the capsule before it is sent.
-ferros_kist = { path = "../../ferros_kist" }
+ferros_kist = { path = "../../crates/kist" }
 blake3 = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

@@ -2,7 +2,7 @@
 //!
 //! Left: the picture fitted to the window (C shows it 1:1 instead, a crop the arrows pan, Shift for four times the step), and beside it the seed, c, the time each pass took, and every attempt the survey looked at with its numbers and why it failed, or that it passed and was kept.
 //! Right: one slider row per knob, its value in its own unit; the first is the frame (husky or akita), the next five the anchor (Today, the device's; α at the centre; α at a third) and its own knobs, then the constants `candidate` and `survey` draw from, in the crate's order.
-//! Keys: N and P the next and previous seed (a counter, spread over 32 bytes by `wallpaper::seed_of`), R a random seed (32 bytes from the host's /dev/urandom), H types a seed in hex (64 digits are its bytes, fewer a counter; Enter takes it, Escape drops it), V the other frame, A shows or hides the anchor's point on the picture, S prints the knobs as the crate's constants (Rust source, ready to paste over wallpaper/src/lib.rs's), X puts every knob back to `Knobs::DEFAULT`.
+//! Keys: N and P the next and previous seed (a counter, spread over 32 bytes by `wallpaper::seed_of`), R a random seed (32 bytes from the host's /dev/urandom), H types a seed in hex (64 digits are its bytes, fewer a counter; Enter takes it, Escape drops it), V the other frame, A shows or hides the anchor's point on the picture, S prints the knobs as the crate's constants (Rust source, ready to paste over crates/wallpaper/src/lib.rs's), X puts every knob back to `Knobs::DEFAULT`.
 //!
 //! The drawing is never on the UI thread: a change sends a job to one worker thread, which drops any job a newer one has replaced, works out the seed's choices, draws a quick pass at a quarter of the size, then the first pass at full size and the refined one (the device's three passes), each banded across the host's cores with rayon, and hands each back thru fluor's wake-sender as it lands; a newer job stops an older one between bands. The window shows the newest picture it has until the next one lands.
 //! The picture is the display's working values (√light × 16384 a channel), shown as screencap writes them: light = (v / 16384)², a gamma2tanh code (vsf's own encoder) at 8 bits, as α + darkness.
@@ -244,12 +244,12 @@ fn from_unit(i: usize, u: f32) -> f32 {
     if d.step == 0. { v } else { d.lo + ((v - d.lo) / d.step).round() * d.step }
 }
 
-/// The knobs as the crate's source: its constants (paste over wallpaper/src/lib.rs's), a changed one marked with what it was, and the anchor's fields for `Knobs::DEFAULT`.
+/// The knobs as the crate's source: its constants (paste over crates/wallpaper/src/lib.rs's), a changed one marked with what it was, and the anchor's fields for `Knobs::DEFAULT`.
 fn rust_source(k: &Knobs) -> String {
     let d = Knobs::DEFAULT;
     let pair = |a: [f32; 2]| format!("[{:?}, {:?}]", a[0], a[1]);
     let was = |now: String, then: String| if now == then { String::new() } else { format!(" // was {then}") };
-    let mut s = String::from("// tools/tune, the wallpaper page: the knobs as wallpaper/src/lib.rs's constants.\n");
+    let mut s = String::from("// tools/tune, the wallpaper page: the knobs as crates/wallpaper/src/lib.rs's constants.\n");
     let pairs: [(&str, [f32; 2], [f32; 2]); 13] = [
         ("CARDIOID_T", k.cardioid_t, d.cardioid_t),
         ("CARDIOID_EPS_LOG2", k.cardioid_eps_log2, d.cardioid_eps_log2),

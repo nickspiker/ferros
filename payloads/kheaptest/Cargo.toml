@@ -9,5 +9,5 @@ name = "kheaptest"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-ferros_heap = { path = "../../ferros_heap", features = ["process"] }
+ferros_sys = { path = "../../crates/sys" }
+ferros_heap = { path = "../../crates/heap", features = ["process"] }

@@ -9,13 +9,13 @@ pub mod sys;
 #[path = "../../rt-heap/src/futex.rs"]
 pub mod futex;
 
-#[path = "../../../ferros_rt/src/lock.rs"]
+#[path = "../../../crates/rt/src/lock.rs"]
 pub mod lock;
 
-#[path = "../../../ferros_rt/src/time.rs"]
+#[path = "../../../crates/rt/src/time.rs"]
 pub mod time;
 
-#[path = "../../../ferros_rt/src/tcp.rs"]
+#[path = "../../../crates/rt/src/tcp.rs"]
 pub mod tcp;
 
 /// A grant's token offset: the fake kernel takes the slot itself.

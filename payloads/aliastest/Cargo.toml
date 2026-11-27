@@ -9,6 +9,6 @@ name = "aliastest"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
+ferros_sys = { path = "../../crates/sys" }
 # The alias's short fingerprint (a one-way hash, never the alias).
 blake3 = { version = "1", default-features = false, features = ["pure"] }

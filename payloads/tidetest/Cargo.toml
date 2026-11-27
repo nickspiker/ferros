@@ -9,7 +9,7 @@ name = "tidetest"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-ferros_heap = { path = "../../ferros_heap", features = ["process"] }
+ferros_sys = { path = "../../crates/sys" }
+ferros_heap = { path = "../../crates/heap", features = ["process"] }
 # The engine and the station documents (docs/PUCKS.md).
-ferros_tide = { path = "../../ferros_tide", features = ["vsf"] }
+ferros_tide = { path = "../../crates/tide", features = ["vsf"] }

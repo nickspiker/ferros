@@ -1,0 +1,104 @@
+fn main() {
+    // FERROS_SHIM_HANDOFF=1 links ferros at the 0x92400000 handoff carveout (see aarch64-shim.ld) so a running Linux shim can chainload it via cpu_soft_restart and hand off a live UFS link.
+    // Unset = cold-boot image: Pixel at 0x8008_0000 (aarch64-pixel8.ld), m1 at 0x80000 (aarch64.ld).
+    // The shim_handoff cfg lets ferros pick the post-handoff boot path (skip UFS link startup, adopt the live link, results to scratch).
+    let shim = std::env::var("FERROS_SHIM_HANDOFF").is_ok();
+    // Pixel cold boot links at ABL's real load address (aarch64-pixel8.ld); m1 keeps aarch64.ld.
+    let pixel8 = std::env::var("CARGO_FEATURE_PIXEL8").is_ok();
+    let ld = if shim {
+        "kernel/aarch64-shim.ld"
+    } else if pixel8 {
+        "kernel/aarch64-pixel8.ld"
+    } else {
+        "kernel/aarch64.ld"
+    };
+    println!("cargo:rustc-link-arg=-T{}", ld);
+    if shim {
+        println!("cargo:rustc-cfg=shim_handoff");
+    }
+    println!("cargo:rustc-check-cfg=cfg(shim_handoff)");
+    // FERROS_VAULT_CAPSULE=<file>: the vault process's signed capsule rides in the kernel image (VAULT-OUT.md decision 0: whatever verifies the kernel verifies it, and kernel and vault ship and roll back together). The kernel starts the vault from it at home, before init, and from the `vault` entry of its own vault only when this is absent or refused. Unset: as before, from that entry alone.
+    println!("cargo:rustc-check-cfg=cfg(ferros_vault_capsule)");
+    println!("cargo:rerun-if-env-changed=FERROS_VAULT_CAPSULE");
+    let vout = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("vault.capsule.vsf");
+    match std::env::var("FERROS_VAULT_CAPSULE") {
+        Ok(path) => {
+            println!("cargo:rerun-if-changed={path}");
+            std::fs::copy(&path, &vout).unwrap_or_else(|e| panic!("FERROS_VAULT_CAPSULE {path}: {e}"));
+            println!("cargo:rustc-cfg=ferros_vault_capsule");
+        }
+        Err(_) => std::fs::write(&vout, b"").unwrap(),
+    }
+    // FERROS_RESCUE: the vault's usb, pcie1 and bt capsules mended with the native builds the kernel carries when a masked one got stored (service.rs `start_home`).
+    println!("cargo:rustc-check-cfg=cfg(ferros_rescue)");
+    println!("cargo:rerun-if-env-changed=FERROS_RESCUE");
+    if std::env::var("FERROS_RESCUE").is_ok() {
+        println!("cargo:rustc-cfg=ferros_rescue");
+    }
+    // FERROS_INIT_REFUSE=1: init's spawn refused at home by too many grants, to prove the kernel's usb rescue on the device (service.rs `usb_rescue`, docs/KERNEL.md "When init does not start"). A RAM reload only, never flashed.
+    println!("cargo:rustc-check-cfg=cfg(ferros_init_refuse)");
+    println!("cargo:rerun-if-env-changed=FERROS_INIT_REFUSE");
+    if std::env::var("FERROS_INIT_REFUSE").map(|v| v == "1").unwrap_or(false) {
+        println!("cargo:rustc-cfg=ferros_init_refuse");
+    }
+    // akita's USB process (board.rs: no vault there yet, so no init and no stored capsule): the kernel carries a native usb capsule when target/akita-usb.capsule.vsf exists (tools/akita-boot.sh makes it from the current usb build), and starts it at home.
+    println!("cargo:rustc-check-cfg=cfg(ferros_usb_capsule)");
+    let usb_capsule = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../target/akita-usb.capsule.vsf");
+    println!("cargo:rerun-if-changed={}", usb_capsule.display());
+    if usb_capsule.exists() {
+        println!("cargo:rustc-cfg=ferros_usb_capsule");
+    }
+    // FERROS_PRODUCTION: no "Ready?" gate (straight to ferros), no development doors, no way into Android (docs/BOOT.md "Production: straight to ferros", "Production: pure ferros, no Android").
+    if std::env::var("FERROS_PRODUCTION").is_ok() {
+        println!("cargo:rustc-cfg=ferros_production");
+    }
+    println!("cargo:rustc-check-cfg=cfg(ferros_production)");
+    // FERROS_NO_UFS_WP=1: a control build that does not arm the UFS power-on write protect at boot (bisecting the gate's Android path, 2026-10-17).
+    println!("cargo:rustc-check-cfg=cfg(ferros_no_ufs_wp)");
+    println!("cargo:rerun-if-env-changed=FERROS_NO_UFS_WP");
+    if std::env::var("FERROS_NO_UFS_WP").map(|v| v == "1").unwrap_or(false) {
+        println!("cargo:rustc-cfg=ferros_no_ufs_wp");
+    }
+    println!("cargo:rerun-if-env-changed=FERROS_PRODUCTION");
+    println!("cargo:rerun-if-changed=kernel/aarch64.ld");
+    println!("cargo:rerun-if-changed=kernel/aarch64-shim.ld");
+    println!("cargo:rerun-if-changed=kernel/aarch64-pixel8.ld");
+    println!("cargo:rerun-if-env-changed=FERROS_SHIM_HANDOFF");
+    println!("cargo:rerun-if-env-changed=FERROS_SHIM_ENTRY");
+    text_atlas();
+}
+
+/// The kernel's text (text.rs): Oxanium Regular with the dozenal digit glyphs (`+glyphs`, U+0010-U+001B, where tatau puts them) rasterised anti-aliased at the boot screen's line height, with every glyph's advance, so the kernel draws proportional text by blending alpha, no rasteriser at boot. ASCII, the twelve digits, and tatau's radix point and sign arrows.
+/// atlas.bin: "FAT1", u16 ascent, u16 line height, u16 count, then per glyph {u32 code point, u16 advance, i16 xmin, i16 ymin, u16 width, u16 height, u32 offset}, then the alpha bytes.
+fn text_atlas() {
+    let font_path = format!("{}/../assets/fonts/Oxanium-Regular+glyphs.ttf", std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    println!("cargo:rerun-if-changed={font_path}");
+    let bytes = std::fs::read(&font_path).expect("Oxanium-Regular+glyphs.ttf");
+    let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).expect("font");
+    // The size whose line (ascent - descent) is the checklist's 48-pixel row.
+    let probe = font.horizontal_line_metrics(100.0).expect("line metrics");
+    let px = 100.0 * 46.0 / (probe.ascent - probe.descent);
+    let line = font.horizontal_line_metrics(px).expect("line metrics");
+    let chars: Vec<char> = (0x20u32..0x7F).chain(0x10..0x1C).chain([0xB7, 0x2191, 0x2193]).filter_map(char::from_u32).collect();
+    let mut table = Vec::new();
+    let mut data = Vec::new();
+    for &c in &chars {
+        let (m, bmp) = font.rasterize(c, px);
+        table.extend_from_slice(&(c as u32).to_le_bytes());
+        table.extend_from_slice(&(m.advance_width.round() as u16).to_le_bytes());
+        table.extend_from_slice(&(m.xmin as i16).to_le_bytes());
+        table.extend_from_slice(&(m.ymin as i16).to_le_bytes());
+        table.extend_from_slice(&(m.width as u16).to_le_bytes());
+        table.extend_from_slice(&(m.height as u16).to_le_bytes());
+        table.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        data.extend_from_slice(&bmp);
+    }
+    let mut out = b"FAT1".to_vec();
+    out.extend_from_slice(&(line.ascent.ceil() as u16).to_le_bytes());
+    out.extend_from_slice(&((line.ascent - line.descent).ceil() as u16).to_le_bytes());
+    out.extend_from_slice(&(chars.len() as u16).to_le_bytes());
+    out.extend_from_slice(&table);
+    out.extend_from_slice(&data);
+    let dir = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(std::path::Path::new(&dir).join("atlas.bin"), out).unwrap();
+}

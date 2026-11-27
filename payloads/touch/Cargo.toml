@@ -9,5 +9,5 @@ name = "touch"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-ferros_spi = { path = "../../ferros_spi" }
+ferros_sys = { path = "../../crates/sys" }
+ferros_spi = { path = "../../crates/spi" }

@@ -81,7 +81,7 @@ Whole-device draw from the fuel gauge (`diag power`, 16 s windows, charger cut, 
 
 ## Profiled with the i1 Pro (2026-11-08 night)
 
-`tools/akita-profile.sh run`, unattended (the owner calibrated the i1 on its tile and seated it on the 1 cm disc): 234 spectral readings, raw in `oracle/display/akita-ak3b/profile-0/` (readings.csv, spotread.log with every spectrum). Patches are the display server's op 52 mode 8 (raw 10-bit codes past the present table, 8 bits on the link), centred, radius 84 px (1 cm at 430 ppi).
+`tools/akita-profile.sh run`, unattended (the owner calibrated the i1 on its tile and seated it on the 1 cm disc): 234 spectral readings, raw in `data/oracle/display/akita-ak3b/profile-0/` (readings.csv, spotread.log with every spectrum). Patches are the display server's op 52 mode 8 (raw 10-bit codes past the present table, 8 bits on the link), centred, radius 84 px (1 cm at 430 ppi).
 
 **Emission duty:** full down to about DBV 1280 by the owner's photodiode (BPW34 on line in), degrading below. On the measured curve DBV 1280 is **99.7 cd/m²**: the knee is 100 nits of white. husky's (DBV 1219-1246) is about 108-114 on its coarser table. Both Samsung driver chips appear to switch at a luminance, not a register value.
 

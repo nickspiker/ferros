@@ -12,12 +12,12 @@ path = "src/main.rs"
 # The picture's three planes, VSF YCbCr 4:2:0 to R, G, B codes (vsf::visual::av1, rav1d), as every VSF reader decodes an AV1 plane.
 vsf = { path = "../../../vsf", features = ["av1-decode"] }
 # What the display draws from them, one definition with the host's seed (ferros_kept::icon `texels`).
-ferros_kept = { path = "../../ferros_kept" }
+ferros_kept = { path = "../../crates/kept" }
 
 # The host's seed: an icon read from a capsule or an icon document and named by the `hp` the device knows it by.
 [target.'cfg(not(target_os = "ferros"))'.dependencies]
-ferros_kist = { path = "../../ferros_kist" }
-ferros_thing = { path = "../../ferros_thing" }
+ferros_kist = { path = "../../crates/kist" }
+ferros_thing = { path = "../../crates/thing" }
 
 [dev-dependencies]
 # The test makes an icon's AV1 with vsf's own encoder (rav1e), as tools/app-icons does thru Photon's.

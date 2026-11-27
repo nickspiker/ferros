@@ -1,6 +1,6 @@
 # DISPLAY-CALIB — the husky panel, measured
 
-The google-hk3 panel measured with the owner's i1 Pro (calibrated spectrometer) through ArgyllCMS `spotread`, patches driven through ferros (`tools/display-calib.sh`; the readings are `oracle/display/husky-hk3/calib-20261017-1018.csv`). Raw 8-bit codes on the 8 bpc DSC link, DECON at 8 bpc with no DQE: this is the **panel's native response**, nothing of Android's colour management in front of it. Dark room, instrument face-down on the glass, centre of the panel, 2026-10-17.
+The google-hk3 panel measured with the owner's i1 Pro (calibrated spectrometer) through ArgyllCMS `spotread`, patches driven through ferros (`tools/display-calib.sh`; the readings are `data/oracle/display/husky-hk3/calib-20261017-1018.csv`). Raw 8-bit codes on the 8 bpc DSC link, DECON at 8 bpc with no DQE: this is the **panel's native response**, nothing of Android's colour management in front of it. Dark room, instrument face-down on the glass, centre of the panel, 2026-10-17.
 
 ## Luminance per DBV, full white
 
@@ -48,7 +48,7 @@ Z    0.01    5.71  144.53
 
 ## The full profile (2026-10-22)
 
-Measured with the same i1 Pro through `tools/display-profile.sh`: 227 readings, every one spectral (380–730 nm, 10 nm), the raw spotread output kept beside the CSV (`oracle/display/husky-hk3/profile-20261022/`: `readings.csv`, `spotread.log`, `report.md` from `tools/panel-white report`). The shell was off for the session (vault `home.off`), so only the kernel's measurement patch reached the panel: a disc 1 cm across (193 px at 489 ppi, checked with a ruler) at the centre, the instrument on it throughout. Same unit, same 8 bpc path as above, ABL's panel state.
+Measured with the same i1 Pro through `tools/display-profile.sh`: 227 readings, every one spectral (380–730 nm, 10 nm), the raw spotread output kept beside the CSV (`data/oracle/display/husky-hk3/profile-20261022/`: `readings.csv`, `spotread.log`, `report.md` from `tools/panel-white report`). The shell was off for the session (vault `home.off`), so only the kernel's measurement patch reached the panel: a disc 1 cm across (193 px at 489 ppi, checked with a ruler) at the centre, the instrument on it throughout. Same unit, same 8 bpc path as above, ABL's panel state.
 
 **No limiter.** A full white screen gets what a 1 cm spot gets, at every brightness:
 
@@ -169,6 +169,6 @@ Over the gains it is identity on blue and a 2×2 on red-green (panel red takes �
 
 Checked against f64 on the phone: canvas greys within 6 Q4 (a tenth of an 8-bit step), canvas colour within 21 Q4 (only channels the matrix cancels to near zero, a negligible amount of light next to the pixel's others); the app path within 1 8-bit code (truncation).
 
-**Measured on husky with the PMU** (ferros_kernel/src/pmu.rs, opened to EL0 the same day): canvas 86 cycles and 199 instructions per 16 pixels on the X3 (1.9 ns a pixel at 2.85 GHz), 126 cycles on an A715 (7.4 ns at its 1.07 GHz); the app path 157 cycles on the X3. A full-frame publish, split in bands weighted by those rates (X3 57 %, each A715 14 %): 5.2 ms (the grey-table path alone was 9 ms for a mostly black map, which it skipped). Along the way: the built-in target's strict-align had LLVM turn every NEON load and store into scalar pieces through the stack; processes now build with `cargo el0` (.cargo/config.toml), without it.
+**Measured on husky with the PMU** (kernel/src/pmu.rs, opened to EL0 the same day): canvas 86 cycles and 199 instructions per 16 pixels on the X3 (1.9 ns a pixel at 2.85 GHz), 126 cycles on an A715 (7.4 ns at its 1.07 GHz); the app path 157 cycles on the X3. A full-frame publish, split in bands weighted by those rates (X3 57 %, each A715 14 %): 5.2 ms (the grey-table path alone was 9 ms for a mostly black map, which it skipped). Along the way: the built-in target's strict-align had LLVM turn every NEON load and store into scalar pieces through the stack; processes now build with `cargo el0` (.cargo/config.toml), without it.
 
 Timed and set aside: the scalar f32 ODT (9 ns a pixel on the X3), the scalar integer one (Q30 light, Q28 matrix, `clz` output; 9–10 ns, and within 1 Q4 of f32 only with Q28 — Q16 lost up to 5 codes where channels cancel), plain f16 (fast but up to 18 codes off before gains + K).

@@ -1,4 +1,4 @@
-//! The block layout of keyreg/keys.rs's held-key functions (`keyreg_hold`, `keyreg_held_open`, `keyreg_held_derive`, `keyreg_held_keyed`, `keyreg_id_root`), step for step in scalar Rust: the same chaining values, messages, block lengths, counters and flags, with the reference BLAKE3 compression in place of the NEON one.
+//! The block layout of kernel/keyreg/keys.rs's held-key functions (`keyreg_hold`, `keyreg_held_open`, `keyreg_held_derive`, `keyreg_held_keyed`, `keyreg_id_root`), step for step in scalar Rust: the same chaining values, messages, block lengths, counters and flags, with the reference BLAKE3 compression in place of the NEON one.
 //! The NEON compression is checked on the device against the blake3 crate (keys.rs `self_test`, `held_test`); what can go wrong here is the layout (a flag, a length, a block split), and the tests below hold each layout to the blake3 crate and to the kernel's software derivations before 2026-11-17, which the person's stored data depends on.
 #![cfg_attr(not(test), allow(dead_code))]
 

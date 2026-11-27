@@ -11,7 +11,7 @@
 //! - `cam-oracle cinp-split <in.cinp> <dir>`: a set back into its files.
 //! - `cam-oracle prog-text <in.cpr2> <out.txt>` and `prog-build <in.txt> <out.cpr2>`: a CPU program as text and back, for merging captures that lost lines (the 8a's ISP captures, 2026-11-19: docs/CAMERA.md "The 8a's main: the cause").
 //! - `cam-oracle raw10 <frame.raw10> <width> <height> <stride> [period]`: a frame in numbers (its exposure and focus figures as tools/camera-raw10.py printed them, each cell place's mean, the fill pattern's lines, a 16 x 12 map of the mean).
-//! - `cam-oracle close <capture.log> <out.rs>`: Linux's camera close (ferros_kernel/src/camera_close.rs) from a capture of the front end (tools/camera-close.py).
+//! - `cam-oracle close <capture.log> <out.rs>`: Linux's camera close (kernel/src/camera_close.rs) from a capture of the front end (tools/camera-close.py).
 //! - `cam-oracle job-set <in.cpr3> <out.cpr3> <register>=<value> ...`: a program's writes of a register given another value (the 8a's main image path made RAW10 packed).
 //! - `cam-oracle job-len <in.cpr3> <out.cpr3> <bytes>`: the program cut to a length, every descriptor given it (the 8a's ultrawide: a dump that ran one word past the program).
 
@@ -920,7 +920,7 @@ fn cmd_raw10(args: Vec<String>) {
     }
 }
 
-/// `close <capture.log> <out.rs>`: Linux's camera close as ferros_kernel/src/camera_close.rs holds it (tools/camera-close.py in Rust): every CPU write of the capture from its "camera close" mark to the end, in order, one line each, the way the full front-end capture of a camera open (target/hv/ispfe-full-raw.log, 2026-10-19) gave the 223 writes the kernel replays.
+/// `close <capture.log> <out.rs>`: Linux's camera close as kernel/src/camera_close.rs holds it (tools/camera-close.py in Rust): every CPU write of the capture from its "camera close" mark to the end, in order, one line each, the way the full front-end capture of a camera open (target/hv/ispfe-full-raw.log, 2026-10-19) gave the 223 writes the kernel replays.
 fn cmd_close(args: Vec<String>) {
     if args.len() != 2 {
         die("close <capture.log> <out.rs>");

@@ -1,0 +1,20 @@
+[package]
+name = "ferros_hal"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Hardware abstraction layer for ferros — MMIO, UART, framebuffer, storage"
+
+[dependencies]
+ferros_layout = { path = "../layout" }
+# The 8x16 bitmap font, shared with the glass console.
+ferros_glass = { path = "../glass" }
+vsf = { path = "../../../vsf", default-features = false }
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+
+[features]
+default = ["alloc"]
+alloc = []
+std = ["alloc"]
+# Microsoft OS 2.0 descriptors on the USB device (usb.rs): bcdUSB 2.01, a BOS naming the descriptor set, the set with compatible ID WINUSB, so Windows reaches ferros with no driver installed (docs/FLASHER.md). Off until a device has enumerated with it on Linux and Windows.
+msos = []

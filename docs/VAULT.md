@@ -861,7 +861,7 @@ manifestus README (../manifestus):
 ## Engine Migration — ferros_vault → manifestus
 
 **The decision:** the kernel swaps off the in-repo `ferros_vault` crate and onto `manifestus`, and `ferros_vault` is retired at the swap.
-Today the kernel links `ferros_vault` (`path = ../vault`, non-optional); all recent engine work — reap, extent leaves, kill harnesses, bad-block relocation — lives in the standalone `manifestus` repo and is not what the kernel compiles.
+Today the kernel links `ferros_vault` (`path = ../crates/vault`, non-optional); all recent engine work — reap, extent leaves, kill harnesses, bad-block relocation — lives in the standalone `manifestus` repo and is not what the kernel compiles.
 This section is the record that the divergence is known and the direction is chosen, so nobody "fixes" the old crate.
 
 **Why manifestus wins:**

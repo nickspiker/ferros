@@ -9,15 +9,15 @@ name = "gputest"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-valhall = { path = "../../valhall", features = ["ssa"] }
+ferros_sys = { path = "../../crates/sys" }
+valhall = { path = "../../crates/valhall", features = ["ssa"] }
 tapuwae = { path = "../../../tapuwae", default-features = false, features = ["gpu"] }
 # tapuwae hashes with blake3: its pure-Rust build, as ahau takes it (no C on the payload target).
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 # The queue test (input 14): the queue's own layout (ferros_sys::gpu::queue reads it too).
-ferros_gpuq = { path = "../../ferros_gpuq" }
+ferros_gpuq = { path = "../../crates/gpuq" }
 
 [build-dependencies]
 # The queue test's band coder (input 14): ferros_clip's kernel compiled on the host, as ferros_clip ships it.
-valhall = { path = "../../valhall", features = ["ssa"] }
-ferros_rawcodec = { path = "../../ferros_rawcodec" }
+valhall = { path = "../../crates/valhall", features = ["ssa"] }
+ferros_rawcodec = { path = "../../crates/rawcodec" }

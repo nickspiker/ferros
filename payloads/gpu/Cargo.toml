@@ -9,7 +9,7 @@ name = "gpu"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
+ferros_sys = { path = "../../crates/sys" }
 # The queue's layout and a job's command-stream words (docs/GPU-KISTS.md "The queue").
-ferros_gpuq = { path = "../../ferros_gpuq" }
+ferros_gpuq = { path = "../../crates/gpuq" }
 libm = "0.2"

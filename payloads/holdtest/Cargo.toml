@@ -9,9 +9,9 @@ name = "holdtest"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-ferros_heap = { path = "../../ferros_heap", features = ["process"] }
+ferros_sys = { path = "../../crates/sys" }
+ferros_heap = { path = "../../crates/heap", features = ["process"] }
 # The hold's calls as a kist makes them (`kist::Hold` over `kist::Sys`), the kinds.
-ferros_items = { path = "../../ferros_items" }
+ferros_items = { path = "../../crates/items" }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 vsf = { path = "../../../vsf", default-features = false }

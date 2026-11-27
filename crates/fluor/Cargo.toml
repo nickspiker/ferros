@@ -1,0 +1,17 @@
+[package]
+name = "ferros_fluor"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "A fluor app on ferros in the person's app scale and the device's theme (owner, 2026-11-20: every kist follows them by default, an implicit right): fluor's ferros host run with the scale (preference 14) as its RU and every change to it followed, the device theme (preference 5, ferros_theme) as fluor's look, and a pinch inside the kist written back as the person's app scale. The theme's look builds for any target (a kist's host tests); the run loop for ferros alone."
+
+[dependencies]
+fluor = { path = "../../../fluor", default-features = false, features = ["std", "text", "simd"] }
+ferros_theme = { path = "../theme" }
+
+[target.'cfg(target_os = "ferros")'.dependencies]
+fluor = { path = "../../../fluor", default-features = false, features = ["host-ferros", "simd"] }
+ferros_sys = { path = "../sys" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }

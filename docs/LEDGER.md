@@ -7,7 +7,7 @@
 
 ## Stage 0 as built: the flash ring (2026-11-17)
 
-The flash log (ferros_kernel/src/flashlog.rs) is the ledger's first running part: every line is an entry, kept in a ring on the flash outside the vault, so it works with the vault broken.
+The flash log (kernel/src/flashlog.rs) is the ledger's first running part: every line is an entry, kept in a ring on the flash outside the vault, so it works with the vault broken.
 The format, the ring and the seal are ferros_ledger (`--features ring`); the kernel gives it blocks, keys and the clock.
 What the rest of this document specifies and stage 0 does not do yet is listed at the end of this section.
 

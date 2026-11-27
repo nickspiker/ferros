@@ -9,12 +9,12 @@ name = "ahau"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-honeycomb = { path = "../../honeycomb" }
+ferros_sys = { path = "../../crates/sys" }
+honeycomb = { path = "../../crates/honeycomb" }
 # The attest screen's words in the person's language (ferros_lang; the fleet's and identity's are fgtw's, thru it), and its numbers in their base (tatau).
-ferros_lang = { path = "../../ferros_lang", features = ["process"] }
+ferros_lang = { path = "../../crates/lang", features = ["process"] }
 tatau = { path = "../../../tatau" }
-ahau_core = { path = "../../ahau_core" }
+ahau_core = { path = "../../crates/ahau_core" }
 ihi = { path = "../../../ihi", default-features = false, features = ["proof"] }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 # The attest mark (tapuwae), without std: rows one after another on this thread, float maths from libm.
@@ -22,6 +22,6 @@ tapuwae = { path = "../../../tapuwae", default-features = false, features = ["gp
 # VSF RGB's photopic luminance (through LMS), for the keys' rainbow: colours are VSF RGB, never sRGB (owner, 2026-11-01).
 vsf = { version = "0.11", path = "../../../vsf", default-features = false }
 # The handle proof and the wallpaper seed kept in the identity's space as VSF documents (docs/VSF-AUDIT.md P18).
-ferros_kept = { path = "../../ferros_kept" }
+ferros_kept = { path = "../../crates/kept" }
 # The attest button's squircle edge (a cube root) and the keys' hues (a cosine).
 libm = "0.2"

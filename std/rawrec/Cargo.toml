@@ -9,13 +9,13 @@ name = "rawrec"
 path = "src/main.rs"
 
 [dependencies]
-ferros_clip = { path = "../../ferros_clip" }
+ferros_clip = { path = "../../crates/clip" }
 # The hold's calls, for reading a clip kept as an item back by its handle (+21).
-ferros_items = { path = "../../ferros_items" }
+ferros_items = { path = "../../crates/items" }
 vsf = { path = "../../../vsf", default-features = false, features = ["std"] }
 blake3 = "1.5"
 # Job 4: this build's band coder against the scalar one.
-ferros_rawcodec = { path = "../../ferros_rawcodec" }
+ferros_rawcodec = { path = "../../crates/rawcodec" }
 # Job 3: what sealing a clip would cost (XChaCha20-Poly1305, as the vault seals its values).
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 

@@ -8,7 +8,7 @@ metadata:
   modified: 2026-10-24T20:53:55.015Z
 ---
 
-2026-10-24: every display timing taken before pinning ran on the A715 workers (processes default there; the display pins itself to the X3 only later in startup), and the A715s sit at 1.07 GHz — the X3 runs at 2.85 GHz. The f16 ODT read 11.4 ns/px unpinned and 2.76 on the X3; the integer-vs-f32 ranking even changed. `ferros_sys::pin(mask)` only takes effect at the next reschedule: sleep ~1 ms after it. The PMU is open to EL0 on every core (ferros_kernel/src/pmu.rs, `ferros_sys::pmu`), but its counts are per core, so a migration mid-run gives nonsense (zeros, or a few cycles per 16 pixels). Cycles ÷ elapsed µs = the clock, which tells which core the run was on.
+2026-10-24: every display timing taken before pinning ran on the A715 workers (processes default there; the display pins itself to the X3 only later in startup), and the A715s sit at 1.07 GHz — the X3 runs at 2.85 GHz. The f16 ODT read 11.4 ns/px unpinned and 2.76 on the X3; the integer-vs-f32 ranking even changed. `ferros_sys::pin(mask)` only takes effect at the next reschedule: sleep ~1 ms after it. The PMU is open to EL0 on every core (kernel/src/pmu.rs, `ferros_sys::pmu`), but its counts are per core, so a migration mid-run gives nonsense (zeros, or a few cycles per 16 pixels). Cycles ÷ elapsed µs = the clock, which tells which core the run was on.
 
 **Why:** a wrong core makes every comparison wrong.
 

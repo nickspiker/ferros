@@ -130,7 +130,7 @@ Never synced: it is the device's, and it is on the device's own partitions. Each
 | Vault | Source | Driver |
 |---|---|---|
 | `aoc.reg.0` … `aoc.reg.14` | `vendor_a:/etc/sensors/registry/` (five scripts, then `append/`'s two) and `persist:/sensors/registry/` (eight calibrations), in tools/husky-aoc-reg.sh's order; checked on the Pro 2026-11-08: `persist:/sensors/registry/icm45631_accel_fac_cal.reg`, 277 bytes | sensors (init passes it slots 74 persist and 76 vendor_a) |
-| `wifi.fw`, `wifi.nvram`, `wifi.clm` | `vendor_a:/firmware/` as firmware/husky/MANIFEST.md pins them (BLAKE3 checked before keeping) | pcie1 (slot 76) |
+| `wifi.fw`, `wifi.nvram`, `wifi.clm` | `vendor_a:/firmware/` as data/firmware/husky/MANIFEST.md pins them (BLAKE3 checked before keeping) | pcie1 (slot 76) |
 | `gpu.fw` | `vendor_a:/firmware/` (the Mali CSF image) | gpu: started by the kernel (`gpu_grants`), so a kernel change: batch it with the next flash |
 | `gps.replay`, `gps.replay.sky` | not on a partition (captured sessions, GPS.md): stay on Harbor until the GPS engine's own start replaces them | |
 

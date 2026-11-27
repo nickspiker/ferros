@@ -9,9 +9,9 @@ name = "ip"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
+ferros_sys = { path = "../../crates/sys" }
 # The pure parts of the client TCP (sequence arithmetic, out-of-order ranges, options, window, RTT, congestion control), tested on the host.
-ferros_tcp = { path = "../../ferros_tcp" }
+ferros_tcp = { path = "../../crates/tcp" }
 # The pure parts of the resolver (op 10: names, the question, the answer read, the cache), tested on the host.
-ferros_dns = { path = "../../ferros_dns" }
-ferros_netring = { path = "../../ferros_netring" }
+ferros_dns = { path = "../../crates/dns" }
+ferros_netring = { path = "../../crates/netring" }

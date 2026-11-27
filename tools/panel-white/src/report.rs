@@ -1,5 +1,5 @@
 //! `panel-white report <profile dir> [--md out.md]`: a display profile run (tools/display-profile.sh, its readings.csv) summarised in Markdown, as tools/display-profile-report.py wrote it: the roll-off of a small window against full field at every brightness, sustained white over time, the limiter's response to average picture level, the tone curve per channel at each brightness (gamma fitted over codes 16-240, with the deviation of each step), near-black, primaries and secondaries (xy, Y, and R+G+B against white), and drift.
-//! Run on oracle/display/husky-hk3/profile-20261022 it writes that profile's report.md byte for byte.
+//! Run on data/oracle/display/husky-hk3/profile-20261022 it writes that profile's report.md byte for byte.
 
 /// One reading: its CSV row by column name, and Y, x, y as numbers.
 struct Row {

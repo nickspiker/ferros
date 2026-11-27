@@ -24,7 +24,7 @@ const MIN_MACOS_BYTES: u64 = 40 * (1 << 30); // 40 GB
 const MIN_FERROS_BYTES: u64 = 4 * (1 << 30); // 4 GB floor
 
 /// Logo (embedded SVG source for future splash/icon use).
-const _LOGO_SVG: &[u8] = include_bytes!("../../../logo.svg");
+const _LOGO_SVG: &[u8] = include_bytes!("../../../assets/logo.svg");
 
 /// Path to sgdisk binary (installed via Homebrew).
 const SGDISK: &str = "/opt/homebrew/bin/sgdisk";

@@ -3,7 +3,7 @@
 //! - `oracle-decode spi < capture.log`: an hv register-oracle capture of an Exynos (s3c64xx family) SPI controller as SPI transactions, `T0001 W 87 | R 00 ...` (tools/oracle-decode-spi.py; docs/oracle/TOUCH.md).
 //! - `oracle-decode modem-ring [--data-head] < capture.log`: the hv's modem boot-channel trace (FERROS_HV_MODEM_RING) as the boot protocol, data runs summarised (tools/oracle-decode-modem-ring.py; docs/oracle/MODEM-BOOT-RECON.md).
 //! - `oracle-decode usf <capture.txt> [--raw] [--only tx|rx] [--skip-streams]`: an ftrace of the usf_tx / usf_rx kprobes as the AoC sensor service's messages, each FlatBuffer walked without a schema (tools/usf-decode.py; docs/SENSORS.md "Capturing USF").
-//! - `oracle-decode dsi <root>`: every `<root>/<state>/dsi-trace.txt` (an ftrace of the panel driver's DSI traffic) as `<root>/<state>/dsi-commands.txt`, a command list in ms from the first event (oracle/display/husky-hk3/tools/decode.py; that directory's README).
+//! - `oracle-decode dsi <root>`: every `<root>/<state>/dsi-trace.txt` (an ftrace of the panel driver's DSI traffic) as `<root>/<state>/dsi-commands.txt`, a command list in ms from the first event (data/oracle/display/husky-hk3/tools/decode.py; that directory's README).
 
 mod dsi;
 mod modem;

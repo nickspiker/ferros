@@ -26,11 +26,11 @@ vsf = { path = "../../../vsf", features = ["text-encode"] }
 [target.'cfg(target_os = "ferros")'.dependencies]
 fluor = { path = "../../../fluor", default-features = false, features = ["host-ferros", "simd"] }
 # The person's app scale and the device's theme, followed (window.rs `run_app`).
-ferros_fluor = { path = "../../ferros_fluor" }
+ferros_fluor = { path = "../../crates/fluor" }
 # The kist's own vault domain (no files on ferros).
 kete = { path = "../../../kete" }
 # ferros's one typeface for the puck's dial (Oxanium with tatau's dozenal digits), the face the display draws its own words in.
-ferros_glyphs = { path = "../../ferros_glyphs" }
+ferros_glyphs = { path = "../../crates/glyphs" }
 # getrandom 0.2 through any dependency: its `custom` backend is ferros_rt's, the kernel's entropy (the kist's entropy right).
 getrandom02 = { package = "getrandom", version = "0.2", features = ["custom"] }
 

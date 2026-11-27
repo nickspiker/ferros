@@ -7,8 +7,8 @@ Opus 5.5's safety classifier stopped these pieces of work partway. The text it w
 Done and committed:
 - `docs/oracle/MODEM-BOOT-RECON.md`: the modem boot from the GPL sources (GPIO power sequence, PCIe ch0 root complex, shared-memory layout, ROM boot handshake) and the captured boot-channel G#F1 protocol (section order and command numbers, `modem.bin` TOC layout, which per-unit files supply the NV sections).
 - `oracle-decode modem-ring` (tools/oracle-decode); hv knobs `FERROS_HV_MODEM_RING`, `FERROS_HV_ORACLE_STEP`, `FERROS_HV_ORACLE_SMC`, one-shot oracle marker (afa464a).
-- `ferros_ext4` (host-tested), `ferros_kernel/src/partfs.rs`, `diag modem files` / `diag modem readmain` (not yet run on hardware).
-- `ferros_kernel/src/modem.rs`: `diag modem s0..s5` (survey, GPIO power-on, PHY, link, endpoint, ROM boot) written and building, never run.
+- `ferros_ext4` (host-tested), `kernel/src/partfs.rs`, `diag modem files` / `diag modem readmain` (not yet run on hardware).
+- `kernel/src/modem.rs`: `diag modem s0..s5` (survey, GPIO power-on, PHY, link, endpoint, ROM boot) written and building, never run.
 
 Left to do, in order:
 1. Run `diag modem files`, `diag modem readmain` (expect MAIN BLAKE3 prefix 14df88e07f8aad008ab8fff8a4256d12), then `diag modem s0` up through `s5` on a cold boot, one stage at a time, and fix what the hardware says.
@@ -29,7 +29,7 @@ Also open: the cold vault accepts only the first write per boot and that write d
 
 ## 2c. Kernel vault moved onto manifestus (stopped 2026-10-20 mid-verification)
 
-Done: ferros_kernel/src/kvault.rs (manifestus over two UFS mirror regions of the ferros partition, values sealed, a sealed name index for `store ls`); vault_boot/service switched to it, no silent format any more; flash log (flashlog.rs, `diag log`) and manifestus storage events logged; `diag kv selftest`; manifestus no_std fix and vsf 0.12 bump pushed.
+Done: kernel/src/kvault.rs (manifestus over two UFS mirror regions of the ferros partition, values sealed, a sealed name index for `store ls`); vault_boot/service switched to it, no silent format any more; flash log (flashlog.rs, `diag log`) and manifestus storage events logged; `diag kv selftest`; manifestus no_std fix and vsf 0.12 bump pushed.
 Verified on the phone: genesis once (17.6 s), later opens ~6 ms, small values and genesis survive reboots, a 30 KB value stored through `store put` reads back identical with the current build.
 **Closed 2026-10-20 (Opus 5):** a 30 KB value written by the current build reads back identical after a reboot, and only the values written by the older builds were corrupt — all of those are now deleted, so the vault holds just `genesis`. Reserved names (leading NUL: the name index, selftest scratch) no longer show in `store ls`. The vsf version question closed itself: vsf went back to one unreleased 0.10.0 and manifestus with it.
 Left: re-provision `init` (a capsule, when one is wanted) and `sealed`; then remove ferros_vault from the kernel (shim.rs entry_genesis, UfsDevice, ira.rs AnchorKey, wairua NonceSource all still use it).

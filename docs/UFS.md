@@ -12,7 +12,7 @@ The August conclusion below ("difference is off-chip, needs a scope") was right 
 
 So ferros always started with an **unpowered flash device**. Linux re-enables the regulator at probe, which is why its register-identical bring-up worked.
 
-**Fix (`ferros_kernel/src/cold_ufs.rs`):**
+**Fix (`kernel/src/cold_ufs.rs`):**
 1. `power_on_device` sets gpp0-1 as an output (gpp0 CON `G#2010`, DAT `G#0` at handoff; the bank is accessible), drives it high, and waits 4 ms.
 2. The HAL sets the Exynos per-command nexus bit before every doorbell: set for SCSI, clear for NOP and query.
 
@@ -53,7 +53,7 @@ Key commits: f24e083 (PMA-identical proof), aef776e (EL2 confirmation), 2fb15d2 
 
 **What the custom debug kernel proved (ground truth from Linux's WORKING UFS):**
 - **Secure-DMA / GSA theory: DEAD.** Linux runs `WSECURITY=0` (write path "secure") with descriptors in plain low DRAM (`utrdl_dma=0x87570000`) and works. No secure memory / GSA needed.
-- **The real bug (partially): mclk was wrong.** Linux logs `mclk: 178000000`; HCI_1US_TO_CNT_VAL reads G#B2=178. ferros hardcoded 133 MHz and calibrated the entire M-PHY for the wrong clock. **FIXED** in `ferros_hal/src/ufs_cal.rs` (MCLK_RATE=178_000_000, derived consts recompute). Committed e03494e.
+- **The real bug (partially): mclk was wrong.** Linux logs `mclk: 178000000`; HCI_1US_TO_CNT_VAL reads G#B2=178. ferros hardcoded 133 MHz and calibrated the entire M-PHY for the wrong clock. **FIXED** in `crates/hal/src/ufs_cal.rs` (MCLK_RATE=178_000_000, derived consts recompute). Committed e03494e.
 - **But mclk alone didn't fix it:** ferros full_init still fails at DME_LINKSTARTUP (device silent, MXGR=0), and the live-link doorbell still won't execute even with ABL's own descriptors (`REUSE_OCS=F`). So there's a FURTHER difference vs Linux.
 
 **THE decisive next step — flash the enhanced debug kernel, get the FWTRACE:**
@@ -64,7 +64,7 @@ The debug kernel is REBUILT with MMIO write tracing (`FWTRACE <region> <ofs>=<va
 # after boot:
 adb bugreport /tmp/br.zip && unzip -p /tmp/br.zip | grep -aE 'FWTRACE|FERROS_'
 ```
-That yields Linux's EXACT ordered register-write sequence of a working link bring-up. Diff it against `ferros_hal/src/ufs.rs::full_init` (and the cal in `ufs_cal.rs`) to find the missing/different step that makes DME_LINKSTARTUP succeed. **This is the artifact that ends the guessing.**
+That yields Linux's EXACT ordered register-write sequence of a working link bring-up. Diff it against `crates/hal/src/ufs.rs::full_init` (and the cal in `ufs_cal.rs`) to find the missing/different step that makes DME_LINKSTARTUP succeed. **This is the artifact that ends the guessing.**
 
 **Device state overnight:** boot_a = ferros (with the mclk fix + clean-NOP diag), boot_b = the earlier debug Linux kernel. Device sitting on ferros, enumerating. To return to Android: reflash the husky factory boot images (`/mnt/Harbor/tmp/husky-restore/` + factory image), or the debug kernel via the script above. USB stable on the 1m cable (the 3m cable caused all the earlier flakiness). Reboots decrement A/B retry — if a slot exhausts, ABL falls to the other slot (both bootable).
 
@@ -76,8 +76,8 @@ That yields Linux's EXACT ordered register-write sequence of a working link brin
 Built the complete Exynos UFSHCI re-init path and tested it exhaustively on hardware. The wall moved from "transfers don't complete" down one layer to "the UniPro link won't start up for us at all."
 
 **What was built (all committed-ready in the tree):**
-- `ferros_hal/src/ufs_cal.rs` — faithful Rust port of Samsung's `ufs-cal-if` zuma tables (`/mnt/Harbor/ferros-ref/soc-gs/drivers/ufs/zuma/`): the full `init_cfg` PMA/PCS/UNIPRO pre-link table (57 rows), `post_init_cfg`, `calib_of_hs_rate_b`, the PCS AUX-lane-select window, line-reset tick math, mclk periods. Fixed params measured from ABL via `payloads/ufsdump` (mclk 133.33 MHz, 38.4 MHz refclk, 2 lanes, evt0, AH8 off). The critical `unlock_clocks` (clear HCI_FORCE_HCS auto clock-stop enables) is applied before every PMA/UNIPRO touch — this is what made the vendor region readable without the AP hang, definitively killing the old "vendor region hangs" theory.
-- `ferros_hal/src/ufs.rs` — `full_init()` (HCE reset → SW_RST → config_host → device reset → HCE on → pre_link cal → DME_LINKSTARTUP → post_link → lists → NOP → fDeviceInit → HS-G4 PMC), plus `uic_cmd`/`dme_set`/`dme_get`/`query_flag` and a 20-field `InitReport`. Retries the whole hba-enable as a unit (like ufshcd). Config values are ABL's proven ones captured via ufsdump (DBG_SUITE1=G#98913C1C etc), not the gs-kernel runtime values.
+- `crates/hal/src/ufs_cal.rs` — faithful Rust port of Samsung's `ufs-cal-if` zuma tables (`/mnt/Harbor/ferros-ref/soc-gs/drivers/ufs/zuma/`): the full `init_cfg` PMA/PCS/UNIPRO pre-link table (57 rows), `post_init_cfg`, `calib_of_hs_rate_b`, the PCS AUX-lane-select window, line-reset tick math, mclk periods. Fixed params measured from ABL via `payloads/ufsdump` (mclk 133.33 MHz, 38.4 MHz refclk, 2 lanes, evt0, AH8 off). The critical `unlock_clocks` (clear HCI_FORCE_HCS auto clock-stop enables) is applied before every PMA/UNIPRO touch — this is what made the vendor region readable without the AP hang, definitively killing the old "vendor region hangs" theory.
+- `crates/hal/src/ufs.rs` — `full_init()` (HCE reset → SW_RST → config_host → device reset → HCE on → pre_link cal → DME_LINKSTARTUP → post_link → lists → NOP → fDeviceInit → HS-G4 PMC), plus `uic_cmd`/`dme_set`/`dme_get`/`query_flag` and a 20-field `InitReport`. Retries the whole hba-enable as a unit (like ufshcd). Config values are ABL's proven ones captured via ufsdump (DBG_SUITE1=G#98913C1C etc), not the gs-kernel runtime values.
 - Kernel boot runs `full_init` and reports all fields over DIAG (`UFS_STEPS`, `UFS_FAIL`, `UFS_LS_RES`, `UFS_UECPA_LS`, …). Validated by hot-reload.
 
 **The hardware result (consistent across every variant):**

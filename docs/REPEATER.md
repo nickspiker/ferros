@@ -7,7 +7,7 @@ The enumeration coin flip was never the repeater or the PHY. Per-attempt DWC3 ev
 - The status-stage ZLP had been started at SETUP time, before the core asked for it. The core then raised XferNotReady(Status) with "transfer active" set, and that status transfer never completed.
 - The host's next request, to the new address, failed with EPROTO (-71). Host journal: `device descriptor read/all, error -71` / `read/8, error -71`.
 
-The fix is in `ferros_hal/src/usb.rs` (`Ep0State::StatusInWait`). SET_ADDRESS and SET_CONFIGURATION now start their status IN only on XferNotReady(Status), the DWC3 control programming model that Linux dwc3 follows too.
+The fix is in `crates/hal/src/usb.rs` (`Ep0State::StatusInWait`). SET_ADDRESS and SET_CONFIGURATION now start their status IN only on XferNotReady(Status), the DWC3 control programming model that Linux dwc3 follows too.
 
 Cold boots of slot b went from 1-16 attempts (sometimes none in 64 s) to **first-try on 13 of 13 boots** (9 of them on the committed build: flash boot plus 8 cycled boots, about 23 s from `fastboot reboot` to enumerated).
 

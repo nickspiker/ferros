@@ -9,6 +9,6 @@ name = "cambench"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
+ferros_sys = { path = "../../crates/sys" }
 # ferros_cam raw: the NEON unpack-and-add (no allocation, no I/O).
-ferros_cam = { path = "../../ferros_cam" }
+ferros_cam = { path = "../../crates/cam" }

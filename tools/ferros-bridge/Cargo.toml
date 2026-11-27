@@ -13,7 +13,7 @@ path = "src/main.rs"
 nusb = "0.1"
 # The link and Photon Transport: tools/ferros-link, shared with ferros-send (its development vendor requests stay here, usb.rs).
 ferros-link = { path = "../ferros-link" }
-ferros_pt = { path = "../../ferros_pt", features = ["std"] }
+ferros_pt = { path = "../../crates/pt", features = ["std"] }
 blake3 = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "signal", "macros", "fs", "time"] }
 nunc-time = "0.0.0"
@@ -21,18 +21,18 @@ nunc-time = "0.0.0"
 vsf = { path = "../../../vsf", features = ["crypto"] }
 ed25519-dalek = "2"
 # kists (KISTS.md): a capsule's declaration when it is signed (`bundle`: built the one way kistcat builds it, with its developer's bundle), the person's list when one is stowed
-ferros_kist = { path = "../../ferros_kist", features = ["bundle"] }
+ferros_kist = { path = "../../crates/kist", features = ["bundle"] }
 # the hold (docs/STORE.md): `items`, the same calls a kist makes (ferros_items `kist::Hold`) over the bench's STORE job
-ferros_items = { path = "../../ferros_items" }
+ferros_items = { path = "../../crates/items" }
 # `icon seed`: a decoded icon checked (ferros_kept::icon) and stored under its `hp` (ferros_thing).
-ferros_kept = { path = "../../ferros_kept" }
-ferros_thing = { path = "../../ferros_thing" }
+ferros_kept = { path = "../../crates/kept" }
+ferros_thing = { path = "../../crates/thing" }
 # a kist capsule is signed with every scheme of its developer's bundle and checked at stow (fgtw::release: Photon's release key, owner 2026-11-10: "no single eggs")
 fgtw = { path = "../../../fgtw", default-features = false, features = ["std", "sign"] }
 # input injection scripts (docs/INPUT-INJECT.md): built here, played on the device by payloads/inject
-ferros_inject = { path = "../../ferros_inject" }
+ferros_inject = { path = "../../crates/inject" }
 # the flash log's entries (LEDGER.md): `diag log` rendered, `log-render`, `log-legacy` (ledger.rs)
-ferros_ledger = { path = "../../ferros_ledger", features = ["ring"] }
+ferros_ledger = { path = "../../crates/ledger", features = ["ring"] }
 # an entry's Eagle time shown as the host's local wall time, for display only
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # `deaths`: a death's frames named from the process's ELF (function, file and line, inlined calls) by gimli's DWARF reader, the symbol table where an ELF has no line tables

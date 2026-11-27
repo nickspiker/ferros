@@ -12,7 +12,7 @@ B=$REPO/target/debug/ferros-bridge
 CAP=$REPO/target/el0/aarch64-unknown-none/release/capture.bin
 # A centimetre on akita's glass (430 ppi): the disc's radius 84 px.
 R1=84
-ROOT=$REPO/oracle/display/akita-ak3b
+ROOT=$REPO/data/oracle/display/akita-ak3b
 n=0; while [ -e "$ROOT/profile-$n" ]; do n=$((n + 1)); done
 DIR=${PROFILE_DIR:-$ROOT/profile-$n}
 CSV=$DIR/readings.csv

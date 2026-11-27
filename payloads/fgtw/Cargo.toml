@@ -9,21 +9,21 @@ name = "fgtw"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
+ferros_sys = { path = "../../crates/sys" }
 # Attest to approve: the add flow opens only with the person's approve on the attest screen held in the kernel (ahau_core::approve::FLEET_ADD), taken as it opens.
-ahau_core = { path = "../../ahau_core" }
-ferros_heap = { path = "../../ferros_heap", features = ["process"] }
-photon_core = { path = "../../photon_core" }
+ahau_core = { path = "../../crates/ahau_core" }
+ferros_heap = { path = "../../crates/heap", features = ["process"] }
+photon_core = { path = "../../crates/photon_core" }
 fgtw = { path = "../../../fgtw", default-features = false, features = ["fanout", "protocol", "flow", "profile", "security"] }
 # Photon Transport names a frame by its BLAKE3 when it answers a send (depart.rs, route.rs): the same pure build photon_core takes.
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 ed25519-dalek = { version = "2", default-features = false }
-# The CPU's SHA-256 under fgtw's SPHINCS+ (fips205's sha2 0.10, whose aarch64 backend needs `asm`): the workspace patches sha2-asm with sha2_asm, pure Rust, so nothing but Rust is built (sha2_asm/Cargo.toml). Every binding's signature, the device keys at start.
+# The CPU's SHA-256 under fgtw's SPHINCS+ (fips205's sha2 0.10, whose aarch64 backend needs `asm`): the workspace patches sha2-asm with sha2_asm, pure Rust, so nothing but Rust is built (crates/sha2_asm/Cargo.toml). Every binding's signature, the device keys at start.
 sha2 = { version = "0.10", default-features = false, features = ["asm"] }
 # x-full: the `x` text codec without std for every Unicode scalar value (fgtw's Cargo.toml: a no_std build that wants every character enables vsf/x-full; the owner's call for ferros, so every language's text encodes, as ferros_idea does).
 # Without a codec a kept departure or add holding a device's name (`x`) did not read ("VsfType::x is Huffman-coded and requires the 'text' feature"), so fgtw started fresh at every start, and a name it wrote flattened empty.
 vsf = { path = "../../../vsf", default-features = false, features = ["x-full"] }
 # The person's identity space (space.rs): ferros's vocabulary for fgtw::space and the sync with this device's copy.
-ferros_space = { path = "../../ferros_space" }
+ferros_space = { path = "../../crates/space" }
 # The roots and the sponsor kept in the vault as VSF documents (docs/VSF-AUDIT.md P18, P19).
-ferros_kept = { path = "../../ferros_kept" }
+ferros_kept = { path = "../../crates/kept" }

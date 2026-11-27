@@ -10,9 +10,9 @@ name = "ferros-install"
 path = "src/main.rs"
 
 [dependencies]
-ferros_layout = { path = "../../ferros_layout" }
+ferros_layout = { path = "../../crates/layout" }
 # The spine and stem entries: one definition, the one the seed and the kernel read (portable on the host; its hardware modules are aarch64 only).
-ferros_hal = { path = "../../ferros_hal", default-features = false }
+ferros_hal = { path = "../../crates/hal", default-features = false }
 # The host's clock as Eagle time (std).
 vsf = { path = "../../../vsf" }
 blake3 = "1"

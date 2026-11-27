@@ -105,7 +105,7 @@ Secrets are handled in **hand-audited assembly**, not Rust the compiler recompil
 
 ## Proven Result (the reason §2/§3 is real, not aspirational)
 
-The minimal probe — inverted-pair load + XOR-to-all-ones check + zero-all + freeze — was compiled for the kernel target and the emitted asm read. Source and audited output live in [keyreg/keyreg_probe.rs](keyreg/keyreg_probe.rs) and [keyreg/keyreg_probe.s](keyreg/keyreg_probe.s).
+The minimal probe — inverted-pair load + XOR-to-all-ones check + zero-all + freeze — was compiled for the kernel target and the emitted asm read. Source and audited output live in [kernel/keyreg/keyreg_probe.rs](kernel/keyreg/keyreg_probe.rs) and [kernel/keyreg/keyreg_probe.s](kernel/keyreg/keyreg_probe.s).
 
 - **Toolchain:** rustc 1.94.0 (4a4ef493e 2026-03-02), `--target aarch64-unknown-none -O`.
 - **Result:** **Tier 2 — no stack frame allocated, no `str/stp q`, no GP-to-stack store.** The secret stays in `v0`–`v4` from load through zero. The generated asm *is* the program; it can ship unmodified.
@@ -163,7 +163,7 @@ M1 is the clean case and the active dev target. Pixel 8 Pro is PRIMARY but boxed
 
 ## Off DRAM: where the ira and wairua can rest (measured 2026-10-28)
 
-The design above holds a secret in V-registers only for the length of one asm block. It does not say where the ira and wairua (64 bytes together) rest between uses for a whole boot, and NEON cannot hold them there: the kernel saves every process's V0–V31 on each trap, LLVM cannot reserve a V-register, and the kernel's own Rust uses them. So the resting place is system registers that nothing in ferros uses and EL0 cannot read. `diag keyreg` (ferros_kernel/src/keyreg.rs) measured the candidates on husky's X3 (MIDR G#411FD4E0) and an A715 (G#411FD4D0); both agree.
+The design above holds a secret in V-registers only for the length of one asm block. It does not say where the ira and wairua (64 bytes together) rest between uses for a whole boot, and NEON cannot hold them there: the kernel saves every process's V0–V31 on each trap, LLVM cannot reserve a V-register, and the kernel's own Rust uses them. So the resting place is system registers that nothing in ferros uses and EL0 cannot read. `diag keyreg` (kernel/src/keyreg.rs) measured the candidates on husky's X3 (MIDR G#411FD4E0) and an A715 (G#411FD4D0); both agree.
 
 **Bank 0: the pointer-authentication keys.** APIA, APIB, APDA and APDB are 128 bits each, 64 bytes exactly. Every bit holds, survives an SMC into EL3, and survives idle (`wfi`/`wfe`). ferros signs no pointers: SCTLR_EL2's EnIA/EnIB/EnDA/EnDB are 0, and with them clear PACIA left a pointer unchanged under a test key (measured at EL2; the same SCTLR_EL2 governs EL0 in the EL2&0 regime). The fifth key, APGA, has no enable bit: PACGA computes with it (measured). So APGA must never hold anything that is useful alone.
 
@@ -202,7 +202,7 @@ So on stock silicon the wairua crosses deep sleep sealed in DRAM under a key re-
 ## Built: the ira and wairua in registers (2026-10-28)
 
 Neither secret has a RAM copy any more. KOHI and vault boot hand theirs over the moment they exist, and their copies are wiped.
-- **The code that touches them** is keyreg/keys.rs: safe Rust except the system-register access, with BLAKE3's compression as NEON intrinsics. `tools/keyreg-lift.sh` compiles it with the kernel's own flags and freezes the output as keyreg/keys.s, which the kernel links (ferros_kernel/src/keys.rs). The lift refuses any output that names `sp`, uses v8–v15, or calls out; `--check` regenerates and diffs, for CI. Getting there took three refusals:
+- **The code that touches them** is kernel/keyreg/keys.rs: safe Rust except the system-register access, with BLAKE3's compression as NEON intrinsics. `tools/keyreg-lift.sh` compiles it with the kernel's own flags and freezes the output as kernel/keyreg/keys.s, which the kernel links (kernel/src/keys.rs). The lift refuses any output that names `sp`, uses v8–v15, or calls out; `--check` regenerates and diffs, for CI. Getting there took three refusals:
   - helpers that were not inlined passed state through the stack;
   - a strict-align target bounced vector rows off the stack (fixed by 16-byte-aligned outputs);
   - at -O3 the seven unrolled rounds ran out of registers.
@@ -325,7 +325,7 @@ The owner, 2026-11-17: "if it stays closer to the CPU it's not only faster but i
 A plaintext identity key held by the kernel is never stored to memory, cacheable or not.
 The kernel's held keys are the identity's seed, the three keys of its vault class (address, payload, domain), the person's ledger key (personal entries of the flash log, LEDGER.md "Classes") and the person key (kvault `IdKeys`).
 
-**How** (keyreg/keys.rs, the same derive, audit, freeze discipline as the ira and the wairua: safe Rust lifted by tools/keyreg-lift.sh, no stack, no spill, no call out):
+**How** (kernel/keyreg/keys.rs, the same derive, audit, freeze discipline as the ira and the wairua: safe Rust lifted by tools/keyreg-lift.sh, no stack, no spill, no call out):
 - A held key is `key XOR pad` beside its nonce (`keys::Held`, 64 bytes), the pad `derive_key("ferros 2026-11-17 identity at rest v0", wairua ‖ nonce)`, one compression made in registers from the wairua's two shares.
   The nonce is new for every seal (a counter, the clock and the core), so no two seals share a pad under one wairua; the wairua is new each power session.
 - The lifted functions open a held key in registers, use it, and give back a derived value or another held key:

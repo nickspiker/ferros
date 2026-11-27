@@ -13,9 +13,9 @@ Units: a block is 4 KiB; 2^18 blocks are 1 GiB. Offsets are from the start of th
 | Spec says | Built | Where | Carved by |
 |---|---|---|---|
 | ABL loads the seed; the seed verifies itself, finds the kernel, jumps (SEED.md "Execution Flow", "Android Integration"; BOOT.md "Dual Boot") | ABL loads the gate (the hv, Linux's Image, the ferros kernel with its vault capsule carried) and the hv jumps to the kernel; the seed never runs | BOOT.md "As built on husky"; HV.md | 2026-10-22 on |
-| The tract is the rest of the device (RING.md "Partition Layout", VAULT.md "Tract Capacity") | the vault process's tract is a 16 GiB window, two 8 GiB copies | ferros_kernel/src/process.rs:4503, payloads/vault/src/main.rs:95-96 | b922919c, 684f8d3e |
-| The ledger is a tenant of the vault (VAULT.md "What Lives In The Vault") | the flash log is a fixed ring of its own at 1 GiB, two copies of 2^14 blocks | ferros_kernel/src/flashlog.rs:26-30 | b4f52efd |
-| One vault | the kernel's own vault (kvault) is a second vault in two fixed 256 MiB regions at 2 GiB | ferros_kernel/src/kvault.rs:18-20 | c00d0e80, 3a93cc7e |
+| The tract is the rest of the device (RING.md "Partition Layout", VAULT.md "Tract Capacity") | the vault process's tract is a 16 GiB window, two 8 GiB copies | kernel/src/process.rs:4503, payloads/vault/src/main.rs:95-96 | b922919c, 684f8d3e |
+| The ledger is a tenant of the vault (VAULT.md "What Lives In The Vault") | the flash log is a fixed ring of its own at 1 GiB, two copies of 2^14 blocks | kernel/src/flashlog.rs:26-30 | b4f52efd |
+| One vault | the kernel's own vault (kvault) is a second vault in two fixed 256 MiB regions at 2 GiB | kernel/src/kvault.rs:18-20 | c00d0e80, 3a93cc7e |
 | Extents live in the tract (VAULT.md "Extent", "Furrows") | RAW clips are extents in a 48 GiB area beside the vault | process.rs:4508-4509, payloads/vault/src/main.rs:90 | 684f8d3e |
 | (nothing) | rawbench, a 32 GiB development area | process.rs:4511 | 684f8d3e |
 | The spine migrates (RING.md "Migrating Rings") | the spine is fixed at block 0 of each region, 2^8 entries (manifestus's host profile) | kvault.rs:403 `Vault::open`, payloads/vault/src/main.rs:918 `open_lazy` | |
@@ -147,7 +147,7 @@ The owner: split across both rings, one half in each, with a custom marker recor
 ## 4. RAM: the same rule
 
 The owner, 2026-11-23: "if I open notepad and it requests 1mb ... then I go and open a video ... and it malloc's 4GB of RAM, it better work."
-- **Today:** declared ceilings: each payload's heap size (`HEAP_BYTES` in 11 payloads, e.g. payloads/vault/src/main.rs:26 at 56 MiB, payloads/beamtest/src/main.rs:20), each arc's ceiling (`diag arcs` "ceiling"), and the kernel heap (ferros_kernel/src/main.rs:186, 12 MiB).
+- **Today:** declared ceilings: each payload's heap size (`HEAP_BYTES` in 11 payloads, e.g. payloads/vault/src/main.rs:26 at 56 MiB, payloads/beamtest/src/main.rs:20), each arc's ceiling (`diag arcs` "ceiling"), and the kernel heap (kernel/src/main.rs:186, 12 MiB).
 - **Plan, a separate step:** heaps grow by asking the kernel for frames as they use them (arcs already grow, as `diag arcs` "grew" counts show), up to physical memory, and the declared caps are removed. Its own plan follows once the storage steps are under way.
 
 ## 5. The migration: describe first, nothing lost

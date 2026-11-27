@@ -1,6 +1,6 @@
 # KOHI-SOURCES — where husky's randomness comes from — Zil (0)
 
-KOHI gathers the session's wairua (GLOSSARY; `ferros_kernel/src/kohi.rs`), every source health-tested the PIPE way (RCT, APT, iterated GF(2) popcount levels) and only healthy ones mixed. The wairua needs 256 good bits per power session; everything downstream (the entropy syscall, nonces, the WiFi firmware's RNG seed) is BLAKE3-derived from it. So rate is not the constraint — **independence is**.
+KOHI gathers the session's wairua (GLOSSARY; `kernel/src/kohi.rs`), every source health-tested the PIPE way (RCT, APT, iterated GF(2) popcount levels) and only healthy ones mixed. The wairua needs 256 good bits per power session; everything downstream (the entropy syscall, nonces, the WiFi firmware's RNG seed) is BLAKE3-derived from it. So rate is not the constraint — **independence is**.
 
 **The single-egg rule (owner):** never one basket. Target: **four independent sources** — no single firmware, vendor block or physical effect can decide the wairua alone. Every other source joins as its hardware comes up anyway (camera, microphone, IMU — Lumis and the rest bring them up regardless).
 

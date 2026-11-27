@@ -6,7 +6,7 @@ metadata:
 ---
 
 Where the std target stands (STD-TARGET.md in the ferros repo has the mechanics):
-- Target: `targets/aarch64-unknown-ferros.json` (target_os ferros, static PIE, native TLS, panic abort, links through `ferros_rt/ferros.ld`). std fork: `/mnt/Harbor/Code/ferros-rust/library` (rustc 1.97.0-nightly d7f14d3d8 rust-src + `sys/pal/ferros` + `target_os = "ferros"` arms; depends on `ferros-rt` by path). Runtime: `ferros_rt/` in the ferros repo (excluded from the workspace).
+- Target: `targets/aarch64-unknown-ferros.json` (target_os ferros, static PIE, native TLS, panic abort, links through `crates/rt/ferros.ld`). std fork: `/mnt/Harbor/Code/ferros-rust/library` (rustc 1.97.0-nightly d7f14d3d8 rust-src + `sys/pal/ferros` + `target_os = "ferros"` arms; depends on `ferros-rt` by path). Runtime: `crates/rt/` in the ferros repo (excluded from the workspace).
 - Build: `tools/std-build.sh std/hello` → `stdhello.bin`; `ferros-bridge spawn … --name stdhello --entropy`. First run 2026-10-27 passed everything (println, TLS, threads, Mutex/Condvar, HashMap, sleep, SystemTime).
 - kete on ferros keeps entries by their 32-byte addresses straight through SYS_STORE bit 5 (no names, no encoding); the kernel scopes an address through its keyed hash and keeps the scope's address list.
 - Kernel: trap Frame carries TPIDR_EL0; `process.rs image_tail` reads the `ferrosRT` header at image offset 8 and grows the arc by .bss + heap (2 MiB default, `--defsym __ferros_heap=`). The arc pool is 16 MiB: Photon will need an app memory region.

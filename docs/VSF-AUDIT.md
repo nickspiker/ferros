@@ -9,19 +9,19 @@ No JSON or base64 exists device-side.
 
 | # | What | Where | Breaks | State |
 |---|---|---|---|---|
-| P1 | the flash log: `FLOG` u32 header, `b<boot> t<ms>` text lines | ferros_kernel/src/flashlog.rs | fixed-width, counter time, numbers in text | being rebuilt on the ledger (branch ledger-stage0) |
+| P1 | the flash log: `FLOG` u32 header, `b<boot> t<ms>` text lines | kernel/src/flashlog.rs | fixed-width, counter time, numbers in text | being rebuilt on the ledger (branch ledger-stage0) |
 | P2 | install's genesis spine entry: `hp` and `u` values pushed by hand, no magic, header or time | tools/install/src/main.rs:677-726 | hand-built bytes | live (install) |
 | P3 | install's stem (kernel ring) entry: VSF assembled byte by byte, time hard-coded 0, no `kernel` field | tools/install/src/main.rs:931-1046 | hand-built VSF; the seed cannot parse it (ferros_hal ring.rs:384-390) | live, a real bug |
 | P4 | ring and HAMT blocks stamp counter ticks as creation time | ferros_hal ring.rs:112,211,224; hamt.rs:207,361 | counter time as Eagle | dormant writers |
 | P5 | `FEANCH01` anchor image | tools/mkimg main.rs:294-299 | fixed-width | dead (nothing reads it) |
 | P6 | `.signed` trailer `FERROSIG` | mkimg main.rs:683-688; install :893-907; bridge :1510-1531 | fixed-width | live (host to device) |
 | P7 | gate header `FERROSGT` | mkimg main.rs:1081-1084; ferros_hv gate.rs:37,63 | fixed-width | live (flashed) |
-| P8 | legacy vault crate: `OBJ0`, `RCM0`, `VLT0`, MeshAnchor; wrapper with no time, plaintext labelled `v'e'` | vault/src backend.rs, root_commit.rs, vault_anchor.rs, anchor.rs, vsf_wrapper.rs | fixed-width, hand-built | host tools only; `ferros_vault/` is an unbuilt copy |
+| P8 | legacy vault crate: `OBJ0`, `RCM0`, `VLT0`, MeshAnchor; wrapper with no time, plaintext labelled `v'e'` | crates/vault/src backend.rs, root_commit.rs, vault_anchor.rs, anchor.rs, vsf_wrapper.rs | fixed-width, hand-built | host tools only; `ferros_vault/` is an unbuilt copy |
 | P9 | `FAT1` font atlas, `ICN3` icon bundle (display still reads `ICN2`) | ferros_kernel build.rs:66-92, text.rs; tools/app-icons; payloads/display main.rs:686,702 | fixed-width, a compatibility reader | live (baked) |
 | P10 | kernel vault stamps seconds since boot as Eagle time | ferros_kernel kvault.rs:200 (open, put, delete) | counter time as Eagle | live, every commit |
 | P11 | `\0names`, `\0id.names` stored newline-joined | kvault.rs:394-407 | delimiter string parsed back | live |
 | P12 | bare bytes as vault values: `sealed`, `\0addrs.*`, `\0id.addrs`, `\0id.secret`, `\0id.unlock`, `\0id.bound`, `genesis` text | service.rs, ferros_kist seal.rs, kvault.rs, vault_boot.rs | no VSF document | live |
-| P13 | sealed values stored as a raw `[nonce][ct][tag]` envelope | kvault.rs:337-352; store/src/lib.rs:303 | no VSF document (the kvault tag record shows the right pattern) | live |
+| P13 | sealed values stored as a raw `[nonce][ct][tag]` envelope | kvault.rs:337-352; crates/store/src/lib.rs:303 | no VSF document (the kvault tag record shows the right pattern) | live |
 | P14 | vault process stamps seconds since boot as Eagle time | payloads/vault main.rs:198 into store heads, lists and every batch | counter time as Eagle | live, every commit |
 | P15 | `gps.last`: two i32 LE | payloads/gps main.rs:627-636 | fixed-width | live |
 | P16 | `gps.replay`, `.sky`: `GNR1` + `[u16 len][u16 gap]` records | payloads/gps main.rs:641-745 | fixed-width, counter time | live (placed by hand) |

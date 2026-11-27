@@ -9,5 +9,5 @@ name = "beamtest"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-photon_core = { path = "../../photon_core" }
+ferros_sys = { path = "../../crates/sys" }
+photon_core = { path = "../../crates/photon_core" }

@@ -1,0 +1,2668 @@
+// FERROS SOURCE MAP — keep updated when pub items or files change
+//
+// kernel/ └── main.rs ── kernel entry, boot sequence, USB event loop _start (asm), kernel_main() Boot: EL check, DTB parse, FB console, USB DWC3 init USB event loop: PT command dispatch, hot-reload handler
+//
+// crates/hal/ ── hardware abstraction (no_std, Pixel 8 Exynos + shared) ├── lib.rs ── module re-exports ├── mmio.rs ── raw MMIO read/write (8/16/32-bit), cache ops ├── console.rs ── framebuffer text console, 8x16 VGA font, 2x scaling │   struct Console { fb_base, stride, x_off, y_off, col, row } │     ::new(), put_char(), scroll(), clear() ├── fb.rs ── raw framebuffer pixel ops ├── dtb.rs ── FDT/DTB parser (find nodes, read properties) ├── uart.rs ── GENI UART TX ├── pstore.rs ── ramoops/persistent_ram_buffer writer ├── ufs.rs ── UFS host controller (UFSHCI v3.0) ├── hsi2c.rs ── Exynos HSI2C master (eUSB repeater) └── usb.rs ── DWC3 USB device controller struct Dwc3Dev { evt_read_idx, ep0_state, bulk_out/in state } ::new() → init, CSFTRST, PHY, endpoint config, Run/Stop ::poll_event() → UsbEvent (Reset, ConnectDone, TransferComplete) ::bulk_out_arm(), bulk_out_read() → &[u8] ::bulk_in_send(data) → bool (ISP_IMI for short packets) ::ep0_send(), ep0_status_in/out(), handle_setup() pub fn probe() → Dwc3Info, dump_diag() → Dwc3Diag pub fn phy_init(), smmu_bypass()
+//
+// crates/pt/ ── Photon Transport (no_std, optional alloc) ├── lib.rs ── is_data_packet(), is_control_packet(), re-exports ├── packet.rs ── packet encode/decode │   TAG_SPEC='S', TAG_ACK='A', TAG_NAK='N', TAG_DONE='D', TAG_FIN='F' │   struct Spec, Ack, Nak, Complete { sid, fields... } │   encode_data(), decode_data() — per-chunk BLAKE3 hash ├── transfer.rs ── transfer state machines │   struct InboundTransfer { data, received bitmap, expected_count } │     ::new(), handle_data(), all_received(), finish() → COMPLETE/NAK │   struct OutboundTransfer { data, next_seq, count, psize } │     ::start(), start_vec(), next_data_packet(), encode_fin() │   BitmapWord = u64, outbound_bitmap_words() └── command.rs ── cap-addressed command protocol [cap:32][op:1][params...], dev caps via BLAKE3 caps: DIAG, MEM, RELOAD enum Op { Read, Write, Exec }
+//
+// crates/ledger/ ── the ledger (no_std, LEDGER.md) ├── ewe.rs ── EWE variable-width integer encoding (PT, the map) ├── category.rs ── categories and their class (system, personal) ├── entry.rs ── one entry: a sealed, chained VSF document ├── ring.rs ── the flash ring: two copies, head by the chain, torn writes named ├── preboot.rs ── the pre-boot buffer └── view.rs ── `diag log`'s documents and their render
+//
+// ferros_vault/ ── persistent object store (no_std) ├── lib.rs ── re-exports ├── device.rs ── Device trait, DeviceError, DeviceIoKind ├── hash.rs ── BLAKE3 hashing utilities ├── anchor.rs ── root anchor / superblock ├── boot.rs ── boot sequence validation ├── capability.rs ── capability tokens ├── commit.rs ── atomic commit protocol ├── failure.rs ── failure modes and recovery ├── mesh.rs ── object mesh topology ├── object.rs ── stored objects ├── platform.rs ── platform abstraction └── store.rs ── key-value store
+//
+// tools/ ├── ferros-bridge/ ── host-side USB tool (tokio + nusb) │   ├── main.rs ── CLI: diag, read, reload, reboot, status │   │   cmd_diag(), cmd_read(), cmd_reload() │   │   pt_send() — blast mode, 512-byte padded OUT, COMPLETE wait │   │   pt_recv() — receive outbound response, no SPEC ACK │   └── usb.rs ── UsbLink { interface, ep_out, ep_in } │       ::open(), send() (512-byte pad), recv() └── mkimg/ ── ELF → flat binary → boot.img v3 main.rs ── PE/COFF header, boot.img v3 packing
+//
+//! Ferros kernel — bare-metal aarch64. Targets: Pixel 8 (pixel8, default) and M1 MacBook (m1).
+
+#![no_std]
+#![no_main]
+// A production build compiles the development tools out (service.rs, `ferros_production`); what only they used is then dead code, and stays in the tree for development builds.
+#![cfg_attr(ferros_production, allow(dead_code, unused_imports, unused_variables, unused_mut, unused_assignments))]
+
+extern crate alloc;
+
+use core::arch::global_asm;
+use core::panic::PanicInfo;
+
+// Pixel 8 Pro (husky) modules shared by both boot paths: platform services, the USB/PT service, display adoption, the ira/wairua sources and the vault probe.
+#[cfg(feature = "pixel8")]
+mod platform;
+// Which board (husky or akita), from ABL's device tree at entry.
+#[cfg(feature = "pixel8")]
+mod board;
+mod settings;
+// The chords the service loop reads from the keys (power + volume up restarts, power + volume down stops the app in front): pure, tested on the host by tools/chords.
+#[cfg(feature = "pixel8")]
+mod chord;
+// Vol Up + Vol Down → power off, as the key-press interrupt itself (KILLSWITCH.md).
+#[cfg(feature = "pixel8")]
+mod killswitch;
+#[cfg(feature = "pixel8")]
+mod service;
+#[cfg(feature = "pixel8")]
+mod ptlink;
+#[cfg(feature = "pixel8")]
+mod sensorlink;
+#[cfg(feature = "pixel8")]
+mod display;
+#[cfg(feature = "pixel8")]
+mod glass;
+mod dpu_power;
+mod panel_power;
+#[cfg(feature = "pixel8")]
+#[cfg(feature = "pixel8")]
+#[cfg(feature = "pixel8")]
+#[cfg(feature = "pixel8")]
+mod hsi2c;
+#[cfg(feature = "pixel8")]
+mod acpm;
+// The SoC's heat: the TMU zones, the clock dividers, the thermal policy's caps (docs/THERMAL.md).
+#[cfg(feature = "pixel8")]
+mod thermal;
+mod odpm;
+mod pd;
+#[cfg(feature = "pixel8")]
+mod camera;
+mod x3;
+mod smp;
+// The kernel core's idle: tickless while dark, and powered down (PSCI c2) when nothing is due (POWER.md "Deep idle").
+mod idle;
+mod rtc;
+mod zone;
+mod lang;
+// The number base and whose choice it is (base.rs, SETTINGS.md).
+mod base;
+mod aoc;
+mod gps;
+mod nfc;
+mod bt;
+mod gsa;
+mod ffa;
+mod trusty;
+#[cfg(feature = "pixel8")]
+mod camera_close;
+#[cfg(feature = "pixel8")]
+mod camera_power;
+mod irqarm;
+#[cfg(feature = "pixel8")]
+mod spi;
+#[cfg(feature = "pixel8")]
+mod touch;
+#[cfg(feature = "pixel8")]
+mod amp;
+#[cfg(feature = "pixel8")]
+mod torch;
+#[cfg(feature = "pixel8")]
+mod partfs;
+#[cfg(feature = "pixel8")]
+mod flashlog;
+#[cfg(feature = "pixel8")]
+mod kvault;
+#[cfg(feature = "pixel8")]
+mod modem;
+// The PCIe links' guard: an access that never comes back ended by its link going down, and the links crowbarred at a reload or a jump (pcie_guard.rs, WIFI.md).
+#[cfg(feature = "pixel8")]
+mod pcie_guard;
+// The bootloader's lock state from ABL's bootconfig: fact 87, the settings line and a console line (bootlock.rs).
+#[cfg(feature = "pixel8")]
+mod bootlock;
+// The ira-rooted vault probe and its ira/wairua sources (both boot paths now bring UFS up).
+#[cfg(feature = "pixel8")]
+mod vault_boot;
+#[cfg(feature = "pixel8")]
+mod ira;
+#[cfg(feature = "pixel8")]
+mod wairua;
+// Post-handoff entry (ferros chainloaded from a running Linux shim; FERROS_SHIM_HANDOFF=1 → cfg shim_handoff).
+#[cfg(all(feature = "pixel8", shim_handoff))]
+mod shim;
+// Cold boot from ABL: the UFS link-startup probe behind `bridge diag ufs`.
+#[cfg(all(feature = "pixel8", not(shim_handoff)))]
+mod cold_ufs;
+// Cold boot from ABL: mark the booted A/B slot successful in devinfo, so ABL keeps booting it.
+#[cfg(all(feature = "pixel8", not(shim_handoff)))]
+mod slot;
+// Cold boot: the HSI2 S2MPU fence (what UFS and the WiFi chip may DMA into). Compiled into the handoff build too: the service and the drivers it shares with the cold boot call it (2026-11-06: the shim build had stopped compiling).
+#[cfg(feature = "pixel8")]
+mod s2mpu;
+// zuma's CoreSight trace, stopped after a jump before CPUCL0's S2MPU closes (coresight.rs).
+#[cfg(feature = "pixel8")]
+mod coresight;
+// Power + volume up inside ferros: kill everything and start again from the image the hv kept, no bootloader (restart.rs).
+#[cfg(all(feature = "pixel8", not(shim_handoff)))]
+mod restart;
+// The static cache map: one identity table at boot so ferros's own memory is cacheable (KERNEL.md, Execution Model).
+#[cfg(feature = "pixel8")]
+mod cachemap;
+// KOHI: PIPE's entropy gathering + health stack in software (the wairua's source).
+#[cfg(feature = "pixel8")]
+mod kohi;
+// The performance monitors, open to EL0 on every core (pmu.rs).
+#[cfg(feature = "pixel8")]
+mod pmu;
+// The whole-system sampling profiler (`diag prof`, tools/flame).
+#[cfg(feature = "pixel8")]
+mod prof;
+// Where the ira and wairua could live off DRAM: a probe of the unused CPU registers (keyreg.rs, KEY_REGISTERS.md).
+#[cfg(feature = "pixel8")]
+mod keyreg;
+// The ira and wairua held in CPU registers, never DRAM (keys.rs; the code that touches them is lifted from kernel/keyreg/keys.rs).
+#[cfg(feature = "pixel8")]
+mod keys;
+// The gate and the oracle: signed capsules, ihi at spawn (ORACLE.md).
+#[cfg(feature = "pixel8")]
+mod oracle;
+// Processes: EL0 in an arc, capabilities, the syscall boundary.
+#[cfg(feature = "pixel8")]
+mod process;
+// Device threads and the kernel lock: the measures and the switches (KERNEL.md "Device threads").
+#[cfg(feature = "pixel8")]
+mod devsched;
+// The scheduler's plain choices (where a kept thread queues, whom make_way asks, a slice's length), host-tested.
+#[cfg(feature = "pixel8")]
+mod schedrule;
+// The frame pool: the DRAM every arc is made of, in 2 MiB frames (frames.rs, ARCS.md).
+#[cfg(feature = "pixel8")]
+mod frames;
+// The kernel heap's window, grown from the frame pool (kheap.rs, docs/NO-CEILINGS.md step 4).
+#[cfg(feature = "pixel8")]
+mod kheap;
+// The "Ready?" gate: the boot proper starts at the power key's press (BOOT.md). Compiled into the handoff build too, for the gate telemetry and marks the shared service reads.
+#[cfg(feature = "pixel8")]
+mod ready;
+// Bring-up checklist on the panel: red until done, green once done.
+#[cfg(feature = "pixel8")]
+mod checklist;
+mod text;
+
+// UFS-backed vault Device (windowed onto the ferros partition), used by shim::entry_genesis.
+mod ufs_device;
+
+
+// ---------------------------------------------------------------------------
+// Global allocator
+// ---------------------------------------------------------------------------
+
+use core::alloc::{GlobalAlloc, Layout};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// DRAM-based bump allocator. Base address set at startup from __stack_top linker symbol (right after kernel image + the kernel stack). Keeps binary small — no BSS heap array — so PT transfers don't grow circularly.
+// Cold boot: 12 MiB (room for multi-MiB PT transfers — WiFi firmware, a display capsule with 256-px icons, 2.2 MB, which with the store's copies ran 8 MiB out, 2026-10-23; image + stack + heap end below G#8100_0000, where the arc pool starts: G#80F3_4000 today). The handoff carveout is 12 MiB with its staging slot 6 MiB in, so it keeps 4 MiB.
+#[cfg(not(shim_handoff))]
+const HEAP_SIZE: usize = 12 * 1024 * 1024;
+#[cfg(shim_handoff)]
+const HEAP_SIZE: usize = 4 * 1024 * 1024;
+
+#[cfg_attr(feature = "pixel8", allow(dead_code))]
+static HEAP_BASE: AtomicUsize = AtomicUsize::new(0);
+#[cfg_attr(feature = "pixel8", allow(dead_code))]
+static HEAP_POS: AtomicUsize = AtomicUsize::new(0);
+
+/// The kernel heap's first region, as every boot path lays it: the page after the kernel stack (the linker's `__stack_top`), `HEAP_SIZE` long.
+pub fn heap_bounds() -> (usize, usize) {
+    unsafe extern "C" {
+        static __stack_top: u8;
+    }
+    let b = (unsafe { &__stack_top as *const u8 as usize } + 0xFFF) & !0xFFF;
+    (b, b + HEAP_SIZE)
+}
+
+#[cfg_attr(feature = "pixel8", allow(dead_code))]
+struct BumpAlloc;
+
+unsafe impl GlobalAlloc for BumpAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let base = HEAP_BASE.load(Ordering::Relaxed) as *mut u8;
+        if base.is_null() {
+            return core::ptr::null_mut();
+        }
+        loop {
+            let pos = HEAP_POS.load(Ordering::Relaxed);
+            let aligned = (pos + layout.align() - 1) & !(layout.align() - 1);
+            let new_pos = aligned + layout.size();
+            if new_pos > HEAP_SIZE {
+                return core::ptr::null_mut();
+            }
+            if HEAP_POS.compare_exchange_weak(pos, new_pos, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                return unsafe { base.add(aligned) };
+            }
+        }
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
+// m1 keeps the lean leak-forever bump: its allocation is bounded and set up once.
+#[cfg(not(feature = "pixel8"))]
+#[global_allocator]
+static ALLOC: BumpAlloc = BumpAlloc;
+
+// Both Pixel boot paths run the long-lived PT service (and the handoff the vault, whose commits do many alloc/free cycles); a leak-forever bump would exhaust the 4 MiB heap, so they get a freeing allocator: TLSF since 2026-11-12 (ferros_heap kernel.rs, ferros_rt's tlsf.rs), the first-fit free list before. The free list walked every free block under the lock at each alloc, and grew a Vec only by a new block and a copy; TLSF is a few bit operations whatever the free blocks, grows in place, and records a refused allocation for the panic report (`diag heap`).
+#[cfg(feature = "pixel8")]
+#[global_allocator]
+pub(crate) static KERNEL_HEAP: ferros_heap::kernel::LockedTlsf = ferros_heap::kernel::LockedTlsf::empty();
+/// Whether the cache map is on, so the heap's second region can join (it must be normal memory: an allocation's unaligned copies fault on Device memory).
+static HEAP2_CACHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static HEAP2_JOINED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// From the service loop, once, a couple of seconds after it starts: the heap's second region (cachemap HEAP2) prepared and added to the kernel heap. The first 12 MiB carry the boot until then.
+#[cfg(not(shim_handoff))]
+pub fn heap2_join() {
+    if !HEAP2_CACHED.load(Ordering::Relaxed) || HEAP2_JOINED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    cachemap::heap2_prepare();
+    unsafe { KERNEL_HEAP.add(cachemap::HEAP2.0, cachemap::HEAP2.1 - cachemap::HEAP2.0) };
+    // The window after it (docs/NO-CEILINGS.md 1, step 4), so the window is the heap's last region and grows as one.
+    kheap::open();
+}
+
+/// The kernel heap now (its regions, in use and peak, free bytes and blocks, the largest free block, refusals), for DIAG; None if the heap is busy.
+pub fn heap_report() -> Option<ferros_heap::kernel::Report> {
+    KERNEL_HEAP.report()
+}
+
+/// The kernel heap's largest free block in bytes; `usize::MAX` when the heap is busy on another core (the caller's test then passes, as it would have a moment later).
+pub fn heap_largest_free() -> usize {
+    KERNEL_HEAP.report().map_or(usize::MAX, |r| r.largest)
+}
+
+/// `diag heap`: the kernel heap as text, its free space by size included (a walk of every free block, under the heap's lock).
+pub fn heap_text() -> alloc::string::String {
+    let Some(r) = KERNEL_HEAP.report() else {
+        return alloc::string::String::from("kernel heap: busy, ask again\n");
+    };
+    let mut s = alloc::format!("kernel heap: A#{} bytes in A#{} regions and the window:", r.size, r.regions);
+    for &(a, b) in &r.region[..r.regions] {
+        s.push_str(&alloc::format!(" G#{a:X}-G#{b:X} (A#{} KiB)", (b - a) >> 10));
+    }
+    s.push('\n');
+    s.push_str(&kheap::report());
+    s.push_str(&alloc::format!("window growths A#{}, A#{} KiB given back since boot", r.grows, r.trimmed >> 10));
+    s.push_str(&alloc::format!("\nin use A#{} bytes, peak A#{} since boot or `diag heap peak reset`\nfree A#{} bytes in A#{} blocks, the largest A#{}\n", r.in_use, r.peak, r.free, r.free_blocks, r.largest));
+    // Gathered on the stack under the heap's lock, written out after it: text allocates, and the lock is the allocator's own. One entry a first level of the lists (tlsf.rs: 39 of them since docs/NO-CEILINGS.md step 3, so 2^6 entries).
+    let mut levels = [(0usize, 0usize, 0usize); 1 << 6];
+    let mut n = 0;
+    if let Some(h) = KERNEL_HEAP.try_lock() {
+        h.levels(|floor, blocks, bytes| {
+            levels[n] = (floor, blocks, bytes);
+            n += 1;
+        });
+    }
+    s.push_str("free blocks by size (from, blocks, bytes):\n");
+    for &(floor, blocks, bytes) in &levels[..n] {
+        s.push_str(&alloc::format!("  A#{floor}: A#{blocks}, A#{bytes}\n"));
+    }
+    let f = r.last_fail;
+    if r.fails == 0 {
+        s.push_str("refused: none since boot\n");
+    } else {
+        s.push_str(&alloc::format!("refused: A#{} since boot; the last A#{} bytes at alignment A#{}, for G#{:X}, when A#{} were in use and A#{} free in A#{} blocks, the largest A#{}\n", r.fails, f.size, f.align, f.caller, f.in_use, f.free, f.free_blocks, f.largest));
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Boot stub — minimal, no MMU
+// ---------------------------------------------------------------------------
+
+global_asm!(r#"
+.section .text.boot, "ax"
+.global _start
+
+// ========================================================================
+// ARM64 Image header with PE/COFF stub
+//
+// Qualcomm ABL (UEFI-based) requires PE/COFF format to find entry point. Stock FP5 kernel starts with "MZ" (PE/COFF). We replicate this.
+//
+// Layout: 0x000: DOS/ARM64 header (MZ + branch + ARM64 Image fields + e_lfanew) 0x040: PE header (PE\0\0 + COFF + Optional + Section table) 0x1000: _entry (page-aligned .text section start)
+// ========================================================================
+
+_start:
+    // Offset 0x00: "MZ" magic — must be valid ARM64: `add x13, x18, #0x16` Bytes: 4D 5A 00 91. Stock kernel uses this exact encoding.
+    .long   0x91005A4D
+    // Offset 0x04: branch to _entry (past all headers)
+    b       _entry
+
+    // Offset 0x08: text_offset (ARM64 Image header)
+    .quad   0x80000                 // text_offset = 0x80000 (matches stock FP5 kernel)
+    // Offset 0x10: image_size
+    .quad   __kernel_size
+    // Offset 0x18: flags — LE, 4K pages, can be placed anywhere
+    .quad   0x0A
+    // Offset 0x20: res2
+    .quad   0
+    // Offset 0x28: res3
+    .quad   0
+    // Offset 0x30: res4
+    .quad   0
+    // Offset 0x38: ARM64 magic
+    .ascii  "ARM\x64"
+    // Offset 0x3C: PE header offset (e_lfanew for PE/COFF)
+    .long   .Lpe_header - _start
+
+// ---------- PE/COFF Header (at offset 0x40) ----------
+.balign 4
+.Lpe_header:
+    .ascii  "PE\0\0"               // PE magic
+
+    // COFF header (20 bytes)
+    .short  0xAA64                  // Machine: ARM64
+    .short  1                       // NumberOfSections
+    .long   0                       // TimeDateStamp
+    .long   0                       // PointerToSymbolTable
+    .long   0                       // NumberOfSymbols
+    .short  .Lsection_table - .Loptional_header   // SizeOfOptionalHeader
+    .short  0x206                   // Characteristics: EXEC | NO_LINE | NO_DEBUG
+
+.Loptional_header:
+    // PE32+ Optional Header
+    .short  0x20B                   // Magic: PE32+
+    .byte   0                       // MajorLinkerVersion
+    .byte   0                       // MinorLinkerVersion
+    .long   __kernel_size - 0x1000   // SizeOfCode (section data, excl headers)
+    .long   0                       // SizeOfInitializedData
+    .long   0                       // SizeOfUninitializedData
+    .long   0x1000                  // AddressOfEntryPoint (RVA = page 1)
+    .long   0x1000                  // BaseOfCode
+
+    // PE32+ fields
+    .quad   0                       // ImageBase (relocatable)
+    .long   0x1000                  // SectionAlignment (4K)
+    .long   0x200                   // FileAlignment (512 — matches stock)
+    .short  0                       // MajorOperatingSystemVersion
+    .short  0                       // MinorOperatingSystemVersion
+    .short  0                       // MajorImageVersion
+    .short  0                       // MinorImageVersion
+    .short  0                       // MajorSubsystemVersion
+    .short  0                       // MinorSubsystemVersion
+    .long   0                       // Win32VersionValue
+    .long   __kernel_size           // SizeOfImage
+    .long   0x1000                  // SizeOfHeaders (one page)
+    .long   0                       // CheckSum
+    .short  10                      // Subsystem: EFI Application
+    .short  0                       // DllCharacteristics
+    .quad   0                       // SizeOfStackReserve
+    .quad   0                       // SizeOfStackCommit
+    .quad   0                       // SizeOfHeapReserve
+    .quad   0                       // SizeOfHeapCommit
+    .long   0                       // LoaderFlags
+    .long   6                       // NumberOfRvaAndSizes (6, matches stock)
+
+    // Data directories (6 entries, all empty — matches stock)
+    .quad   0                       // Export Table
+    .quad   0                       // Import Table
+    .quad   0                       // Resource Table
+    .quad   0                       // Exception Table
+    .quad   0                       // Certificate Table
+    .quad   0                       // Base Relocation Table
+
+.Lsection_table:
+    // Section header: ".text"
+    .ascii  ".text\0\0\0"           // Name (8 bytes)
+    .long   __kernel_size - 0x1000  // VirtualSize (section virtual extent, incl BSS)
+    .long   0x1000                  // VirtualAddress (RVA, page-aligned)
+    .long   __bss_start - _start - 0x1000  // SizeOfRawData (file-backed only, excl BSS)
+    .long   0x1000                  // PointerToRawData (file offset)
+    .long   0                       // PointerToRelocations
+    .long   0                       // PointerToLinenumbers
+    .short  0                       // NumberOfRelocations
+    .short  0                       // NumberOfLinenumbers
+    .long   0xE0000020              // Characteristics: CODE | EXECUTE | READ | WRITE
+
+// ---------- Actual kernel entry (page-aligned at RVA 0x1000) ----------
+.balign 0x1000
+_entry:
+    // Handoff diagnostic breadcrumb: prove we reached ferros's first instruction.
+    // Written to the shim scratch (0x92F00100) so it survives a later crash and the kernel readback can see the EL2 jump landed.
+    // Harmless on cold boot — 0x92F00100 is DRAM the cold-boot image (at 0x80000) never touches.
+    // MMU is off on all our entry paths (shim jump + Tensor ABL), so this hits DRAM.
+    movz    x9, #0x92F0, lsl #16    // x9 = 0x92F00000
+    add     x9, x9, #0x100          // x9 = 0x92F00100 (entry breadcrumb slot)
+    movz    x10, #0xBEE1            // "reached _entry"
+    str     x10, [x9]
+    dc      civac, x9               // push the breadcrumb to PoC so it survives a reset
+    dsb     sy
+    // Save DTB pointer, mask interrupts
+    mov     x19, x0
+    msr     daifset, #0xF
+
+    mrs     x20, CurrentEL
+    lsr     x20, x20, #2
+
+    // ================================================================
+    // Check if MMU is already off. If so, skip the teardown entirely. ABL (Tensor G3, m1n1) disables MMU + caches before jumping. FP5/QCM6490 ABL leaves them enabled. Attempting cache clean + MMU disable when already off faults on Tensor G3 (Apple SPRR, Samsung SCTLR behavior).
+    // ================================================================
+    cmp     x20, #2
+    b.ne    .Lcheck_el1_mmu
+    mrs     x21, sctlr_el2
+    tst     x21, #1             // test M bit (MMU enable)
+    b.eq    .Lsctlr_done        // MMU already off — skip teardown
+    b       .Ldo_cache_clean_el2
+
+.Lcheck_el1_mmu:
+    mrs     x21, sctlr_el1
+    tst     x21, #1
+    b.eq    .Lsctlr_done        // MMU already off — skip teardown
+    b       .Ldo_cache_clean_el1
+
+// ---------- M1 entry: explicit skip (kept for m1n1-boot.py compatibility) ----------
+.global _m1_entry
+_m1_entry:
+    mov     x19, x0
+    msr     daifset, #0xF
+    mrs     x20, CurrentEL
+    lsr     x20, x20, #2
+    mov     x21, #0             // no saved SCTLR
+    b       .Lsctlr_done
+
+    // ================================================================
+    // Cache clean + MMU disable — only reached if MMU was on.
+    // ================================================================
+.Ldo_cache_clean_el2:
+    // EL2 path
+    mrs     x21, sctlr_el2     // x21 = original SCTLR (saved for diagnostics)
+    // Clean + invalidate data caches before disabling (otherwise dirty lines are lost)
+    mrs     x0, ctr_el0
+    ubfx    x0, x0, #16, #4    // DminLine (log2 words)
+    mov     x1, #4
+    lsl     x1, x1, x0         // x1 = cache line size in bytes
+    sub     x3, x1, #1          // line mask
+
+    // Clean entire BSS + data region conservatively (0 to 8MB from load addr)
+    adrp    x4, _start
+    mov     x5, #0x800000       // 8MB
+    add     x5, x5, x4
+.Lclean_el2:
+    dc      civac, x4
+    add     x4, x4, x1
+    cmp     x4, x5
+    b.lo    .Lclean_el2
+    dsb     sy
+    isb
+
+    bic     x0, x21, #(1 << 0)  // Clear M (MMU)
+    bic     x0, x0, #(1 << 2)   // Clear C (data cache)
+    bic     x0, x0, #(1 << 12)  // Clear I (instruction cache)
+    msr     sctlr_el2, x0
+    isb
+    // Invalidate TLBs + I-cache after disabling
+    tlbi    alle2
+    ic      iallu
+    dsb     sy
+    isb
+    b       .Lsctlr_done
+
+.Ldo_cache_clean_el1:
+    // EL1 path
+    mrs     x21, sctlr_el1
+    mrs     x0, ctr_el0
+    ubfx    x0, x0, #16, #4
+    mov     x1, #4
+    lsl     x1, x1, x0
+    sub     x3, x1, #1
+
+    adrp    x4, _start
+    mov     x5, #0x800000
+    add     x5, x5, x4
+.Lclean_el1:
+    dc      civac, x4
+    add     x4, x4, x1
+    cmp     x4, x5
+    b.lo    .Lclean_el1
+    dsb     sy
+    isb
+
+    bic     x0, x21, #(1 << 0)
+    bic     x0, x0, #(1 << 2)
+    bic     x0, x0, #(1 << 12)
+    msr     sctlr_el1, x0
+    isb
+    tlbi    vmalle1
+    ic      iallu
+    dsb     sy
+    isb
+
+.Lsctlr_done:
+
+    adr     x2, .Lvectors
+    cmp     x20, #2
+    b.ne    .Lvbar_el1
+    msr     vbar_el2, x2
+    b       .Lvbar_done
+.Lvbar_el1:
+    msr     vbar_el1, x2
+.Lvbar_done:
+    isb
+
+    msr     spsel, #1
+    adrp    x1, __stack_top
+    add     x1, x1, :lo12:__stack_top
+    mov     sp, x1
+
+    adrp    x1, __bss_start
+    add     x1, x1, :lo12:__bss_start
+    adrp    x2, __bss_end
+    add     x2, x2, :lo12:__bss_end
+.Lbss_loop:
+    cmp     x1, x2
+    b.ge    .Lbss_done
+    str     xzr, [x1], #8
+    b       .Lbss_loop
+.Lbss_done:
+
+    adrp    x1, __boot_el
+    add     x1, x1, :lo12:__boot_el
+    str     x20, [x1]
+
+    adrp    x1, __boot_sctlr
+    add     x1, x1, :lo12:__boot_sctlr
+    str     x21, [x1]
+
+    mov     x0, x19
+    bl      kernel_main
+
+.Lhalt:
+    wfe
+    b       .Lhalt
+
+.balign 0x800
+.Lvectors:
+    b       .Lexc_recover          // EL1t sync
+    .balign 0x80
+    b       .Lirq                  // EL1t IRQ
+    .balign 0x80
+    b .Lhalt                       // EL1t FIQ
+    .balign 0x80
+    b       .Lexc_serror           // EL1t SError
+
+    .balign 0x80
+    b       .Lexc_recover          // EL1h sync
+    .balign 0x80
+    b       .Lirq                  // EL1h IRQ (at EL2: current EL, SP_EL2)
+    .balign 0x80
+    b .Lhalt                       // EL1h FIQ
+    .balign 0x80
+    b       .Lexc_serror           // EL1h SError
+
+    .balign 0x80
+    b       .Lel0_sync             // Lower AArch64 sync (a process: syscall or fault)
+    .balign 0x80
+    b       .Lirq                  // Lower AArch64 IRQ (the killswitch preempts processes too)
+    .balign 0x80
+    b .Lhalt                       // Lower AArch64 FIQ
+    .balign 0x80
+    b       .Lexc_serror           // Lower AArch64 SError
+
+    .balign 0x80
+    b .Lhalt
+    .balign 0x80
+    b .Lhalt
+    .balign 0x80
+    b .Lhalt
+    .balign 0x80
+    b .Lhalt
+
+.balign 16
+// IRQ = the killswitch (kernel/src/killswitch.rs). Whatever fired, both volume keys held (gpa4-1 and gpa6-2 low, G#154D_0084 / G#154D_00A4) → PSCI SYSTEM_OFF at once: no zeroing, no cleanup (KILLSWITCH.md). Otherwise a key edge clears its EINT pending bits; any other interrupt is switched off at the distributor (ferros polls everything else); then EOI and return. Spurious (INTID >= 1020) returns without EOI. If SYSTEM_OFF ever returns, sit with IRQs masked until the unpetted watchdog resets the SoC.
+.Lirq:
+    stp     x0, x1, [sp, #-32]!
+    stp     x2, x3, [sp, #16]
+    // Stage 1: entered (x1 = this core's stage word, kept in x1 only until the first ldr below).
+    adrp    x1, __irq_stage
+    add     x1, x1, :lo12:__irq_stage
+    mrs     x2, mpidr_el1
+    ubfx    x2, x2, #8, #4
+    mov     x3, #1
+    str     x3, [x1, x2, lsl #3]
+    mrs     x0, S3_0_C12_C12_0     // ICC_IAR1_EL1
+    movz    x1, #0x0084
+    movk    x1, #0x154D, lsl #16
+    ldr     w2, [x1]
+    ldr     w3, [x1, #0x20]
+    tst     w2, #2
+    b.ne    .Lirq_live
+    tst     w3, #4
+    b.ne    .Lirq_live
+    movz    x0, #0x0008
+    movk    x0, #0x8400, lsl #16
+    smc     #0
+.Lirq_dead:
+    adrp    x1, __irq_stage
+    add     x1, x1, :lo12:__irq_stage
+    mrs     x2, mpidr_el1
+    ubfx    x2, x2, #8, #4
+    mov     x3, #3
+    str     x3, [x1, x2, lsl #3]
+    wfi
+    b       .Lirq_dead
+.Lirq_live:
+    adrp    x1, __irq_stage
+    add     x1, x1, :lo12:__irq_stage
+    mrs     x2, mpidr_el1
+    ubfx    x2, x2, #8, #4
+    mov     x3, #2
+    str     x3, [x1, x2, lsl #3]
+    // The INTID this core took last (process.rs `__irq_last`): what parked a thread, read by `ferros_el0_preempt` with the interrupts still masked.
+    adrp    x1, __irq_last
+    add     x1, x1, :lo12:__irq_last
+    str     x0, [x1, x2, lsl #3]
+    adrp    x1, __irq_count
+    add     x1, x1, :lo12:__irq_count
+    ldr     x2, [x1]
+    add     x2, x2, #1
+    str     x2, [x1]
+    cmp     x0, #1020
+    b.hs    .Lirq_ret
+    cmp     x0, #2
+    b.eq    .Lirq_dump
+    cmp     x0, #3
+    b.eq    .Lirq_hold
+    cmp     x0, #26
+    b.eq    .Lirq_tick
+    cmp     x0, #28
+    b.eq    .Lirq_prof
+    cmp     x0, #60
+    b.eq    .Lirq_power
+    cmp     x0, #61
+    b.eq    .Lirq_key
+    cmp     x0, #64
+    b.eq    .Lirq_key
+    cmp     x0, #32
+    b.lo    .Lirq_eoi
+    adrp    x1, __irq_armed
+    add     x1, x1, :lo12:__irq_armed
+    ldrb    w1, [x1, x0]
+    cbnz    w1, .Lirq_armed
+.Lirq_spi:
+    lsr     x2, x0, #5
+    and     x3, x0, #31
+    mov     w1, #1
+    lsl     w1, w1, w3
+    movz    x3, #0x0180
+    movk    x3, #0x1040, lsl #16
+    str     w1, [x3, x2, lsl #2]   // GICD_ICENABLER<n>: masked until a driver's irq_ack (or for good, if no one holds the line)
+// An armed line whose program cleared its own source and asked to stay open (irqarm.rs UNMASK): pending and woken as any line, never masked, so its next event fires whatever its driver is doing.
+.Lirq_spi_open:
+    adrp    x1, __irq_stage
+    add     x1, x1, :lo12:__irq_stage
+    mrs     x2, mpidr_el1
+    ubfx    x2, x2, #8, #4
+    mov     x3, #4
+    str     x3, [x1, x2, lsl #3]
+    // When it came and on which core (process.rs __irq_at, __irq_core: what devsched measures the waiter's run from), stored before the pending byte and ordered ahead of it.
+    adrp    x1, __irq_at
+    add     x1, x1, :lo12:__irq_at
+    mrs     x3, cntpct_el0
+    str     x3, [x1, x0, lsl #3]
+    adrp    x1, __irq_core
+    add     x1, x1, :lo12:__irq_core
+    strb    w2, [x1, x0]
+    dmb     ish
+    // The line is pending for whoever holds its grant (process.rs IRQS); from EL0 the running thread is parked so the scheduler can run the waiter now, from EL2 the service loop's next slice does.
+    adrp    x1, __irq_pending
+    add     x1, x1, :lo12:__irq_pending
+    mov     w2, #1
+    strb    w2, [x1, x0]
+    adrp    x1, __irq_any
+    add     x1, x1, :lo12:__irq_any
+    str     x2, [x1]
+    dsb     sy
+    sev                            // the kernel's core, if in wfe, looks for the waiter
+    mov     x1, #(1 << 24)
+    orr     x1, x1, #(1 << 40)
+    msr     S3_0_C12_C11_5, x1     // ICC_SGI1R_EL1: SGI 1 to every other core — the workers sleep in wfi
+    isb
+    msr     S3_0_C12_C12_1, x0     // ICC_EOIR1_EL1
+    isb
+    adrp    x1, __irq_stage
+    add     x1, x1, :lo12:__irq_stage
+    mrs     x2, mpidr_el1
+    ubfx    x2, x2, #8, #4
+    mov     x3, #5
+    str     x3, [x1, x2, lsl #3]
+    mrs     x1, spsr_el2
+    and     x1, x1, #0xF
+    cbnz    x1, .Lirq_ret
+    adrp    x1, __irq_stage
+    add     x1, x1, :lo12:__irq_stage
+    mov     x3, #6
+    str     x3, [x1, x2, lsl #3]
+    ldp     x2, x3, [sp, #16]
+    ldp     x0, x1, [sp], #32
+    b       .Lel0_preempt
+// The power key was pressed (gpa4-0 falling edge, killswitch.rs arm_power_key): record it for the "Ready?" gate and clear its pending bit.
+.Lirq_power:
+    adrp    x1, __power_pressed
+    add     x1, x1, :lo12:__power_pressed
+    mov     x2, #1
+    str     x2, [x1]
+    movz    x1, #0x0A10
+    movk    x1, #0x154D, lsl #16
+    mov     w2, #1
+    str     w2, [x1]               // EINT_PEND gpa4: power
+    dsb     sy
+    b       .Lirq_eoi
+// The EL2 timer (PPI 26): a process's time slice is up. Stop the timer and EOI; from EL2 there is nothing to preempt, from EL0 park the process (.Lel0_preempt) and give the CPU back to the kernel.
+.Lirq_tick:
+    msr     cnthp_ctl_el2, xzr
+    msr     S3_0_C12_C12_1, x0     // ICC_EOIR1_EL1
+    isb
+    mrs     x1, spsr_el2
+    and     x1, x1, #0xF
+    cbnz    x1, .Lirq_ret
+    ldp     x2, x3, [sp, #16]
+    ldp     x0, x1, [sp], #32
+    b       .Lel0_preempt
+// SGI 3: the kernel holds the process this core runs (process.rs `hold`, ARCS.md step 3: its arc is about to move or change its mask). EOI, then from EL0 park the thread as a slice's end does (.Lel0_preempt), so the last of its threads off a core lets the held work run; from EL2 there is nothing to park (the thread is in the kernel already and parks at its trap's end).
+.Lirq_hold:
+    msr     S3_0_C12_C12_1, x0     // ICC_EOIR1_EL1
+    isb
+    mrs     x1, spsr_el2
+    and     x1, x1, #0xF
+    cbnz    x1, .Lirq_ret
+    ldp     x2, x3, [sp, #16]
+    ldp     x0, x1, [sp], #32
+    b       .Lel0_preempt
+// The profiler's tick (prof.rs): this core's EL2 virtual timer, PPI 28. The record is written in Rust, which may use any caller-saved register, the vector registers among them (the kernel's memcpy does): x4-x18, x29, x30 and v0-v31 with FPCR/FPSR are saved over the x0-x3 the entry saved (x0, the INTID, kept with x30 for the EOI). It gets the interrupted ELR, SPSR, x29 and x30, re-arms or stops the timer itself (the line drops before the EOI), and never takes the kernel lock. Then EOI and the common return: it parks nothing, whichever level it interrupted.
+.Lirq_prof:
+    sub     sp, sp, #672
+    stp     x4, x5, [sp, #0]
+    stp     x6, x7, [sp, #16]
+    stp     x8, x9, [sp, #32]
+    stp     x10, x11, [sp, #48]
+    stp     x12, x13, [sp, #64]
+    stp     x14, x15, [sp, #80]
+    stp     x16, x17, [sp, #96]
+    stp     x18, x29, [sp, #112]
+    stp     x30, x0, [sp, #128]
+    stp     q0, q1, [sp, #160]
+    stp     q2, q3, [sp, #192]
+    stp     q4, q5, [sp, #224]
+    stp     q6, q7, [sp, #256]
+    stp     q8, q9, [sp, #288]
+    stp     q10, q11, [sp, #320]
+    stp     q12, q13, [sp, #352]
+    stp     q14, q15, [sp, #384]
+    stp     q16, q17, [sp, #416]
+    stp     q18, q19, [sp, #448]
+    stp     q20, q21, [sp, #480]
+    stp     q22, q23, [sp, #512]
+    stp     q24, q25, [sp, #544]
+    stp     q26, q27, [sp, #576]
+    stp     q28, q29, [sp, #608]
+    stp     q30, q31, [sp, #640]
+    mrs     x9, fpcr
+    mrs     x10, fpsr
+    stp     x9, x10, [sp, #144]
+    mrs     x0, elr_el2
+    mrs     x1, spsr_el2
+    mov     x2, x29
+    mov     x3, x30
+    bl      ferros_prof_tick
+    ldp     x9, x10, [sp, #144]
+    msr     fpcr, x9
+    msr     fpsr, x10
+    ldp     q0, q1, [sp, #160]
+    ldp     q2, q3, [sp, #192]
+    ldp     q4, q5, [sp, #224]
+    ldp     q6, q7, [sp, #256]
+    ldp     q8, q9, [sp, #288]
+    ldp     q10, q11, [sp, #320]
+    ldp     q12, q13, [sp, #352]
+    ldp     q14, q15, [sp, #384]
+    ldp     q16, q17, [sp, #416]
+    ldp     q18, q19, [sp, #448]
+    ldp     q20, q21, [sp, #480]
+    ldp     q22, q23, [sp, #512]
+    ldp     q24, q25, [sp, #544]
+    ldp     q26, q27, [sp, #576]
+    ldp     q28, q29, [sp, #608]
+    ldp     q30, q31, [sp, #640]
+    ldp     x30, x0, [sp, #128]
+    ldp     x18, x29, [sp, #112]
+    ldp     x16, x17, [sp, #96]
+    ldp     x14, x15, [sp, #80]
+    ldp     x12, x13, [sp, #64]
+    ldp     x10, x11, [sp, #48]
+    ldp     x8, x9, [sp, #32]
+    ldp     x6, x7, [sp, #16]
+    ldp     x4, x5, [sp, #0]
+    add     sp, sp, #672
+    b       .Lirq_eoi
+// A line its driver armed (irqarm.rs, SYS_IRQ_ARM; `__irq_armed` non-zero): its armed register operations run here, before the line is masked and its driver woken (`ferros_irq_armed`, x0 the INTID), so they never wait for the kernel lock or a core (2026-11-18: the camera's descriptor release, a wake 3.3 ms behind a set_pref's hold stopped the stream at 96 a second).
+// Saved as `.Lirq_prof` saves (Rust may use any caller-saved register, the vector registers among them); x0, the INTID, kept for the line's own path after it (`.Lirq_spi`). It never takes the kernel lock.
+.Lirq_armed:
+    sub     sp, sp, #672
+    stp     x4, x5, [sp, #0]
+    stp     x6, x7, [sp, #16]
+    stp     x8, x9, [sp, #32]
+    stp     x10, x11, [sp, #48]
+    stp     x12, x13, [sp, #64]
+    stp     x14, x15, [sp, #80]
+    stp     x16, x17, [sp, #96]
+    stp     x18, x29, [sp, #112]
+    stp     x30, x0, [sp, #128]
+    stp     q0, q1, [sp, #160]
+    stp     q2, q3, [sp, #192]
+    stp     q4, q5, [sp, #224]
+    stp     q6, q7, [sp, #256]
+    stp     q8, q9, [sp, #288]
+    stp     q10, q11, [sp, #320]
+    stp     q12, q13, [sp, #352]
+    stp     q14, q15, [sp, #384]
+    stp     q16, q17, [sp, #416]
+    stp     q18, q19, [sp, #448]
+    stp     q20, q21, [sp, #480]
+    stp     q22, q23, [sp, #512]
+    stp     q24, q25, [sp, #544]
+    stp     q26, q27, [sp, #576]
+    stp     q28, q29, [sp, #608]
+    stp     q30, q31, [sp, #640]
+    mrs     x9, fpcr
+    mrs     x10, fpsr
+    stp     x9, x10, [sp, #144]
+    bl      ferros_irq_armed
+    mov     x1, x0                 // 1: leave the line open (UNMASK); x1 is the entry's to restore, none of the loads below touch it
+    ldp     x9, x10, [sp, #144]
+    msr     fpcr, x9
+    msr     fpsr, x10
+    ldp     q0, q1, [sp, #160]
+    ldp     q2, q3, [sp, #192]
+    ldp     q4, q5, [sp, #224]
+    ldp     q6, q7, [sp, #256]
+    ldp     q8, q9, [sp, #288]
+    ldp     q10, q11, [sp, #320]
+    ldp     q12, q13, [sp, #352]
+    ldp     q14, q15, [sp, #384]
+    ldp     q16, q17, [sp, #416]
+    ldp     q18, q19, [sp, #448]
+    ldp     q20, q21, [sp, #480]
+    ldp     q22, q23, [sp, #512]
+    ldp     q24, q25, [sp, #544]
+    ldp     q26, q27, [sp, #576]
+    ldp     q28, q29, [sp, #608]
+    ldp     q30, q31, [sp, #640]
+    ldp     x30, x0, [sp, #128]
+    ldp     x18, x29, [sp, #112]
+    ldp     x16, x17, [sp, #96]
+    ldp     x14, x15, [sp, #80]
+    ldp     x12, x13, [sp, #64]
+    ldp     x10, x11, [sp, #48]
+    ldp     x8, x9, [sp, #32]
+    ldp     x6, x7, [sp, #16]
+    ldp     x4, x5, [sp, #0]
+    add     sp, sp, #672
+    cbnz    x1, .Lirq_spi_open
+    b       .Lirq_spi
+// SGI 2: dump where this core is (process.rs `diag core`): the interrupted ELR/SPSR, both stack pointers, and x0-x3 as saved at entry.
+.Lirq_dump:
+    adrp    x1, __core_dump
+    add     x1, x1, :lo12:__core_dump
+    mrs     x2, mpidr_el1
+    ubfx    x2, x2, #8, #4
+    add     x1, x1, x2, lsl #7
+    mrs     x2, elr_el2
+    str     x2, [x1, #0]
+    mrs     x2, spsr_el2
+    str     x2, [x1, #8]
+    add     x2, sp, #32
+    str     x2, [x1, #16]
+    mrs     x2, sp_el0
+    str     x2, [x1, #24]
+    ldp     x2, x3, [sp]
+    stp     x2, x3, [x1, #32]
+    ldp     x2, x3, [sp, #16]
+    stp     x2, x3, [x1, #48]
+    // The frame pointer and the link register as the interrupted code left them (nothing before this in the handler touches them): with ELR, the caller of the place the core is stuck in (platform::stall_check).
+    stp     x29, x30, [x1, #64]
+    dsb     sy
+    b       .Lirq_eoi
+.Lirq_key:
+    movz    x1, #0x0A10
+    movk    x1, #0x154D, lsl #16
+    mov     w2, #2
+    str     w2, [x1]               // EINT_PEND gpa4: vol-down
+    mov     w2, #4
+    str     w2, [x1, #4]           // EINT_PEND gpa6: vol-up
+    dsb     sy
+.Lirq_eoi:
+    msr     S3_0_C12_C12_1, x0     // ICC_EOIR1_EL1
+    isb
+.Lirq_ret:
+    adrp    x1, __irq_stage
+    add     x1, x1, :lo12:__irq_stage
+    mrs     x2, mpidr_el1
+    ubfx    x2, x2, #8, #4
+    mov     x3, #7
+    str     x3, [x1, x2, lsl #3]
+    ldp     x2, x3, [sp, #16]
+    ldp     x0, x1, [sp], #32
+    eret
+
+.balign 16
+// Enter a process at EL0 (process.rs `spawn`): x0 = entry, x1 = SP_EL0, x2 = arc base → x28, x3 = arc mask → x27, x4..x6 = the process's x0..x2. Saves the kernel's callee-saved registers and SP in __el0_kctx; `.Lel0_leave` returns from this call with the exit value. Every other register — general and SIMD — is cleared so no kernel value leaks into the process. SPSR = EL0t with interrupts unmasked: the killswitch keeps preempting.
+.global ferros_el0_enter
+ferros_el0_enter:
+    msr     daifset, #2            // as in ferros_el0_resume
+    adrp    x9, __el0_kctx
+    add     x9, x9, :lo12:__el0_kctx
+    mrs     x10, mpidr_el1          // this core's slot: MPIDR Aff1 (husky: 0-8), 192 bytes each
+    ubfx    x10, x10, #8, #4
+    add     x9, x9, x10, lsl #7
+    add     x9, x9, x10, lsl #6
+    stp     x19, x20, [x9, #0]
+    stp     x21, x22, [x9, #16]
+    stp     x23, x24, [x9, #32]
+    stp     x25, x26, [x9, #48]
+    stp     x27, x28, [x9, #64]
+    stp     x29, x30, [x9, #80]
+    mov     x10, sp
+    str     x10, [x9, #96]
+    stp     d8, d9, [x9, #104]
+    stp     d10, d11, [x9, #120]
+    stp     d12, d13, [x9, #136]
+    stp     d14, d15, [x9, #152]
+    msr     elr_el2, x0
+    msr     sp_el0, x1
+    msr     spsr_el2, xzr
+    mov     x28, x2
+    mov     x27, x3
+    mov     x0, x4
+    mov     x1, x5
+    mov     x2, x6
+    mov     x3, xzr
+    mov     x4, xzr
+    mov     x5, xzr
+    mov     x6, xzr
+    mov     x7, xzr
+    mov     x8, xzr
+    mov     x9, xzr
+    mov     x10, xzr
+    mov     x11, xzr
+    mov     x12, xzr
+    mov     x13, xzr
+    mov     x14, xzr
+    mov     x15, xzr
+    mov     x16, xzr
+    mov     x17, xzr
+    mov     x18, xzr
+    mov     x19, xzr
+    mov     x20, xzr
+    mov     x21, xzr
+    mov     x22, xzr
+    mov     x23, xzr
+    mov     x24, xzr
+    mov     x25, xzr
+    mov     x26, x28               // fixed mode's address register starts at the arc base (SANDBOX.md, "Modes"); ring mode rewrites it before any use
+    mov     x29, xzr
+    mov     x30, xzr
+    movi    v0.16b, #0
+    movi    v1.16b, #0
+    movi    v2.16b, #0
+    movi    v3.16b, #0
+    movi    v4.16b, #0
+    movi    v5.16b, #0
+    movi    v6.16b, #0
+    movi    v7.16b, #0
+    movi    v8.16b, #0
+    movi    v9.16b, #0
+    movi    v10.16b, #0
+    movi    v11.16b, #0
+    movi    v12.16b, #0
+    movi    v13.16b, #0
+    movi    v14.16b, #0
+    movi    v15.16b, #0
+    movi    v16.16b, #0
+    movi    v17.16b, #0
+    movi    v18.16b, #0
+    movi    v19.16b, #0
+    movi    v20.16b, #0
+    movi    v21.16b, #0
+    movi    v22.16b, #0
+    movi    v23.16b, #0
+    movi    v24.16b, #0
+    movi    v25.16b, #0
+    movi    v26.16b, #0
+    movi    v27.16b, #0
+    movi    v28.16b, #0
+    movi    v29.16b, #0
+    movi    v30.16b, #0
+    movi    v31.16b, #0
+    eret
+
+.balign 16
+// Resume a parked process (process.rs `run_slice`): x0 = its saved frame (816 bytes, the .Lel0_sync layout: x0–x30, SP_EL0, ELR, SPSR, ESR, FAR, then v0–v31, FPCR, FPSR). Saves the kernel context like ferros_el0_enter, copies the frame onto the stack and erets through the common restore path.
+.global ferros_el0_resume
+ferros_el0_resume:
+    // IRQs masked from here to the eret (the eret restores the thread's own PSTATE). Without this, an interrupt taken between `msr elr_el2`/`msr spsr_el2` in .Lel0_restore and the eret overwrote both with the eret's own address and EL2h, and the eret then returned to itself at EL2 forever — a core parked on one instruction with interrupts open, no slice ticks, no traps (2026-10-23; with SGI kicks at kilohertz it happened within seconds of a drag). The trap-return path never had this: exception entry masks IRQs.
+    msr     daifset, #2
+    adrp    x9, __el0_kctx
+    add     x9, x9, :lo12:__el0_kctx
+    mrs     x10, mpidr_el1          // this core's slot: MPIDR Aff1 (husky: 0-8), 192 bytes each
+    ubfx    x10, x10, #8, #4
+    add     x9, x9, x10, lsl #7
+    add     x9, x9, x10, lsl #6
+    stp     x19, x20, [x9, #0]
+    stp     x21, x22, [x9, #16]
+    stp     x23, x24, [x9, #32]
+    stp     x25, x26, [x9, #48]
+    stp     x27, x28, [x9, #64]
+    stp     x29, x30, [x9, #80]
+    mov     x10, sp
+    str     x10, [x9, #96]
+    stp     d8, d9, [x9, #104]
+    stp     d10, d11, [x9, #120]
+    stp     d12, d13, [x9, #136]
+    stp     d14, d15, [x9, #152]
+    sub     sp, sp, #832
+    mov     x10, #0
+1:  ldr     x11, [x0, x10]
+    str     x11, [sp, x10]
+    add     x10, x10, #8
+    cmp     x10, #832
+    b.lo    1b
+    b       .Lel0_restore
+
+.balign 16
+// Synchronous exception from EL0 (a syscall or a fault): save the process's registers in a frame on SP_EL2, let process.rs decide (ferros_el0_trap: 0 = resume, 1 = the process ends).
+.Lel0_sync:
+    sub     sp, sp, #832
+    stp     x0, x1, [sp, #0]
+    stp     x2, x3, [sp, #16]
+    stp     x4, x5, [sp, #32]
+    stp     x6, x7, [sp, #48]
+    stp     x8, x9, [sp, #64]
+    stp     x10, x11, [sp, #80]
+    stp     x12, x13, [sp, #96]
+    stp     x14, x15, [sp, #112]
+    stp     x16, x17, [sp, #128]
+    stp     x18, x19, [sp, #144]
+    stp     x20, x21, [sp, #160]
+    stp     x22, x23, [sp, #176]
+    stp     x24, x25, [sp, #192]
+    stp     x26, x27, [sp, #208]
+    stp     x28, x29, [sp, #224]
+    str     x30, [sp, #240]
+    mrs     x9, sp_el0
+    str     x9, [sp, #248]
+    mrs     x9, elr_el2
+    str     x9, [sp, #256]
+    mrs     x9, spsr_el2
+    str     x9, [sp, #264]
+    mrs     x9, esr_el2
+    str     x9, [sp, #272]
+    mrs     x9, far_el2
+    str     x9, [sp, #280]
+    stp     q0, q1, [sp, #288]
+    stp     q2, q3, [sp, #320]
+    stp     q4, q5, [sp, #352]
+    stp     q6, q7, [sp, #384]
+    stp     q8, q9, [sp, #416]
+    stp     q10, q11, [sp, #448]
+    stp     q12, q13, [sp, #480]
+    stp     q14, q15, [sp, #512]
+    stp     q16, q17, [sp, #544]
+    stp     q18, q19, [sp, #576]
+    stp     q20, q21, [sp, #608]
+    stp     q22, q23, [sp, #640]
+    stp     q24, q25, [sp, #672]
+    stp     q26, q27, [sp, #704]
+    stp     q28, q29, [sp, #736]
+    stp     q30, q31, [sp, #768]
+    mrs     x9, fpcr
+    str     x9, [sp, #800]
+    mrs     x9, fpsr
+    str     x9, [sp, #808]
+    mrs     x9, tpidr_el0
+    str     x9, [sp, #816]
+    mov     x0, sp
+    bl      ferros_el0_trap
+    b       .Lel0_tail
+// The time slice ran out while a process was at EL0 (the timer tick in .Lirq, scratch registers already restored): save its frame the same way and let process.rs park it runnable.
+.Lel0_preempt:
+    sub     sp, sp, #832
+    stp     x0, x1, [sp, #0]
+    stp     x2, x3, [sp, #16]
+    stp     x4, x5, [sp, #32]
+    stp     x6, x7, [sp, #48]
+    stp     x8, x9, [sp, #64]
+    stp     x10, x11, [sp, #80]
+    stp     x12, x13, [sp, #96]
+    stp     x14, x15, [sp, #112]
+    stp     x16, x17, [sp, #128]
+    stp     x18, x19, [sp, #144]
+    stp     x20, x21, [sp, #160]
+    stp     x22, x23, [sp, #176]
+    stp     x24, x25, [sp, #192]
+    stp     x26, x27, [sp, #208]
+    stp     x28, x29, [sp, #224]
+    str     x30, [sp, #240]
+    mrs     x9, sp_el0
+    str     x9, [sp, #248]
+    mrs     x9, elr_el2
+    str     x9, [sp, #256]
+    mrs     x9, spsr_el2
+    str     x9, [sp, #264]
+    mrs     x9, esr_el2
+    str     x9, [sp, #272]
+    mrs     x9, far_el2
+    str     x9, [sp, #280]
+    stp     q0, q1, [sp, #288]
+    stp     q2, q3, [sp, #320]
+    stp     q4, q5, [sp, #352]
+    stp     q6, q7, [sp, #384]
+    stp     q8, q9, [sp, #416]
+    stp     q10, q11, [sp, #448]
+    stp     q12, q13, [sp, #480]
+    stp     q14, q15, [sp, #512]
+    stp     q16, q17, [sp, #544]
+    stp     q18, q19, [sp, #576]
+    stp     q20, q21, [sp, #608]
+    stp     q22, q23, [sp, #640]
+    stp     q24, q25, [sp, #672]
+    stp     q26, q27, [sp, #704]
+    stp     q28, q29, [sp, #736]
+    stp     q30, q31, [sp, #768]
+    mrs     x9, fpcr
+    str     x9, [sp, #800]
+    mrs     x9, fpsr
+    str     x9, [sp, #808]
+    mrs     x9, tpidr_el0
+    str     x9, [sp, #816]
+    mov     x0, sp
+    bl      ferros_el0_preempt
+.Lel0_tail:
+    cbnz    x0, .Lel0_leave
+.Lel0_restore:
+    ldr     x9, [sp, #256]
+    msr     elr_el2, x9
+    ldr     x9, [sp, #264]
+    msr     spsr_el2, x9
+    ldr     x9, [sp, #248]
+    msr     sp_el0, x9
+    ldr     x9, [sp, #800]
+    msr     fpcr, x9
+    ldr     x9, [sp, #808]
+    msr     fpsr, x9
+    ldr     x9, [sp, #816]
+    msr     tpidr_el0, x9
+    ldp     q0, q1, [sp, #288]
+    ldp     q2, q3, [sp, #320]
+    ldp     q4, q5, [sp, #352]
+    ldp     q6, q7, [sp, #384]
+    ldp     q8, q9, [sp, #416]
+    ldp     q10, q11, [sp, #448]
+    ldp     q12, q13, [sp, #480]
+    ldp     q14, q15, [sp, #512]
+    ldp     q16, q17, [sp, #544]
+    ldp     q18, q19, [sp, #576]
+    ldp     q20, q21, [sp, #608]
+    ldp     q22, q23, [sp, #640]
+    ldp     q24, q25, [sp, #672]
+    ldp     q26, q27, [sp, #704]
+    ldp     q28, q29, [sp, #736]
+    ldp     q30, q31, [sp, #768]
+    ldp     x0, x1, [sp, #0]
+    ldp     x2, x3, [sp, #16]
+    ldp     x4, x5, [sp, #32]
+    ldp     x6, x7, [sp, #48]
+    ldp     x8, x9, [sp, #64]
+    ldp     x10, x11, [sp, #80]
+    ldp     x12, x13, [sp, #96]
+    ldp     x14, x15, [sp, #112]
+    ldp     x16, x17, [sp, #128]
+    ldp     x18, x19, [sp, #144]
+    ldp     x20, x21, [sp, #160]
+    ldp     x22, x23, [sp, #176]
+    ldp     x24, x25, [sp, #192]
+    ldp     x26, x27, [sp, #208]
+    ldp     x28, x29, [sp, #224]
+    ldr     x30, [sp, #240]
+    add     sp, sp, #832
+    eret
+// The process ended: return from ferros_el0_enter with its x0 (the exit value), kernel registers and SP restored.
+.Lel0_leave:
+    ldr     x0, [sp, #0]
+    adrp    x9, __el0_kctx
+    add     x9, x9, :lo12:__el0_kctx
+    mrs     x10, mpidr_el1          // this core's slot: MPIDR Aff1 (husky: 0-8), 192 bytes each
+    ubfx    x10, x10, #8, #4
+    add     x9, x9, x10, lsl #7
+    add     x9, x9, x10, lsl #6
+    ldp     x19, x20, [x9, #0]
+    ldp     x21, x22, [x9, #16]
+    ldp     x23, x24, [x9, #32]
+    ldp     x25, x26, [x9, #48]
+    ldp     x27, x28, [x9, #64]
+    ldp     x29, x30, [x9, #80]
+    ldr     x10, [x9, #96]
+    mov     sp, x10
+    ldp     d8, d9, [x9, #104]
+    ldp     d10, d11, [x9, #120]
+    ldp     d12, d13, [x9, #136]
+    ldp     d14, d15, [x9, #152]
+    // Back in the kernel from exception context: taking the EL0 exception masked IRQs (PSTATE.I), and `ret` doesn't restore them. Left masked, the killswitch's key interrupts are never taken again — every boot lost it the moment `init` ran (seen 2026-10-15: DAIF G#3C0 in the service loop).
+    msr     daifclr, #2
+    ret
+
+.balign 16
+// Synchronous abort: increment count, advance ELR past faulting instruction, eret.
+.Lexc_recover:
+    stp     x0, x1, [sp, #-16]!
+    adrp    x0, __exception_count
+    add     x0, x0, :lo12:__exception_count
+    ldr     x1, [x0]
+    add     x1, x1, #1
+    str     x1, [x0]
+    // Fault sink (shim path): if __exc_sink is armed (a ramoops result block), record the FIRST sync fault into the block's hardcoded print slots — ELR@+0xA0, FAR@+0xA8 (the 16-byte hexdump), ESR@+0x20 (the r[4] byte fields), count@+0x28 (r[5]) — stamp the magic, and warm-reset via PSCI so DRAM survives and the next Linux boot prints it. Skipping the faulting instruction (the default below) only produces garbage state, so on the shim path a fault is terminal by design. Cold/m1 builds leave the sink at 0 and keep the skip-and-count behaviour.
+    stp     x2, x3, [sp, #-16]!
+    // A fault while a panic's screen is drawn or held (glass.rs; `__glass_core` set): its report is already in the block, so the reset comes at once.
+    // Skipping the faulting instruction (below) would run the screen on with garbage, and the sink's guard on +G#A0 sends every fault there once a report or the vault's boot result has written that slot.
+    adrp    x0, __glass_core
+    add     x0, x0, :lo12:__glass_core
+    ldr     x0, [x0]
+    cbnz    x0, .Lexc_glass_reset
+    adrp    x0, __exc_sink
+    add     x0, x0, :lo12:__exc_sink
+    ldr     x0, [x0]
+    cbz     x0, .Lexc_nosink
+    ldr     x1, [x0, #0xA0]
+    cbnz    x1, .Lexc_nosink
+    mrs     x1, CurrentEL
+    lsr     x1, x1, #2
+    cmp     x1, #2
+    b.eq    .Lexc_sink_el2
+    mrs     x1, elr_el1
+    mrs     x2, far_el1
+    mrs     x3, esr_el1
+    b       .Lexc_sink_store
+.Lexc_sink_el2:
+    mrs     x1, elr_el2
+    mrs     x2, far_el2
+    mrs     x3, esr_el2
+.Lexc_sink_store:
+    str     x1, [x0, #0xA0]
+    str     x2, [x0, #0xA8]
+    str     x3, [x0, #0x20]
+    // The fault's own record for the next boot's flash log (platform.rs FAULT_RECORD, G#1400 on): ELR, FAR and ESR, its magic "FeFault0" below once the block's is in; the words above are shared with the vault's boot report.
+    str     x1, [x0, #0x1408]
+    str     x2, [x0, #0x1410]
+    str     x3, [x0, #0x1418]
+    adrp    x1, __exception_count
+    add     x1, x1, :lo12:__exception_count
+    ldr     x1, [x1]
+    str     x1, [x0, #0x28]
+    movz    x1, #0x6546
+    movk    x1, #0x6F52, lsl #16
+    movk    x1, #0x6655, lsl #32
+    movk    x1, #0x3153, lsl #48
+    str     x1, [x0]
+    movz    x1, #0x6546
+    movk    x1, #0x6146, lsl #16
+    movk    x1, #0x6C75, lsl #32
+    movk    x1, #0x3074, lsl #48
+    str     x1, [x0, #0x1400]
+    dc      cvac, x0
+    add     x1, x0, #0x20
+    dc      cvac, x1
+    add     x1, x0, #0xA0
+    dc      cvac, x1
+    add     x1, x0, #0x1000
+    add     x1, x1, #0x400
+    dc      cvac, x1
+    dsb     sy
+    mov     w0, #0x0009
+    movk    w0, #0x8400, lsl #16
+    smc     #0
+.Lexc_nosink:
+    ldp     x2, x3, [sp], #16
+    mrs     x1, CurrentEL
+    lsr     x1, x1, #2
+    cmp     x1, #2
+    b.eq    .Lexc_el2
+    mrs     x0, elr_el1
+    add     x0, x0, #4
+    msr     elr_el1, x0
+    b       .Lexc_ret
+.Lexc_el2:
+    mrs     x0, elr_el2
+    add     x0, x0, #4
+    msr     elr_el2, x0
+.Lexc_ret:
+    ldp     x0, x1, [sp], #16
+    eret
+// PSCI SYSTEM_RESET, warm: DRAM and the panic's report survive.
+.Lexc_glass_reset:
+    mov     w0, #0x0009
+    movk    w0, #0x8400, lsl #16
+    smc     #0
+    b       .Lexc_glass_reset
+
+// SError (asynchronous): increment count, do NOT advance ELR (fault is async), just eret — the exception entry consumed the pending SError.
+.Lexc_serror:
+    stp     x0, x1, [sp, #-16]!
+    adrp    x0, __exception_count
+    add     x0, x0, :lo12:__exception_count
+    ldr     x1, [x0]
+    add     x1, x1, #1
+    str     x1, [x0]
+    ldp     x0, x1, [sp], #16
+    eret
+"#);
+
+// ---------------------------------------------------------------------------
+// Statics
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+static mut __exception_count: u64 = 0;
+/// M1 has no processes yet; the shared vector table still names the EL0 trap handler, so a stand-in ends anything that could ever reach it.
+#[cfg(not(feature = "pixel8"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn ferros_el0_trap(_frame: *mut u64) -> u64 {
+    1
+}
+#[cfg(not(feature = "pixel8"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn ferros_el0_preempt(_frame: *mut u64) -> u64 {
+    1
+}
+/// M1 has no profiler; `.Lirq_prof` still names the tick handler, and a tick (never armed here) would only need the timer stopped.
+#[cfg(not(feature = "pixel8"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn ferros_prof_tick(_elr: u64, _spsr: u64, _fp: u64, _lr: u64) {
+    unsafe { core::arch::asm!("msr S3_4_C14_C3_1, xzr", "isb") };
+}
+
+/// Set by `.Lirq_power` when the power key is pressed.
+#[unsafe(no_mangle)]
+pub static mut __power_pressed: u64 = 0;
+/// Kernel context saved by `ferros_el0_enter` (x19..x30, SP) and restored when the process ends.
+#[unsafe(no_mangle)]
+/// The kernel's callee-saved registers, SP and d8-d15 around a process run, per core (24 words = 192 bytes a slot, MPIDR Aff1 picks it): two cores enter processes at once.
+pub static mut __el0_kctx: [[u64; 24]; 16] = [[0; 24]; 16];
+/// Whether the cold boot armed the UFS power-on write protect: 0 not attempted, 1 armed, 2 the device refused (DIAG UFS_POWER_ON_WP).
+pub static UFS_WP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The flag as the boot found it (DIAG UFS_POWER_ON_WP_BEFORE): 0 clear, 1 set — it survived the reset — 2 unreadable.
+pub static UFS_WP_BEFORE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Interrupts taken that were not the killswitch firing (key edges with one key up, spurious, stray lines switched off): `.Lirq`.
+#[unsafe(no_mangle)]
+pub static mut __irq_count: u64 = 0;
+/// Per core (MPIDR Aff1), where its IRQ handler last was: 1 entered, 2 past the chord check, 3 the dead loop (both volume keys read pressed and SYSTEM_OFF returned), 4 a device line masked and marked pending, 5 after EOI, 6 leaving for the preempt path, 7 returned to the interrupted code. DIAG IRQ_STAGE_Ck; a core stuck in the handler shows where (2026-10-23).
+#[unsafe(no_mangle)]
+pub static mut __irq_stage: [u64; 16] = [0; 16];
+/// Per core, what SGI 2 (`diag core <k>`, platform::stall_check) found when it interrupted it: ELR, SPSR, SP (the handler's), SP_EL0, x0-x3 as they were, then x29 and x30 — a stuck core's exact position and its caller (2026-10-23; x29/x30 2026-11-08). Sixteen words a core (`.Lirq_dump` steps by 128 bytes), the last six unused.
+#[unsafe(no_mangle)]
+pub static mut __core_dump: [[u64; 16]; 16] = [[0; 16]; 16];
+#[unsafe(no_mangle)]
+static mut __boot_el: u64 = 0;
+/// Fault sink for the sync exception handler: 0 = skip-and-count (cold/m1 boots); nonzero = physical address of a ramoops result block that the FIRST fault is recorded into before a PSCI warm reset (shim path, see `.Lexc_recover`).
+#[unsafe(no_mangle)]
+pub static mut __exc_sink: u64 = 0;
+/// The core drawing or holding a panic's screen, plus one; 0 none (glass.rs `claim`, platform.rs `report_panic`).
+/// The fault vector reads it as `__glass_core`: a fault while it is set resets at once (`.Lexc_glass_reset`).
+#[unsafe(export_name = "__glass_core")]
+pub static GLASS_CORE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[unsafe(no_mangle)]
+static mut __boot_sctlr: u64 = 0;
+
+fn exception_count() -> u64 {
+    unsafe { core::ptr::read_volatile(&raw const __exception_count) }
+}
+
+/// Exception level the entry asm found at boot (2 = bare EL2, as both husky paths need).
+#[cfg_attr(not(feature = "pixel8"), allow(dead_code))]
+fn boot_el() -> u64 {
+    unsafe { core::ptr::read_volatile(&raw const __boot_el) }
+}
+
+/// The SCTLR the entry asm found at boot (0 when the MMU was already off and nothing was saved): whether the bootloader handed over with its MMU and caches on.
+#[cfg_attr(not(feature = "pixel8"), allow(dead_code))]
+fn boot_sctlr() -> u64 {
+    unsafe { core::ptr::read_volatile(&raw const __boot_sctlr) }
+}
+
+// ---------------------------------------------------------------------------
+// M1 kernel entry
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "m1")]
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
+    // Init DRAM heap.
+    unsafe extern "C" { static __stack_top: u8; }
+    let stack_top = unsafe { &__stack_top as *const u8 as usize };
+    let heap_base = (stack_top + 0xFFF) & !0xFFF;
+    HEAP_BASE.store(heap_base, Ordering::SeqCst);
+
+    // Parse DTB for simplefb — m1n1 always provides one.
+    let fb_cfg = if dtb_addr != 0 {
+        unsafe { ferros_hal::dtb::Dtb::from_ptr(dtb_addr as *const u8) }
+            .and_then(|dtb| dtb.parse_simplefb())
+    } else {
+        None
+    };
+
+    // Set up framebuffer console from DTB simplefb, or spin if not found. M1 DCP uses 10:10:10:2 pixel format (R10:G10:B10:X2, little-endian u32). White = G#FFFFFFFC, Black = G#00000000.
+    let mut con = if let Some(cfg) = fb_cfg {
+        unsafe {
+            ferros_hal::console::Console::new(
+                cfg.phys_base as *mut u32,
+                cfg.width as usize,
+                cfg.height as usize,
+                (cfg.stride / 4) as usize, // stride in pixels
+                0xFFFF_FFFC,               // white text (10:10:10:2)
+                0x0000_0000,               // black background
+                (32, 32, 32, 32),          // margins
+            )
+        }
+    } else {
+        // No framebuffer — spin. Connect serial via m1n1 proxy to debug.
+        loop { core::hint::spin_loop(); }
+    };
+
+    con.clear();
+    con.puts("ferros on M1\n");
+    con.puts("============\n\n");
+    // --- USB init --- TODO: read actual addresses from ADT. These are placeholders. Boot into m1n1 proxy and run m1n1-boot.py to dump real values. Probe DWC3 before full init — check if controller is powered
+    let dwc3_base: usize = 0x3_8228_0000;
+    con.puts("DWC3 probe:    ");
+    let snpsid = unsafe { ferros_hal::mmio::read32(dwc3_base + 0xC120) };
+    con.put_hex32(snpsid);
+    con.puts("\n");
+
+    con.puts("GCTL:          ");
+    let gctl = unsafe { ferros_hal::mmio::read32(dwc3_base + 0xC110) };
+    con.put_hex32(gctl);
+    con.puts("\n");
+
+    con.puts("DSTS:          ");
+    let dsts = unsafe { ferros_hal::mmio::read32(dwc3_base + 0xC70C) };
+    con.put_hex32(dsts);
+    con.puts("\n");
+
+    let usb_addrs = ferros_hal_m1::usb::M1UsbAddrs {
+        dwc3:      0x3_8228_0000,
+        pipe:      0x3_82A8_4000,
+        atcphy:    0x3_82A9_0000,
+        dart_base0: 0x3_82F8_0000,
+        dart_base1: 0x3_82F0_0000,
+        dart_sid:  0,
+    };
+
+    // DART page tables: use fixed addresses after the heap base. __stack_top is at ~kernel+0x23000. Heap starts there. We reserve the first 64KB of heap for DART page tables. L1 at heap+0, L2 at heap+16KB. Then bump HEAP_POS past them.
+    con.puts("DART alloc:    ");
+    let l1_base = (heap_base + 0x3FFF) & !0x3FFF; // 16KB align
+    let l2_base = l1_base + 16384;
+    // Bump heap position past the page tables
+    HEAP_POS.store(l2_base + 16384 - heap_base, Ordering::SeqCst);
+    con.puts("OK\n");
+
+    con.puts("DART tables:   ");
+    let min_page = ferros_hal_m1::usb::dma_buffer_min_page();
+    let iova_base: usize = 0xF000_0000;
+    let l1_idx = (iova_base >> 25) & 0x1FFF;
+    unsafe {
+        // Zero tables
+        let l1 = l1_base as *mut u64;
+        let l2 = l2_base as *mut u64;
+        for i in 0..2048 { core::ptr::write_volatile(l1.add(i), 0); }
+        for i in 0..2048 { core::ptr::write_volatile(l2.add(i), 0); }
+        // L1 entry → L2
+        let l1_entry = ((l2_base as u64) >> 14) << 14 | (0xFFF_u64 << 40) | (1 << 1) | 1;
+        core::ptr::write_volatile(l1.add(l1_idx), l1_entry);
+        // L2 entries → buffer pages
+        for i in 0..32usize {
+            let phys = min_page + i * 16384;
+            let iova = iova_base + i * 16384;
+            let l2_idx = (iova >> 14) & 0x7FF;
+            let pte = ((phys as u64) >> 14) << 14 | (0xFFF_u64 << 40) | (1 << 1) | 1;
+            core::ptr::write_volatile(l2.add(l2_idx), pte);
+        }
+        core::arch::asm!("dsb sy");
+    }
+    con.puts("OK\n");
+
+    con.puts("DART hw:       ");
+    let ttbr_val = (1u32 << 31) | ((l1_base >> 12) as u32 & 0x7FFF_FFFF);
+    unsafe {
+        for dart_base in [usb_addrs.dart_base0, usb_addrs.dart_base1] {
+            ferros_hal::mmio::write32(dart_base + 0xFC, 0xFFFF); // enable streams
+            for s in 0..16u32 {
+                let off = 0x200 + (s as usize) * 16;
+                ferros_hal::mmio::write32(dart_base + off, ttbr_val);
+                for t in 1..4u32 { ferros_hal::mmio::write32(dart_base + off + (t as usize) * 4, 0); }
+            }
+            for s in 0..16u32 {
+                ferros_hal::mmio::write32(dart_base + 0x100 + (s as usize) * 4, 0x80);
+            }
+            // TLB invalidate
+            ferros_hal::mmio::write32(dart_base + 0x34, 0xFFFF);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            ferros_hal::mmio::write32(dart_base + 0x20, 1 << 20);
+            for _ in 0..100_000u32 {
+                if ferros_hal::mmio::read32(dart_base + 0x20) & (1 << 2) == 0 { break; }
+            }
+        }
+    }
+    let dma_offset: i64 = iova_base as i64 - min_page as i64;
+    con.puts("OK\n");
+
+    con.puts("USB init:      ");
+    match ferros_hal_m1::usb::M1Usb::init(&usb_addrs, dma_offset) {
+        Some(mut usb) => {
+            con.puts("OK\n");
+            // Post-init register dump
+            unsafe {
+                con.puts("DCTL:          ");
+                con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC704));
+                con.puts("\n");
+                con.puts("DALEPENA:      ");
+                con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC720));
+                con.puts("\n");
+                con.puts("GUSB2PHYCFG:   ");
+                con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC200));
+                con.puts("\n");
+                con.puts("GUSB3PIPECTL:  ");
+                con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC2C0));
+                con.puts("\n");
+                con.puts("GEVNTCOUNT:    ");
+                con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC40C));
+                con.puts("\n");
+                con.puts("DART ERR:      ");
+                con.put_hex32(ferros_hal::mmio::read32(usb_addrs.dart_base0 + 0x40));
+                con.puts("\n");
+                // Event buffer DMA address
+                con.puts("GEVNTADR:      ");
+                con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC404));
+                con.puts("_");
+                con.put_hex32(ferros_hal::mmio::read32(dwc3_base + 0xC400));
+                con.puts("\n");
+            }
+            con.puts("DART cfg:      ");
+            con.put_hex32(usb.dart_config);
+            con.puts("\n");
+            con.puts("DART TCR b/a:  ");
+            con.put_hex32(usb.dart_tcr_before);
+            con.puts(" -> ");
+            con.put_hex32(usb.dart_tcr_after);
+            con.puts("\n");
+            con.puts("DART TTBR b/a: ");
+            con.put_hex32(usb.dart_ttbr_before);
+            con.puts(" -> ");
+            con.put_hex32(usb.dart_ttbr_after);
+            con.puts("\n");
+            con.puts("dma_offset:    ");
+            con.put_hex32((usb.dma_offset_val >> 32) as u32);
+            con.puts("_");
+            con.put_hex32(usb.dma_offset_val as u32);
+            con.puts("\n");
+            // Read back L1 entry for IOVA 0xF0000000 L1 index = (0xF0000000 >> 25) & 0x1FFF = 0x780 TTBR after has L1 phys = (ttbr & 0x7FFFFFFF) << 12
+            let l1_phys = ((usb.dart_ttbr_after & 0x7FFF_FFFF) as usize) << 12;
+            con.puts("\nL1 phys:       ");
+            con.put_hex32((usb.l1_phys >> 32) as u32);
+            con.puts("_");
+            con.put_hex32(usb.l1_phys as u32);
+            con.puts("\nmin_buf_page:  ");
+            con.put_hex32((usb.min_buf_page >> 32) as u32);
+            con.puts("_");
+            con.put_hex32(usb.min_buf_page as u32);
+            // L1 readback immediately after dart.map() (inside USB init)
+            con.puts("\nL1 immed:      ");
+            con.put_hex32((usb.l1_readback >> 32) as u32);
+            con.puts("_");
+            con.put_hex32(usb.l1_readback as u32);
+            // Read back L1 entry now (from kernel_main)
+            let l1_addr = usb.l1_phys as usize;
+            if l1_addr != 0 {
+                let l1_entry_addr = l1_addr + 0x780 * 8;
+                let l1_lo = unsafe { core::ptr::read_volatile(l1_entry_addr as *const u32) };
+                let l1_hi = unsafe { core::ptr::read_volatile((l1_entry_addr + 4) as *const u32) };
+                con.puts("\nL1 now:        ");
+                con.put_hex32(l1_hi);
+                con.puts("_");
+                con.put_hex32(l1_lo);
+            }
+            con.puts("\nSETUP buf DMA: ");
+            con.put_hex32((usb.setup_buf_dma >> 32) as u32);
+            con.puts("_");
+            con.put_hex32(usb.setup_buf_dma as u32);
+            con.puts("\nSETUP trb DMA: ");
+            con.put_hex32((usb.setup_trb_dma >> 32) as u32);
+            con.puts("_");
+            con.put_hex32(usb.setup_trb_dma as u32);
+            con.puts("\n");
+            con.puts("ep_cmd ok=");
+            con.put_hex32(usb.ep_cmd_ok);
+            con.puts(" fail=");
+            con.put_hex32(usb.ep_cmd_fail);
+            con.puts("\n");
+            if usb.ep_cmd_fail > 0 {
+                con.puts("last_cmd:      ");
+                con.put_hex32(usb.last_cmd_status);
+                con.puts("\n");
+            }
+            con.puts("Waiting for host...\n");
+
+            // Run event loop with diagnostics
+            use ferros_hal::UsbBulk;
+            let mut loop_count = 0u32;
+            loop {
+                match usb.poll_event() {
+                    ferros_hal::UsbEvent::None => {
+                        loop_count += 1;
+                        if loop_count == 10_000_000 {
+                            con.puts("\n--- 10M polls ---\n");
+                            con.puts("evt_count:     ");
+                            con.put_hex32(usb.evt_count);
+                            con.puts("\n");
+                            con.puts("setup_count:   ");
+                            con.put_hex32(usb.setup_count);
+                            con.puts("\n");
+                            con.puts("GEVNTCOUNT:    ");
+                            con.put_hex32(usb.read_reg(0xC40C));
+                            con.puts("\n");
+                            con.puts("DSTS:          ");
+                            con.put_hex32(usb.read_reg(0xC70C));
+                            con.puts("\n");
+                            con.puts("DCTL:          ");
+                            con.put_hex32(usb.read_reg(0xC704));
+                            con.puts("\n");
+                            // Dump raw events
+                            con.puts("raw evts:      ");
+                            for i in 0..8 {
+                                con.put_hex32(usb.raw_evts[i]);
+                                con.puts(" ");
+                            }
+                            con.puts("\n");
+                            // Read DART error addr
+                            con.puts("DART ERR_ADDR: ");
+                            unsafe {
+                                con.put_hex32(ferros_hal::mmio::read32(usb_addrs.dart_base0 + 0x54));
+                                con.puts("_");
+                                con.put_hex32(ferros_hal::mmio::read32(usb_addrs.dart_base0 + 0x50));
+                            }
+                            con.puts("\n");
+                        }
+                        for _ in 0..64u32 { core::hint::spin_loop(); }
+                    }
+                    ferros_hal::UsbEvent::Reset => {
+                        con.puts("  USB reset\n");
+                        usb.handle_reset();
+                    }
+                    ferros_hal::UsbEvent::ConnectDone { speed } => {
+                        con.puts("  connected spd=");
+                        con.put_hex32(speed);
+                        con.puts("\n");
+                        usb.handle_connect_done();
+                    }
+                    ferros_hal::UsbEvent::Disconnect => {
+                        con.puts("  disconnected\n");
+                        usb.handle_disconnect();
+                    }
+                    ferros_hal::UsbEvent::Ep0Setup { request } => {
+                        con.puts("  SETUP: ");
+                        for b in &request {
+                            con.put_hex32(*b as u32);
+                            con.puts(" ");
+                        }
+                        con.puts("\n");
+                        if !usb.handle_setup(&request) {
+                            usb.ep0_stall();
+                        }
+                    }
+                    ferros_hal::UsbEvent::TransferComplete { ep } => {
+                        con.puts("  XferDone ep=");
+                        con.put_hex32(ep as u32);
+                        con.puts("\n");
+                    }
+                    ferros_hal::UsbEvent::TransferNotReady { ep } => {
+                        con.puts("  XferNRdy ep=");
+                        con.put_hex32(ep as u32);
+                        con.puts("\n");
+                    }
+                }
+            }
+        }
+        None => {
+            con.puts("FAIL\n");
+            con.puts("USB init failed. Halted.\n");
+        }
+    }
+
+    loop { core::hint::spin_loop(); }
+}
+
+/// M1 USB event loop with PT command dispatch.
+#[cfg(feature = "m1")]
+fn m1_usb_event_loop(
+    usb: &mut ferros_hal_m1::usb::M1Usb,
+    con: &mut ferros_hal::console::Console,
+) {
+    use ferros_hal::{UsbBulk, UsbEvent};
+    use ferros_pt::{packet, transfer::InboundTransfer};
+
+    // PT state
+    let mut pt_data_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut pt_bitmap_buf: alloc::vec::Vec<ferros_pt::BitmapWord> = alloc::vec::Vec::new();
+    let mut pt_inbound: Option<InboundTransfer<'_>> = None;
+    let mut pt_seq_width: usize = 0;
+    let mut pt_out_data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+
+    // Cap hashes
+    let cap_diag = ferros_pt::command::dev_cap(ferros_pt::command::caps::DIAG);
+    let cap_reload = ferros_pt::command::dev_cap(ferros_pt::command::caps::RELOAD);
+    let cap_reboot = ferros_pt::command::dev_cap(ferros_pt::command::caps::REBOOT);
+
+    // Staging area for hot-reload (use high DRAM, well above kernel)
+    const RELOAD_STAGE: usize = 0x8_2000_0000;
+    let mut reload_size: usize = 0;
+
+    // Boot log buffer for DIAG command
+    let mut boot_log: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    boot_log.extend_from_slice(b"ferros on M1\nUSB: connected\n");
+
+    loop {
+        match usb.poll_event() {
+            UsbEvent::None => {
+                // Pump outbound data if pending
+                if !pt_out_data.is_empty() && usb.bulk_in_is_idle() {
+                    let len = pt_out_data.len().min(512);
+                    let chunk: alloc::vec::Vec<u8> = pt_out_data.drain(..len).collect();
+                    usb.bulk_in_send(&chunk);
+                }
+                for _ in 0..64u32 { core::hint::spin_loop(); }
+            }
+            UsbEvent::Reset => {
+                con.puts("  USB reset\n");
+                usb.handle_reset();
+                pt_inbound = None;
+                pt_seq_width = 0;
+                pt_out_data.clear();
+            }
+            UsbEvent::ConnectDone { speed } => {
+                con.puts("  connected spd=");
+                con.put_hex32(speed);
+                con.puts("\n");
+                usb.handle_connect_done();
+                usb.ep0_start_setup();
+                usb.bulk_out_arm();
+            }
+            UsbEvent::Disconnect => {
+                con.puts("  disconnected\n");
+                usb.handle_disconnect();
+                pt_inbound = None;
+                pt_seq_width = 0;
+                pt_out_data.clear();
+            }
+            UsbEvent::Ep0Setup { request } => {
+                if !usb.handle_setup(&request) {
+                    usb.ep0_stall();
+                }
+            }
+            UsbEvent::TransferComplete { ep } => {
+                if ep == 2 {
+                    // Bulk OUT — PT packet
+                    let mut tmp = [0u8; 512];
+                    let mut n = 0usize;
+                    if let Some(data) = usb.bulk_out_read() {
+                        n = data.len().min(512);
+                        tmp[..n].copy_from_slice(&data[..n]);
+                    }
+                    if n > 0 {
+                        if ferros_pt::is_data_packet(tmp[0]) {
+                            // DATA packet
+                            if let Some(ref mut xfer) = pt_inbound {
+                                if let Some((_sid, seq, hash, payload)) = packet::decode_data(&tmp[..n], pt_seq_width) {
+                                    xfer.handle_data(seq, &hash, payload);
+                                    if xfer.all_received() {
+                                        let mut complete_buf = [0u8; 512];
+                                        let clen = xfer.finish(&mut complete_buf);
+                                        if clen > 0 {
+                                            usb.bulk_in_send(&complete_buf[..clen]);
+                                        }
+                                        // Command dispatch
+                                        let payload = xfer.payload();
+                                        if let Some(cmd) = ferros_pt::command::parse(payload) {
+                                            if cmd.cap == cap_diag && cmd.op == ferros_pt::Op::Read {
+                                                con.puts("  CMD: DIAG\n");
+                                                pt_out_data.clear();
+                                                pt_out_data.extend_from_slice(&boot_log);
+                                            } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Write {
+                                                let data = cmd.params;
+                                                unsafe {
+                                                    core::ptr::copy_nonoverlapping(
+                                                        data.as_ptr(),
+                                                        (RELOAD_STAGE + reload_size) as *mut u8,
+                                                        data.len(),
+                                                    );
+                                                }
+                                                reload_size += data.len();
+                                                con.puts("  RELOAD +");
+                                                con.put_hex32(data.len() as u32);
+                                                con.puts(" total=");
+                                                con.put_hex32(reload_size as u32);
+                                                con.puts("\n");
+                                            } else if cmd.cap == cap_reload && cmd.op == ferros_pt::Op::Exec {
+                                                con.puts("  RELOAD EXEC ");
+                                                con.put_hex32(reload_size as u32);
+                                                con.puts(" bytes\n");
+                                                // TODO: verify + jump For now, just acknowledge
+                                            } else if cmd.cap == cap_reboot && cmd.op == ferros_pt::Op::Exec {
+                                                con.puts("  REBOOT\n");
+                                                // PSCI SYSTEM_RESET
+                                                unsafe {
+                                                    core::arch::asm!(
+                                                        "mov x0, #0x84000000",
+                                                        "movk x0, #0x0009, lsl #16",
+                                                        "hvc #0",
+                                                        options(noreturn)
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        pt_inbound = None;
+                                        pt_seq_width = 0;
+                                    }
+                                }
+                            }
+                        } else if ferros_pt::is_control_packet(tmp[0]) {
+                            // SPEC packet — start new inbound transfer
+                            if let Some(spec) = packet::Spec::decode(&tmp[..n]) {
+                                pt_seq_width = ferros_ledger::ewe::seq_width(spec.count);
+                                let bitmap_words = ferros_pt::transfer::bitmap_words(spec.count);
+                                pt_data_buf = alloc::vec![0u8; spec.total as usize];
+                                pt_bitmap_buf = alloc::vec![0u64; bitmap_words];
+                                // SAFETY: pt_data_buf and pt_bitmap_buf live as long as pt_inbound
+                                let xfer = unsafe {
+                                    InboundTransfer::new(
+                                        &spec,
+                                        core::slice::from_raw_parts_mut(pt_data_buf.as_mut_ptr(), pt_data_buf.len()),
+                                        core::slice::from_raw_parts_mut(pt_bitmap_buf.as_mut_ptr(), pt_bitmap_buf.len()),
+                                    )
+                                };
+                                if let Some(xfer) = xfer {
+                                    // Send SPEC ACK (seq=MAX means "ready")
+                                    let ack = packet::Ack { sid: spec.sid, seq: u64::MAX };
+                                    let mut ack_buf = [0u8; 64];
+                                    let ack_len = ack.encode(&mut ack_buf);
+                                    if ack_len > 0 {
+                                        usb.bulk_in_send(&ack_buf[..ack_len]);
+                                    }
+                                    pt_inbound = Some(xfer);
+                                    con.puts("  SPEC sid=");
+                                    con.put_hex32(spec.sid.0 as u32);
+                                    con.puts(" cnt=");
+                                    con.put_hex32(spec.count as u32);
+                                    con.puts("\n");
+                                }
+                            }
+                        }
+                    }
+                    usb.bulk_out_arm();
+                } else if ep == 3 {
+                    // Bulk IN complete — nothing to do, bulk_in_idle set by poll_event
+                }
+            }
+            UsbEvent::TransferNotReady { .. } => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pixel 8 / QCM6490 kernel entry
+// ---------------------------------------------------------------------------
+
+// Post-handoff entry: ferros was chainloaded by the Linux shim via cpu_soft_restart into the 0x92400000 carveout, MMU off at EL2, with the UFS link already alive.
+// This kernel_main replaces the cold-boot one for the shim-linked image; it must NOT run the ABL-state-dependent cold-boot setup (watchdog reuse, S2MPU/eUSB assumptions), so it dispatches straight to shim.
+/// eUSB2 PHY + USB link bring-up on Tensor G3. Faithful port of phy_exynos_eusb_initiate (tools/pixel8/phy-ref/phy-exynos-eusb.c), 19.2MHz / 4nm; bit positions from eusb-con-reg.h, link init from exynos-usb-blkcon.c. Re-runnable: the enumeration watchdog re-inits the PHY when the host never talks to us. Shared by the cold-boot path and the shim (post-handoff) USB path.
+#[cfg(feature = "pixel8")]
+pub(crate) fn pixel8_eusb_phy_init() {
+    const USBCON: usize = 0x1110_0000;
+    const EUSB_PHY: usize = 0x1111_0000;
+    unsafe {
+            // Delays on the generic timer, not a spin count: the old "~4000 spin iterations per us" turned the 3.56 ms these steps ask for into 230 ms of the press-to-ready time (measured 2026-10-22, `diag boot`), the core running far below the clock it assumed. The timer gives exactly what each step specifies whatever the CPU clock.
+            let udelay = |us: u32| {
+                let t0 = platform::cntpct();
+                let ticks = us as u64 * platform::cntfrq() / 1_000_000 + 1;
+                while platform::cntpct().wrapping_sub(t0) < ticks {
+                    core::hint::spin_loop();
+                }
+            };
+
+            // --- BLKCON link init (exynos_usbcon_init_link) --- LINKCTRL(G#04): disable qact autogating, force qact, bypass bus filter.
+            let mut reg = core::ptr::read_volatile((USBCON + 0x0004) as *const u32);
+            reg |= (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7); // dis_id0/bvalid/vbusvalid/linkgate_qact
+            reg &= !(1 << 8);                                  // force_qact = 0
+            core::ptr::write_volatile((USBCON + 0x0004) as *mut u32, reg);
+            reg |= 1 << 8;        // force_qact = 1
+            reg |= 0xF << 12;     // bus_filter_bypass = G#F
+            core::ptr::write_volatile((USBCON + 0x0004) as *mut u32, reg);
+
+            // LINK_CLKRST(G#0C): pulse link software reset.
+            reg = core::ptr::read_volatile((USBCON + 0x000C) as *const u32);
+            reg |= 1 << 0;
+            core::ptr::write_volatile((USBCON + 0x000C) as *mut u32, reg);
+            udelay(10);
+            reg &= !(1 << 0);
+            core::ptr::write_volatile((USBCON + 0x000C) as *mut u32, reg);
+
+            // UTMI_CTRL(G#10): force B-valid (b0), VBUS-valid (b1) and UTMI TX bit-stuff enable (b2), the live value under Linux (7). The link's own session detection is disabled above (dis_bvalid), so b0|b1 ARE the session the controller sees (exynos-usb-blkcon.c); this used to set b1|b2 and so never forced B-valid. Register parity with Linux, from diffing USBCON cold vs handoff — it was not the cause of the flaky cold enumeration (that was the EP0 status stage, ferros_hal usb.rs StatusInWait).
+            reg = core::ptr::read_volatile((USBCON + 0x0010) as *const u32);
+            reg |= (1 << 0) | (1 << 1) | (1 << 2);
+            core::ptr::write_volatile((USBCON + 0x0010) as *mut u32, reg);
+
+            // HSP_MISC(G#114): resistance-tune calibration chain = eUSB PHY only (sel_res_tune_mux b1:0 = 2, set_req_in2 b4 = 1, set_ack_in2/req_in1/ack_in1 b5/b6/b7 = 0), as exynos_usbcon_disable_pipe3_phy does when the USB3/DP combo PHY is down, which it always is here. ABL leaves 0 (Phy2 → Phy1); Linux, with the combo PHY up, uses 1.
+            reg = core::ptr::read_volatile((USBCON + 0x0114) as *const u32);
+            reg &= !(0x3 | (0xF << 4));
+            reg |= 2 | (1 << 4);
+            core::ptr::write_volatile((USBCON + 0x0114) as *mut u32, reg);
+
+            // --- PHY init (phy_exynos_eusb_initiate) ---
+            // 1. Hold PHY + UTMI port in reset, override-enabled. RST_CTRL(G#00): phy_reset b0, phy_reset_ovrd_en b1, utmi_port_reset b4, utmi_port_reset_ovrd_en b5.
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0000) as *const u32);
+            reg |= (1 << 0) | (1 << 1) | (1 << 4) | (1 << 5);
+            core::ptr::write_volatile((EUSB_PHY + 0x0000) as *mut u32, reg);
+
+            // 2. Strapping. CMN_CTRL(G#04): rptr_mode b10 = 1, ref_freq_sel b6:4 = 0 (19.2MHz).
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0004) as *const u32);
+            reg |= 1 << 10;
+            reg &= !(0x7 << 4);
+            core::ptr::write_volatile((EUSB_PHY + 0x0004) as *mut u32, reg);
+
+            // PLLCFG0(G#08): pll_fb_div b19:8 = 368, pll_cpbias_cntrl b6:0 = 0.
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0008) as *const u32);
+            reg &= !(0xFFF << 8);
+            reg |= 368 << 8;
+            reg &= !0x7F;
+            core::ptr::write_volatile((EUSB_PHY + 0x0008) as *mut u32, reg);
+
+            // PLLCFG1(G#0C): pll_ref_div b11:8 = 0.
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x000C) as *const u32);
+            reg &= !(0xF << 8);
+            core::ptr::write_volatile((EUSB_PHY + 0x000C) as *mut u32, reg);
+
+            // TXTUNE(G#14): fsls_vref_tune (b2:1) = 0, as phy_exynos_eusb_initiate does right before releasing IDDQ (it then applies the DT tune table; on husky the rest of TXTUNE already matches Linux's tuned value G#9030 — cold ABL leaves G#9034).
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0014) as *const u32);
+            reg &= !(0x3 << 1);
+            core::ptr::write_volatile((EUSB_PHY + 0x0014) as *mut u32, reg);
+
+            // 3. Clear analog IDDQ — TESTSE(G#20) test_iddq b6 = 0 — powers the PHY analog UP. (The step the old port missed.)
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0020) as *const u32);
+            reg &= !(1 << 6);
+            core::ptr::write_volatile((EUSB_PHY + 0x0020) as *mut u32, reg);
+
+            // Keep phy_enable(b0) = 0 during the power-up window.
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0004) as *const u32);
+            reg &= !(1 << 0);
+            core::ptr::write_volatile((EUSB_PHY + 0x0004) as *mut u32, reg);
+
+            udelay(10); // phy_reset held >=10us after test_iddq clear
+
+            // 6. Release phy_reset (b0=0); KEEP utmi_port_reset asserted.
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0000) as *const u32);
+            reg &= !(1 << 0);
+            core::ptr::write_volatile((EUSB_PHY + 0x0000) as *mut u32, reg);
+
+            udelay(10); // REXT calibration
+
+            // 7. Enable PHY. CMN_CTRL phy_enable(b0) = 1.
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0004) as *const u32);
+            reg |= 1 << 0;
+            core::ptr::write_volatile((EUSB_PHY + 0x0004) as *mut u32, reg);
+
+            udelay(1000); // REXT calibration
+            udelay(28);   // T4: analog+digital powered, utmi_clk toggles
+            udelay(2500); // T5: Port Reset (ESE1) transmit complete
+
+            // Release UTMI port reset (RST_CTRL b4=0, b5=0).
+            reg = core::ptr::read_volatile((EUSB_PHY + 0x0000) as *const u32);
+            reg &= !((1 << 4) | (1 << 5));
+            core::ptr::write_volatile((EUSB_PHY + 0x0000) as *mut u32, reg);
+    }
+}
+
+/// Whether this boot's first `usb` power-on has logged what it found (`pixel8_usb_path_restore`).
+#[cfg(feature = "pixel8")]
+static USB_PATH_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The USB path back to the state ABL leaves on a cold boot, before the eUSB2 PHY init (`pixel8_eusb_phy_init`), on every `usb` power-on (ptlink.rs).
+/// What it undoes is what Android's USB driver takes down when its USB goes idle and the jump finds as Android left it: `exynos_usbdrd_utmi_exit` puts the repeater in its disabled mode, isolates the PHY in the PMU and drops its clocks; the HSI0 domain's off takes the PHY's rails (exynos-pd.c); a bus suspend hands the PHY to the remote-wake block (HS ReWA); the DWC3 core runs with PHY suspend on.
+/// The jump of 2026-11-13 (b871) found the USB path so: the USB process never configured in 45 minutes, the host never saw a connect (resets 0, connects 0), the link in suspend (DSTS G#8E0009), with the TCPC attached and its switch closed; the boot path skips the repeater after a jump (2026-11-07), so nothing took it out of its disabled mode.
+/// The order is Android's own bring-up (`exynos_usbdrd_utmi_init`): the rails, the repeater out of its disabled mode and tuned, the PMU isolation off, the clocks requested; then the remote-wake blocks off and the DWC3's PHY suspend off; the link and the PHY follow (`pixel8_eusb_phy_init`).
+/// Each step reads first and writes only what differs from a cold boot, as measured on the Pro (2026-11-14, cold, enumerated): LDO_CTRL1 G#4F, L9M_CTRL G#E6, L19M_CTRL G#FC; repeater I2C_GLOBAL_CONFIG G#0 and the tune; PMU USB2 PHY control G#3; the USB Q-channels G#2; REWA_CTL G#0, U3REWA_CTRL G#0; GUSB2PHYCFG G#102400, GUSB3PIPECTL G#1001002.
+/// A cold boot only reads.
+/// What it found goes into the flash log on the boot's first power-on, and on any power-on that changed something, so the next jump that fails says which part was still Android's.
+#[cfg(feature = "pixel8")]
+pub(crate) fn pixel8_usb_path_restore() {
+    use crate::acpm::{MAIN, T_PMIC};
+    use crate::hsi2c::{read_byte, write_byte, HSI2C_11};
+    use core::fmt::Write;
+    const USBCON: usize = 0x1110_0000;
+    const EUSB_PHY: usize = 0x1111_0000;
+    const CMU_HSI0: usize = 0x1100_0000;
+    const DWC3: usize = 0x1121_0000;
+    // The PHY's isolation word in the PMU (zuma-usb.dtsi usbdrd_phy0: pmu_offset G#3EB0, pmu_mask bit 0; 1 = not isolated), reached only through EL3 (the EL3 poison rule).
+    const PMU_USB2_PHY: u64 = 0x1546_3EB0;
+    let rep_addr = ferros_hal::hsi2c::PIXEL8_EUSB_REPEATER_ADDR;
+    let rd = |a: usize| unsafe { core::ptr::read_volatile(a as *const u32) };
+    let wr = |a: usize, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v) };
+    let udelay = |us: u64| {
+        let t0 = platform::cntpct();
+        let ticks = us * platform::cntfrq() / 1_000_000 + 1;
+        while platform::cntpct().wrapping_sub(t0) < ticks {
+            core::hint::spin_loop();
+        }
+    };
+    let hx = |r: Result<u8, u32>| match r {
+        Ok(v) => alloc::format!("G#{v:X}"),
+        Err(e) => alloc::format!("error G#{e:X}"),
+    };
+    let mut seen = alloc::string::String::new();
+    let mut changed = alloc::string::String::new();
+
+    // The rails (zuma-common.dtsi usbdrd_phy0: vdd075 LDO8M, vdd12 LDO9M, vdd33 LDO19M, which is the repeater's vdd33 too), on the S2MPG14 over ACPM.
+    // Each enable field at 3, on in normal mode (`s2mpg14_of_map_mode`): LDO8M's in LDO_CTRL1 (G#44) bits 1-0, LDO9M's and LDO19M's in their control registers (G#33, G#3D) bits 7-6. Only the enable field is written: the voltage stays as set.
+    let mut rails_up = false;
+    for (name, reg, field) in [("L8M", 0x44u32, 0x03u8), ("L9M", 0x33, 0xC0), ("L19M", 0x3D, 0xC0)] {
+        let v = crate::acpm::read(MAIN, T_PMIC, reg);
+        let _ = write!(seen, " {name} {}", hx(v));
+        if v.is_ok_and(|v| v & field != field) {
+            let w = crate::acpm::update(MAIN, T_PMIC, reg, field, field);
+            let _ = write!(changed, " {name} on ({}, now {})", if w.is_ok() { "written" } else { "write refused" }, hx(crate::acpm::read(MAIN, T_PMIC, reg)));
+            rails_up = true;
+        }
+    }
+    // An LDO's enable time is 128 us (S2MPG14_ENABLE_TIME_LDO); the repeater then needs its own start before it answers.
+    if rails_up {
+        udelay(1 << 10);
+    }
+
+    // The repeater (eusb_repeater.c `eusb_repeater_power_on`): out of its disabled mode (I2C_GLOBAL_CONFIG G#B2, REG_DISABLE_P1 bit 6, which `eusb_repeater_power_off` sets when Android's USB goes idle), 3 ms, then the tune table.
+    // Through the kernel's HS-I2C master, which refuses a bus not left running (`hsi2c::up`) and bounds every wait: the TCPC on the same bus answers it after a jump (b871), where the boot's own repeater snapshot hung on 2026-11-07.
+    let rep = |reg: u8| read_byte(HSI2C_11, rep_addr, reg);
+    match rep(0xB0) {
+        Ok(3) => {
+            let cfg = rep(0xB2);
+            let _ = write!(seen, "; repeater cfg {}", hx(cfg));
+            if let Ok(c) = cfg {
+                if c & 0x40 != 0 {
+                    let w = write_byte(HSI2C_11, rep_addr, 0xB2, c & !0x40);
+                    udelay(1 << 12);
+                    let _ = write!(changed, " repeater out of its disabled mode ({}, now {})", if w.is_ok() { "written" } else { "write refused" }, hx(rep(0xB2)));
+                }
+            }
+            let tune: &[(u8, u8)] = if crate::board::akita() { &ferros_hal::hsi2c::AKITA_REPEATER_TUNE } else { &ferros_hal::hsi2c::PIXEL8_REPEATER_TUNE };
+            let (mut off, mut fixed) = (0u32, 0u32);
+            for &(reg, val) in tune {
+                if rep(reg) != Ok(val) {
+                    off += 1;
+                    if write_byte(HSI2C_11, rep_addr, reg, val).is_ok() && rep(reg) == Ok(val) {
+                        fixed += 1;
+                    }
+                }
+            }
+            let _ = write!(seen, " tune off A#{off}");
+            if off != 0 {
+                let _ = write!(changed, " repeater tune A#{fixed} of A#{off}");
+            }
+        }
+        // Not identified (a dead bus, a NACK): nothing written on a bus the PMIC chain shares.
+        other => {
+            let _ = write!(seen, "; repeater REV_ID {}: left alone", hx(other));
+        }
+    }
+
+    // The PHY's PMU isolation off (`exynos_usbdrd_utmi_phy_isol`, on = 0: the mask bit set).
+    let pmu = platform::priv_reg(PMU_USB2_PHY, false, 0) as u32;
+    let _ = write!(seen, "; pmu G#{pmu:X}");
+    if pmu & 1 == 0 {
+        let w = platform::priv_reg(PMU_USB2_PHY, true, pmu | 1);
+        let _ = write!(changed, " pmu isolation off (smc G#{w:X}, now G#{:X})", platform::priv_reg(PMU_USB2_PHY, false, 0) as u32);
+    }
+
+    // The clocks: the USB2 Q-channels in CMU_HSI0 (cmucal-sfr.c: EUSBPHY G#30A8, EUSBCTL G#30B8, SUBCTL G#30BC, LINK G#30C0) as ABL leaves them, ENABLE (bit 0) off and CLOCK_REQ (bit 1) on, the clock held; Android's clock disable gives them to the hardware's gating.
+    // The reference clock's mux (G#1004) and the PHY's gates (G#20D8 APB, G#20DC the 26 MHz reference, G#20A4 the link's bus clock) are read for the log only.
+    let _ = write!(seen, "; qch");
+    for q in [0x30A8usize, 0x30B8, 0x30BC, 0x30C0] {
+        let v = rd(CMU_HSI0 + q);
+        let _ = write!(seen, " G#{v:X}");
+        if v & 3 != 2 {
+            wr(CMU_HSI0 + q, (v & !3) | 2);
+            let _ = write!(changed, " qch G#{q:X} G#{v:X} -> G#{:X}", rd(CMU_HSI0 + q));
+        }
+    }
+    let _ = write!(seen, ", ref mux G#{:X} gates G#{:X} G#{:X} G#{:X}", rd(CMU_HSI0 + 0x1004), rd(CMU_HSI0 + 0x20D8), rd(CMU_HSI0 + 0x20DC), rd(CMU_HSI0 + 0x20A4));
+
+    // The remote-wake blocks off (exynos-usb-blkcon.c `exynos_usbcon_rewa_cancel`, `ready_rewa`, `exynos_usbcon_u3_rewa_disable`): with HS ReWA on (REWA_CTL G#50 bit 0) the PHY is held in retention for a bus suspend, Android's when its host suspended it, and the link never sees the line.
+    let (rewa, hsrewa, u3rewa) = (rd(USBCON + 0x50), rd(USBCON + 0x58), rd(USBCON + 0x70));
+    let _ = write!(seen, "; rewa G#{rewa:X} hsrewa G#{hsrewa:X} u3rewa G#{u3rewa:X}");
+    if rewa & 1 != 0 {
+        wr(USBCON + 0x50, rewa & !1);
+        // Its interrupts masked (HSREWA_INTR G#54: wakeup, event, timeout, wakeup request), as `ready_rewa` leaves them.
+        wr(USBCON + 0x54, rd(USBCON + 0x54) | 0x1111);
+        let _ = write!(changed, " rewa off (now G#{:X})", rd(USBCON + 0x50));
+    }
+    if u3rewa & 1 != 0 {
+        wr(USBCON + 0x70, u3rewa & !1);
+        let _ = write!(changed, " u3rewa off (now G#{:X})", rd(USBCON + 0x70));
+    }
+
+    // The DWC3's PHY suspend off (GUSB2PHYCFG G#C200 bit 6, GUSB3PIPECTL G#C2C0 bit 17), as ABL leaves it and as `dwc3_core_susphy_set(0)` does: Android's core runs with it on (no dis_u2_susphy_quirk in zuma-usb.dtsi), and the USB process's controller init keeps the global registers it finds.
+    let (gctl, u2, u3) = (rd(DWC3 + 0xC110), rd(DWC3 + 0xC200), rd(DWC3 + 0xC2C0));
+    let _ = write!(seen, "; dwc3 gctl G#{gctl:X} u2phy G#{u2:X} u3pipe G#{u3:X}");
+    if u2 & (1 << 6) != 0 {
+        wr(DWC3 + 0xC200, u2 & !(1 << 6));
+        let _ = write!(changed, " u2phy suspend off (now G#{:X})", rd(DWC3 + 0xC200));
+    }
+    if u3 & (1 << 17) != 0 {
+        wr(DWC3 + 0xC2C0, u3 & !(1 << 17));
+        let _ = write!(changed, " u3pipe suspend off (now G#{:X})", rd(DWC3 + 0xC2C0));
+    }
+
+    // The PHY as found, for the log (RST_CTRL, CMN_CTRL, TESTSE: Android's `phy_exynos_eusb_terminate` leaves phy_enable 0, phy_reset 1, test_iddq 1); the init after this one takes it from any of those.
+    let _ = write!(seen, "; phy G#{:X} G#{:X} G#{:X}", rd(EUSB_PHY), rd(EUSB_PHY + 4), rd(EUSB_PHY + 0x20));
+
+    let first = !USB_PATH_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed);
+    if first || !changed.is_empty() {
+        crate::flashlog::line(&alloc::format!("usb path{}: rails{seen}; changed:{}", if platform::jumped() { " after the jump" } else { "" }, if changed.is_empty() { " nothing" } else { &changed }));
+    }
+}
+
+#[cfg(all(feature = "pixel8", shim_handoff))]
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
+    // Killswitch before anything else, then the cache map.
+    killswitch::arm();
+    cachemap::enable();
+    // Init the DRAM bump heap (same as cold boot; __stack_top is inside the carveout for the shim link, so this stays in reserved DRAM).
+    unsafe extern "C" { static __stack_top: u8; }
+    let stack_top = unsafe { &__stack_top as *const u8 as usize };
+    let heap_base = (stack_top + 0xFFF) & !0xFFF;
+    unsafe { KERNEL_HEAP.add(heap_base, HEAP_SIZE) };
+    platform::enable_icache();
+
+    // Default: the USB service (PT over the inherited controller, disk live). FERROS_SHIM_ENTRY=vault builds the one-shot vault probe that reports and resets.
+    if option_env!("FERROS_SHIM_ENTRY") == Some("vault") {
+        shim::entry_vault(dtb_addr)
+    } else {
+        shim::entry_usb(dtb_addr)
+    }
+}
+
+#[cfg(all(feature = "pixel8", not(shim_handoff)))]
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
+    // FERROS_TEST_HANG=1 builds: stop here, before the watchdog is petted or the slot marked, as a broken build would. ABL's watchdog then resets the device, the slot's retries count down, and ABL should fall back to the other slot (the A/B fallback test, BOOT.md). Never in a build that ships.
+    if option_env!("FERROS_TEST_HANG") == Some("1") {
+        loop {
+            unsafe { core::arch::asm!("wfe") };
+        }
+    }
+    // The first word into the pstore ring (no heap, no cache map yet): a session that dies in its first steps (the jumps from Android, 2026-11-01) still shows it began. More marks follow through the early boot. Then whether this boot is the jump from Android, before anything starts a core (platform::start_core). Both were first written into the shim's kernel_main by mistake, so the jumps of 2026-11-02 started parked cores with PSCI.
+    platform::pstore(b"\nferros: entry\n");
+    // The board first (board.rs): husky's high RAM is not there on akita, and the next line reads it on husky.
+    board::detect(dtb_addr);
+    platform::pstore(if board::akita() { b"ferros: board akita\n" as &[u8] } else { b"ferros: board husky\n" });
+    // akita's ABL leaves its splash at G#FAC0_0000, outside the regions the display engine's fence lets it read (s2mpu::fence_dpu: display-fb and display-phases, one GiB lower): fenced at the service's start, every scan-out read of it was refused and the panel went black a few frames into the boot (2026-11-06). So akita draws into ferros's own framebuffer from the first adoption (the layer re-pointed at display-fb; translation is off on a cold boot).
+    if board::akita() {
+        display::use_own_fb(true);
+    }
+    board::probe(1);
+    platform::pstore_prev_handoff();
+    platform::mark_trail(0);
+    platform::detect_jump(dtb_addr);
+    platform::pstore(if platform::from_android() {
+        b"ferros: started by the jump from Android\n" as &[u8]
+    } else if platform::jumped() && dtb_addr & 1 == 1 {
+        b"ferros: a reload in a session the jump from Android began\n"
+    } else if platform::jumped() {
+        b"ferros: started by ferros's own restart\n"
+    } else {
+        b"ferros: not a jump\n"
+    });
+    // Killswitch before anything else, then the cache map.
+    killswitch::arm();
+    platform::pstore(b"ferros: killswitch armed\n");
+    // Boot timing starts here: everything after this is ferros's own time (`diag boot`).
+    checklist::ENTRY.store(platform::cntpct(), core::sync::atomic::Ordering::Relaxed);
+    // The I-cache before the cache map: with the MMU off and the I-cache off every instruction is a DRAM read, and building the tables plus discarding the window's stale lines ran 317 ms that way (`diag boot`, 2026-10-27). With SCTLR.I set and the MMU off, instruction fetches are cacheable; `enable_icache` invalidates first.
+    platform::enable_icache();
+    let cached = cachemap::enable();
+    platform::pstore(b"ferros: cache map on\n");
+    checklist::at("cache map on");
+    // Cold boot from ABL (slot b): ABL loads the image at its link base G#8008_0000 (aarch64-pixel8.ld) with the MMU and caches off, x0 = DTB pointer. Heap right after the image + 64 KB stack.
+    unsafe extern "C" { static __stack_top: u8; static _start: u8; }
+    let stack_top = unsafe { &__stack_top as *const u8 as usize };
+    let heap_base = (stack_top + 0xFFF) & !0xFFF;
+    unsafe { KERNEL_HEAP.add(heap_base, HEAP_SIZE) };
+    // The heap's second region joins later, from the service loop (`heap2_join`): its stale lines must be discarded first, and that takes ~235 ms the boot should not wait for.
+    HEAP2_CACHED.store(cached, Ordering::Relaxed);
+    platform::canary_init();
+    platform::stack_paint();
+    platform::notes_rotate();
+    // The big core, started now so its power-up overlaps the boot; the service moves to it (x3.rs) if it is parked by then.
+    if crate::board::x3() {
+        x3::launch();
+    }
+    platform::pstore(b"ferros: X3 launched\n");
+    // The firmware TRNG's words for the wairua's KOHI, gathered on worker 3 while this core boots (kohi.rs `start_early`): its 329 ms of SMCs ran in front of the first process (2026-11-01).
+    if cached {
+        kohi::start_early();
+    }
+    platform::pstore(b"ferros: KOHI early started\n");
+
+    // The previous session's report (ramoops DRAM survives warm resets), then the safety nets: fault sink + panic reporter into the report block, cluster watchdogs.
+    let prev = platform::read_report();
+    platform::arm_safety();
+    board::probe(2);
+    platform::crumb(0xC0);
+    platform::pstore(b"ferros: safety armed\n");
+    checklist::at("safety armed");
+
+    // The "Ready?" gate, on a real ABL boot (a RELOAD swaps code on a device that has already booted, it is not a boot). Everything above it is plumbing; ferros's boot starts at the press.
+    // Started by the hv's boot gate (slot a, "ferros" already chosen there): no second gate.
+    let hv_answered = ready::answered_by_hv();
+    // Into the pstore ring first thing: whether the hv's gate mark was there and how it was answered (6 = the jump from Android), so a session that dies before USB still says how it began.
+    platform::pstore(alloc::format!("\nferros: boot, hv answered {hv_answered}, gate telemetry G#{:X}\n", ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed)).as_bytes());
+    let real_boot = dtb_addr != 0 && dtb_addr & 1 == 0;
+    // The hv's gate cleared the panel and drew only the gate's picture: adopting it need not clear it again.
+    if hv_answered {
+        display::KEEP_PIXELS.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    // No USB at the gate: the kernel has none of its own since 2026-11-01 (USB.md); the USB process comes with init, after the press. Dev builds answer the gate themselves after a second.
+    // The hv's gate answers volume down (how 3, development builds) with ferros, which leaves ANDROID_ONCE and resets below: the hv starts Android only on that word (ferros_hv gate.rs `ask`).
+    let hv_how = ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed) & 0xFF;
+    let (pressed_at, gate_choice) = if hv_answered {
+        (platform::cntpct(), if cfg!(not(ferros_production)) && hv_how == 3 { ready::Choice::Android } else { ready::Choice::Ferros })
+    } else if real_boot {
+        ready::wait()
+    } else {
+        (0, ready::Choice::Ferros)
+    };
+    let _ = pressed_at;
+    board::probe(3);
+    checklist::PRESS.store(pressed_at, core::sync::atomic::Ordering::Relaxed);
+
+    // eUSB2 repeater: snapshot what ABL left, then apply Google's calibrated tune (ABL never does; only the Android driver does).
+    // Not after the jump: Android's driver has tuned the repeater already, and its bus (hsi2c_11, shared with the TCPC and the PMIC chain) is still in Android's state. The jump of 2026-11-07 morning died right here (crumbs: C0 set, C1 never; the cluster watchdog reset it), before any of the boot's I2C (feedback: the jump is a killswitch, never adopt what Android started). G#FFFF_FFFF marks the snapshot as not taken, and rep_tuned G#FE as skipped for the jump.
+    let rep_snap: [u32; 9] = if platform::jumped() { [0xFFFF_FFFF; 9] } else {
+        let i2c = ferros_hal::hsi2c::Hsi2c::new(ferros_hal::hsi2c::PIXEL8_HSI2C11_BASE);
+        i2c.init();
+        let rep = |reg: u8| match i2c.read_reg(ferros_hal::hsi2c::PIXEL8_EUSB_REPEATER_ADDR, reg) {
+            Ok(v) => v as u32,
+            Err(trans) => 0x8000_0000 | (trans & 0xFFFF),
+        };
+        [rep(0xB0), rep(0x60), rep(0x70), rep(0x71), rep(0x72), rep(0x73), rep(0x77), rep(0x78), rep(0x79)]
+    };
+
+    // Apply Google's calibrated repeater tune (the DT repeater_tune* table) before PHY init.
+    // ABL does NOT apply it — only the Android driver does — so without this every ferros boot runs the analog path untuned (the leading suspect for the enumeration coin flip).
+    // Gated on a positive REV_ID identification: the bus is shared with the PMIC chain, so if the snapshot couldn't identify the repeater we write nothing.
+    // rep_tuned: count of verified tune registers (8 on husky, 5 on akita = full success), G#FF = skipped (REV_ID gate).
+    let rep_tuned: u32 = if rep_snap[0] == 0x3 {
+        let i2c = ferros_hal::hsi2c::Hsi2c::new(ferros_hal::hsi2c::PIXEL8_HSI2C11_BASE);
+        let mut ok = 0u32;
+        let tune: &[(u8, u8)] = if board::akita() { &ferros_hal::hsi2c::AKITA_REPEATER_TUNE } else { &ferros_hal::hsi2c::PIXEL8_REPEATER_TUNE };
+        for &(reg, val) in tune.iter() {
+            let addr = ferros_hal::hsi2c::PIXEL8_EUSB_REPEATER_ADDR;
+            if i2c.write_reg(addr, reg, val).is_ok() && i2c.read_reg(addr, reg) == Ok(val) {
+                ok += 1;
+            }
+        }
+        ok
+    } else if platform::jumped() {
+        0xFE
+    } else {
+        0xFF
+    };
+
+    platform::crumb(0xC1);
+    checklist::at("repeater read + tuned");
+    checklist::step(checklist::Step::Repeater);
+    platform::pstore(b"ferros: repeater read and tuned\n");
+
+    // How this boot began, for the ring's centre: a RELOAD's tag, the hv's jump, then what the RAM kept — the previous session's report survives a warm reset and not a power-on, and its crumb says whether it ended in a panic.
+    let gate = ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed) & 0xFF;
+    checklist::set_reason(if dtb_addr & 1 == 1 {
+        checklist::Reason::Reload
+    } else if platform::jumped() || gate == 6 {
+        checklist::Reason::Jump
+    } else if prev.is_some_and(|r| r[3] >> 8 == 0xEE) {
+        checklist::Reason::Crash
+    } else if prev.is_some() || gate == 5 {
+        checklist::Reason::Restart
+    } else {
+        checklist::Reason::Cold
+    });
+    // The road map on the panel (ABL's splash surface): what this boot has done so far is green.
+    checklist::start(platform::cntfrq(), &[checklist::Item::Killswitch]);
+    board::probe(4);
+    checklist::step(checklist::Step::Panel);
+    checklist::at("checklist drawn");
+    platform::pstore(b"ferros: checklist drawn\n");
+    // The board's CDT and MLB for the sensor registry scripts (sensorlink.rs, SYS_SENSORS op 1), while ABL's device tree is still where it put it: after the ring's first frame, so the walk (~120 ms before, uncached) is not between the press and the glass.
+    if real_boot {
+        // ABL's device tree lies outside the cached window (cachemap.rs: Device memory there), so every byte the walks read was a bus round trip: 554 ms for the two (2026-11-01). One copy into cached memory, eight bytes a load, then both walks on the copy.
+        let copy = dtb_cached_copy(dtb_addr);
+        let at = copy.as_ref().map_or(dtb_addr, |v| v.as_ptr() as u64);
+        sensorlink::read_board(at);
+        modem::read_board(at);
+        modem::keep_bootconfig(at);
+    }
+    checklist::at("board read");
+    checklist::step(checklist::Step::Board);
+    platform::pstore(b"ferros: board read\n");
+    board::probe(41);
+    if cached {
+        checklist::mark(checklist::Item::CacheMap);
+    }
+    // KOHI ran during the "Ready?" wait: light the wairua line now that the checklist exists.
+    if let Some(fp) = wairua::peek().filter(|s| s.0).and_then(|_| wairua::fingerprint()) {
+        let hex = b"0123456789ABCDEF";
+        checklist::mark_interim(checklist::Item::Wairua);
+        checklist::suffix(checklist::Item::Wairua, &[hex[(fp[0] >> 4) as usize], hex[(fp[0] & 15) as usize], hex[(fp[1] >> 4) as usize], hex[(fp[1] & 15) as usize]]);
+    }
+
+    // UFS: ABL leaves the flash unpowered (cold_ufs::power_on_device); bring the link up, then open the ira-rooted vault on the ferros partition exactly as the handoff path does.
+    let t_ufs = platform::cntpct();
+    // akita too since its per-unit partitions are backed up (2026-11-06, /mnt/Harbor/tmp/akita-backup-2026-11-06): the link for its flash log and its vault, both in its ferros partition. Write protect stays off there, and its slot is marked only through the hv's gate (below).
+    let link_up = cold_ufs::bring_up();
+    checklist::step(checklist::Step::Disk);
+    board::probe(42);
+    let ufs_ms = (platform::cntpct().wrapping_sub(t_ufs) / (platform::cntfrq() / 1000)) as u32;
+    platform::pstore(if link_up { b"ferros: UFS link up\n" as &[u8] } else { b"ferros: UFS link DOWN\n" });
+    if link_up {
+        checklist::mark(checklist::Item::Disk);
+        // The ferros partition by its GPT name: where the flash log and the vault live (ufs_device::locate; on husky only if it is where it always was).
+        platform::pstore(if ufs_device::locate() { b"ferros: the ferros partition found\n" as &[u8] } else { b"ferros: NO ferros partition\n" });
+    }
+    // The gate chose Android (development builds only: volume down at this gate or at the hv's; a production build has no gate): the moment the disk answers (set-active needs devinfo and the boot LU attribute, nothing of the vault), ANDROID_ONCE left for the hv's gate, slot a active, then a plain reset. Android lives on slot a on both boards (akita's since 2026-11-18, BOARDS.md), whose hv gate takes the word and goes to Android, once. The way back is a reboot: no word, so the gate gives ferros (owner, 2026-11-21: Android starts only by ferros's hand).
+    // Cleaned to DRAM, since the gate reads it with the caches off.
+    #[cfg(not(ferros_production))]
+    if gate_choice == ready::Choice::Android && link_up {
+        if slot::set_active(0) == slot::MARKED {
+            platform::android_once();
+            platform::crumb(0xC7);
+            platform::reboot();
+        }
+        checklist::suffix(checklist::Item::Slot, b"android: set-active failed");
+    }
+    // The person's standing choice (owner, 2026-11-21: "Start into: ferros / Android") applies only to a boot nobody answered: a production boot (no gate) or a development gate's untouched second. A press of power at the gate, the chord's FERROS_ONCE, a recovery boot refused, the jump and a reload all mean ferros, now. Taken at the first attest (service.rs `START_INTO`).
+    let unattended = real_boot && !platform::jumped() && if hv_answered { matches!(hv_how, 2 | 7) } else { matches!(ready::GATE_HOW.load(core::sync::atomic::Ordering::Relaxed) & 0xFF, 2 | 4) };
+    service::START_INTO.store(unattended, core::sync::atomic::Ordering::Relaxed);
+    platform::crumb(0xC2);
+    let t_vault = platform::cntpct();
+    if link_up {
+        // In the ferros partition (1 GiB in, ufs_device::locate), on both boards. Never akita's `klog` again (2026-11-06): that partition is the bootloader's, its first block ABL's own record, which the flash log's header overwrote at every boot; ABL then booted without its persistent record ("unable to get a real pram"), left the display down, and every ferros boot died before its gate, a power cycle not helping. `klog` was put back from the morning's backup.
+        let ok = flashlog::init();
+        flashlog::line(&alloc::format!("boot cold, flash log init {ok}"));
+        // The gate's one-shot words as this boot finds them (ferros_hv gate.rs: FERROS_ONCE, RECOVERY_ONCE, ANDROID_ONCE at G#FD60_0FE8, F0, F8), which the hv's gate clears before it starts ferros: anything but zeros here says a clear did not hold (the 8a, 2026-11-21).
+        let once = unsafe { [0xFD60_0FE8usize, 0xFD60_0FF0, 0xFD60_0FF8].map(|a| core::ptr::read_volatile(a as *const u64)) };
+        if once != [0; 3] {
+            flashlog::line(&alloc::format!("gate words still set at ferros's start: G#{:X} G#{:X} G#{:X}", once[0], once[1], once[2]));
+        }
+        // Android's recovery request in misc (a factory reset, a rescue, an update), which the gate refused to boot: kept for the person to answer after the attest (service.rs `RECOVERY_ASK`; owner, 2026-11-22), never cleared here.
+        #[cfg(not(shim_handoff))]
+        service::recovery_ask_read();
+        // What ABL said about pKVM this boot (modem.rs `KVM_SIGNS`): after a wipe, set beside a boot before it (docs/BOOT.md "Recovery requests from Android").
+        if real_boot {
+            let s = unsafe { &*(&raw const modem::KVM_SIGNS) };
+            flashlog::line(&alloc::format!("pKVM signs from the bootloader: {}", if s.is_empty() { "none" } else { core::str::from_utf8(s).unwrap_or("(not text)") }));
+        }
+        // How ABL saw the reset that started this boot, kept where the next bootloader run cannot overwrite it (platform::abl_reset_lines). Only when ABL booted this ferros on husky: a reload has no ABL run of its own, a jump's log is Android's boot's, and akita's log place is not measured.
+        if dtb_addr != 0 && dtb_addr & 1 == 0 && !platform::jumped() && !board::akita() {
+            flashlog::line(&alloc::format!("bootloader saw: {}", platform::abl_reset_lines()));
+        }
+    }
+    // The charger's fast-charge safety timer off at every boot, as Android's driver does at probe (hsi2c.rs `charger::safety_timer_off`, docs/CHARGING.md; owner, 2026-11-24: "Turn the safety timer off, yes."). One try: a failure is said and the boot goes on.
+    flashlog::line(&match hsi2c::charger::safety_timer_off() {
+        Ok((b, a, p)) if a & hsi2c::charger::FCHGTIME_MASK == 0 => alloc::format!("charger safety timer off: CHG_CNFG_01 G#{b:02X} -> G#{a:02X} (CHG_CNFG_06 G#{p:02X})"),
+        Ok((b, a, p)) => alloc::format!("charger safety timer NOT off: CHG_CNFG_01 G#{b:02X}, reads G#{a:02X} after the write (CHG_CNFG_06 G#{p:02X}, CHGPROT [3:2] 3 = open); booting on"),
+        Err(e) => alloc::format!("charger safety timer NOT off: hsi2c_11 G#{e:X}; booting on"),
+    });
+    // The charge voltage cap's default at once, so the bootloader's 4.35 V never stands (owner, 2026-11-24: 4.20 V by default); the kept cap follows on the service loop's first pass, once the settings are read (service.rs `charge_poll`).
+    flashlog::line(&match hsi2c::charger::set_cv(process::CHARGE_CV_DEFAULT as u32) {
+        Ok(mv) => alloc::format!("charge cap at boot: A#{mv} mV (the default) until the kept setting is read"),
+        Err(e) => alloc::format!("charge cap NOT set at boot: hsi2c_11 G#{e:X}; booting on"),
+    });
+    checklist::step(checklist::Step::Log);
+    // The wall clock before the vault opens (docs/VSF-AUDIT.md P10, 2026-11-17): every commit and document the vault writes is stamped with Eagle time from it (kvault `now`). A failed read leaves it unknown (0, the Eagle epoch: settings.rs), never made up; the service reads it again at its start and every hour.
+    let clock = rtc::sync_early();
+    if link_up {
+        flashlog::line(&match clock {
+            Ok(unix) => alloc::format!("wall clock read before the vault opens: A#{unix} s past 1970 (UTC), stamped as Eagle time"),
+            Err(e) => alloc::format!("wall clock NOT read before the vault opens (G#{e:X}): its commits are stamped 0, the Eagle epoch, until the service reads it"),
+        });
+    }
+    // akita too since 2026-11-06: its ira's sources read alike across eight boots (`diag "ira sources"`), its ira under its own context (ira.rs), its vault in its own ferros partition (ufs_device::locate; refused without one). Not with no link: the ira's sources include a read of the flash (devinfo), which could then wait past the cluster watchdog.
+    let (probe, mut store) = if board::akita() && !link_up { (vault_boot::VaultProbe::none(), None) } else { vault_boot::vault_probe(link_up) };
+    // A power-on has no last length in RAM for the ring's scale: the disk's, now that the vault is open.
+    if let Some(doc) = store.as_mut().and_then(|s| s.get_by_key(checklist::SPAN_KEY).ok().flatten()) {
+        checklist::span_from_disk(&doc);
+    }
+    board::probe(43);
+    // A bootloader mode the previous boot asked for from a jumped session, where the bootloader could not be told (vault_boot `next_boot_keep`): taken from the vault first, then the reset a cold session makes, the path measured to land in fastboot. Only on a cold boot ABL started: the PMU word survives only the warm reset that follows such a boot.
+    if dtb_addr != 0 && dtb_addr & 1 == 0 && !platform::jumped() {
+        if let Some(mode) = store.as_mut().and_then(vault_boot::next_boot_take) {
+            flashlog::line(&alloc::format!("next boot: the previous boot asked for mode G#{mode:X} from its jump; resetting into it from this cold boot"));
+            let _ = platform::reboot_to_mode(mode);
+            // Back only if EL3 refused the mode or the watchdogs never reset (crumb G#B7 says the second): the memory has been scrubbed on the way, the heap with it, so no line and no allocation now, only the crumb and a plain reset. The wish is gone from the vault, so the boot after it runs on.
+            platform::crumb(0xB8);
+            platform::reset_now();
+        }
+    }
+    let vault_ms =(platform::cntpct().wrapping_sub(t_vault) / (platform::cntfrq() / 1000)) as u32;
+    if probe.opened == 1 {
+        checklist::mark(checklist::Item::VaultOpen);
+    }
+    if probe.verified == 1 {
+        checklist::mark(checklist::Item::VaultVerified);
+    }
+    // ira: yellow once derived — up, but a stand-in until PIPE (SoC-sourced and held in RAM, not on-die registers, KEY_REGISTERS.md) — with the first two bytes of its one-way fingerprint after the label (256-bit secret, so plain BLAKE3 is already one-way; spaghettify only matters for guessable inputs like handles). The wairua line is lit by wairua.rs when KOHI first runs: it is lazy, nothing at boot needs it.
+    if probe.ira_fail == 0 {
+        checklist::mark_interim(checklist::Item::Ira);
+        let hex = b"0123456789ABCDEF";
+        let f = &probe.ira_fp;
+        checklist::suffix(checklist::Item::Ira, &[hex[(f[0] >> 4) as usize], hex[(f[0] & 15) as usize], hex[(f[1] >> 4) as usize], hex[(f[1] & 15) as usize]]);
+    }
+
+    // The flash's power-on write protect, armed now that the link is up (BOOT.md "Dual Boot", owner's yes 2026-10-17): the bootloader's own LUs become read-only until the next reset. The bootloader does not arm it itself; fastboot runs before anything could, so flashing is untouched. Reported in DIAG as UFS_POWER_ON_WP (1 armed, 2 refused, 0 no link).
+    // Not on akita: it would hold the bootloader LUs read-only across the warm reset into fastboot, and flashing is how akita is worked on.
+    let ufs_wp = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() && !board::akita() {
+        let ufs = ferros_hal::ufs::UfsController::new(0x1320_0000);
+        // As the boot found it: whether the flag survived the reset that brought us here (a warm reset may keep it; DIAG UFS_POWER_ON_WP_BEFORE: 0/1, 2 unreadable).
+        UFS_WP_BEFORE.store(match ufs.read_flag(0x03) { Some(true) => 1, Some(false) => 0, None => 2 }, core::sync::atomic::Ordering::Relaxed);
+        if cfg!(ferros_no_ufs_wp) {
+            3
+        } else if ufs.set_flag(0x03) {
+            1
+        } else {
+            2
+        }
+    } else {
+        0
+    };
+    UFS_WP.store(ufs_wp, core::sync::atomic::Ordering::Relaxed);
+    checklist::step(checklist::Step::Protect);
+
+    platform::crumb(0xE4);
+    platform::pstore(b"ferros: vault opened, flash write-protect armed\n");
+    platform::mark_trail(0x17);
+
+    // Tell ABL this slot boots (devinfo "successful"), so its retry countdown stops and a power cycle lands here again. Only on a real ABL boot (x0 = DTB pointer, not a RELOAD tag) with the vault verified: a build that dies before this point still falls back to the other slot.
+    // On akita only through the hv's gate, which shares Android's slot (b) as husky's does: there an unmarked slot loses a retry at every ferros boot, and ABL retires Android's slot with it. A bare ferros (tools/akita-boot.sh, slot a) stays unmarked, so ABL falls back to slot b's Android (the way out) when it does not boot.
+    let through_hv = ready::GATE_TELEMETRY.load(core::sync::atomic::Ordering::Relaxed) != 0;
+    // A production build marks on akita too, bare (no hv) as it is hosted: there is no Android slot to fall back to (owner, 2026-11-24: pure ferros), and the A/B updater needs the booted slot marked so a bad update falls back to the last good one (docs/FLASHER.md "Updating while locked").
+    let mark = if dtb_addr != 0 && dtb_addr & 1 == 0 && store.is_some() && (!board::akita() || through_hv || cfg!(ferros_production)) {
+        let m = slot::mark_booted_slot(dtb_addr);
+        if m.result == slot::MARKED || m.result == slot::ALREADY {
+            checklist::mark(checklist::Item::Slot);
+        }
+        m
+    } else {
+        slot::SlotMark { slot: 0xFF, before: 0, after: 0, result: 0xFF }
+    };
+    checklist::step(checklist::Step::Slot);
+
+    // The device's settings (SETTINGS.md, settings.rs): one VSF document under `device`, loaded here so everything drawn from now on reads in them. Defaults first (DMS, tatau's house base; brightness two stops down (64 32nds), white about 147 cd/m²; Dvorak; everything else 0), then whatever the document carries. An identity's preferences replace them when that identity attests; nothing here ever writes them back to an identity.
+    base::load(tatau::base().code(), 0, false, false);
+    process::set_pref(process::PREF_BRIGHTNESS, 2 << 5);
+    if let Some(doc) = store.as_mut().and_then(|s| s.get_by_key(settings::KEY).ok().flatten()) {
+        let _ = settings::apply(&doc, false);
+    }
+    // Unlock at boot (AUTH.md, SETTINGS.md): with `device.unlock_at_boot` on, the identity whose seed the kernel kept is unlocked now, before anything that reads its space starts; off, a kept seed is deleted.
+    if let Some(s) = store.as_mut() {
+        match s.boot_unlock(process::pref(process::PREF_UNLOCK_AT_BOOT) == 1) {
+            Ok(true) => flashlog::line("identity unlocked at boot (unlock at boot on)"),
+            Ok(false) => {}
+            Err(e) => flashlog::line(&alloc::format!("unlock at boot failed: {e:?}")),
+        }
+    }
+    platform::crumb(0xE5);
+
+    // The first process is no longer started here: the vault's `init` starts when the boot ring completes (service.rs `start_home`), holding the shell's capabilities, and starts the shell itself (owner, 2026-10-22).
+    let init_exit = 0u32;
+
+    let own_base = &raw const _start as usize;
+    let extras = alloc::vec![
+        (b"COLD_UFS_MS=".as_slice(), ufs_ms),
+        (b"UFS_POWER_ON_WP=".as_slice(), UFS_WP.load(core::sync::atomic::Ordering::Relaxed)),
+        (b"UFS_POWER_ON_WP_BEFORE=".as_slice(), UFS_WP_BEFORE.load(core::sync::atomic::Ordering::Relaxed)),
+        (b"COLD_VAULT_MS=".as_slice(), vault_ms),
+        (b"REP_REV=".as_slice(), rep_snap[0]),
+        (b"REP_CFG=".as_slice(), rep_snap[1]),
+        (b"REP_T70=".as_slice(), rep_snap[2]),
+        (b"REP_T71=".as_slice(), rep_snap[3]),
+        (b"REP_T72=".as_slice(), rep_snap[4]),
+        (b"REP_T73=".as_slice(), rep_snap[5]),
+        (b"REP_T77=".as_slice(), rep_snap[6]),
+        (b"REP_T78=".as_slice(), rep_snap[7]),
+        (b"REP_T79=".as_slice(), rep_snap[8]),
+        (b"REP_TUNED=".as_slice(), rep_tuned),
+        (b"DTB=".as_slice(), dtb_addr as u32),
+        (b"SLOT=".as_slice(), mark.slot),
+        (b"SLOT_WORD_BEFORE=".as_slice(), mark.before),
+        (b"SLOT_WORD_AFTER=".as_slice(), mark.after),
+        (b"SLOT_MARK=".as_slice(), mark.result),
+        (b"INIT=".as_slice(), init_exit),
+    ];
+    // RELOAD stages at base+32 MiB (the slot the old ping-pong reload proved on hardware; base+64 MiB was fatal) and runs its copy stub 64 KiB below it, far past this image + stack + 4 MiB heap.
+    platform::crumb(0xE6);
+    checklist::step(checklist::Step::Settings);
+    board::probe(44);
+    checklist::at("service start");
+    let boot = service::Boot {
+        kind: service::BootKind::Cold,
+        link_base: own_base,
+        stage: own_base + (32 << 20),
+        stub: own_base + (32 << 20) - 0x1_0000,
+        x0: if dtb_addr & 1 == 1 { dtb_addr } else { 0 },
+        probe: Some(probe),
+        store,
+        prev,
+        extras,
+    };
+    // On the X3 if it is parked by now (every build since 2026-10-22, proven on a cold boot; FERROS_X3=0 keeps CPU0); otherwise here.
+    // CPU0 is about to park: the ira and wairua it holds go sealed to the X3 and the workers, and its own registers are cleared (keys.rs).
+    if crate::board::x3() && x3::parked() {
+        keys::leave(keys::AFTER_HOP);
+    }
+    board::probe(45);
+    let boot = if crate::board::x3() { x3::hand_over(boot) } else { boot };
+    platform::crumb(0xE7);
+    platform::pstore(b"ferros: into the service\n");
+    platform::mark_trail(0x18);
+    board::probe(5);
+    service::run(boot)
+}
+
+/// Hot-reload: jump to a new kernel image at the given DRAM address.
+///
+/// The new image is position-independent (uses adrp). We disable caches, flush the staging area, then branch to _start with x0 = DTB.
+// kept: generic reload/reboot mechanism, not yet wired to the live path
+#[allow(dead_code)]
+fn hot_reload(stage_addr: usize, dtb: u64) -> ! {
+    unsafe {
+        core::arch::asm!(
+            // Disable interrupts
+            "msr daifset, #0xF",
+            // Clean + invalidate D-cache for staging area (1MB should cover it)
+            "mov x2, {stage}",
+            "mov x3, #0x100000",
+            "add x3, x3, x2",
+            "2:",
+            "dc civac, x2",
+            "add x2, x2, #64",
+            "cmp x2, x3",
+            "b.lo 2b",
+            "dsb sy",
+            "isb",
+            // Invalidate I-cache
+            "ic iallu",
+            "dsb sy",
+            "isb",
+            // Set up args: x0 = DTB pointer (what ABL passes)
+            "mov x0, {dtb}",
+            "mov x1, xzr",
+            "mov x2, xzr",
+            "mov x3, xzr",
+            // Jump to new image entry point
+            "br {stage}",
+            stage = in(reg) stage_addr as u64,
+            dtb = in(reg) dtb,
+            options(noreturn),
+        );
+    }
+}
+
+/// PSCI SYSTEM_RESET via SMC — warm reboot that preserves DRAM.
+// kept: generic reload/reboot mechanism, not yet wired to the live path
+#[allow(dead_code)]
+fn psci_reboot() -> ! {
+    unsafe {
+        core::arch::asm!(
+            "movz x0, #0x0009",
+            "movk x0, #0x8400, lsl #16",  // x0 = 0x84000009 (SYSTEM_RESET)
+            "mov x1, xzr",
+            "mov x2, xzr",
+            "mov x3, xzr",
+            "smc #0",
+            options(noreturn)
+        );
+    }
+}
+
+#[cfg(not(feature = "pixel8"))]
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    loop { unsafe { core::arch::asm!("wfe") }; }
+}
+
+// Both Pixel boot paths: a silent wfe loop is indistinguishable from a hang and only the watchdog gets us out. Report the panic (message head, file, line, last crumb) into the ramoops result block and warm-reset, so the next boot (Linux on slot a, or the next cold ferros's DIAG) shows it.
+#[cfg(feature = "pixel8")]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    platform::report_panic(info)
+}
+
+/// ABL's device tree copied into cached memory, eight bytes a load (its blob is 8-byte aligned by the FDT spec): None when the pointer is not one or the header is not a device tree's. WHY/PROOF the size bound: the size is ABL's word, external input; past 4 MiB it is not a device tree, and the copy would read on past ABL's region (the walks held the same bound).
+fn dtb_cached_copy(addr: u64) -> Option<alloc::vec::Vec<u64>> {
+    if addr == 0 || addr % 8 != 0 {
+        return None;
+    }
+    let be = |a: u64| u32::from_be(unsafe { core::ptr::read_volatile(a as *const u32) });
+    if be(addr) != 0xD00D_FEED {
+        return None;
+    }
+    let size = be(addr + 4) as usize;
+    if size > 4 << 20 {
+        return None;
+    }
+    let words = size.div_ceil(8);
+    let mut v = alloc::vec::Vec::with_capacity(words);
+    for i in 0..words {
+        v.push(unsafe { core::ptr::read_volatile((addr as usize + 8 * i) as *const u64) });
+    }
+    Some(v)
+}

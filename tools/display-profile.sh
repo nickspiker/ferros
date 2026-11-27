@@ -13,13 +13,13 @@
 #   ten <control|dither|link10|restore>   is the link really 10 bits: grey 10-bit codes 512-520 at ~1000 nits, read twice each, in the 1 cm disc. control = 10 bpc compose on the 8 bpc link with the dither off (expect plateaus four codes wide), dither = the same dithered (the instrument averages it: an even ramp), link10 = the 10 bpc DSC stream, no dither (even steps only if all ten bits arrive), restore = the default (10 bpc compose, dithered)
 #   run ramps10   the tone curve in 10-bit codes in the mode ferros runs (10 bpc compose + DQE dither on the 8 bpc link; the panel keeps 8 bits of a 10 bpc stream, 2026-10-22)
 #   on        the shell back (remove `home.off`), reboot
-# Output: oracle/display/husky-hk3/profile-<date>/readings.csv (section, label, dbv, window px, rgb, surround, seconds since start, Y cd/m², x, y) and spotread.log (every reading's full output, spectra included).
+# Output: data/oracle/display/husky-hk3/profile-<date>/readings.csv (section, label, dbv, window px, rgb, surround, seconds since start, Y cd/m², x, y) and spotread.log (every reading's full output, spectra included).
 # Needs: the instrument readable (sudo chmod a+rw /dev/bus/usb/<bus>/<dev>, or the colord group), cold ferros on USB, a dark room.
 set -uo pipefail
 REPO=/mnt/Harbor/Code/ferros
 B=$REPO/target/debug/ferros-bridge
 PX_PER_CM=${PX_PER_CM:-193}
-DIR=${PROFILE_DIR:-$REPO/oracle/display/husky-hk3/profile-$(date +%Y%m%d)}
+DIR=${PROFILE_DIR:-$REPO/data/oracle/display/husky-hk3/profile-$(date +%Y%m%d)}
 CSV=$DIR/readings.csv
 LOG=$DIR/spotread.log
 T0=$(date +%s)

@@ -1,7 +1,7 @@
-//! The chords under ferros and the screenshot's slide on the host: ferros_kernel/src/chord.rs and payloads/map/src/pair.rs themselves, tested.
+//! The chords under ferros and the screenshot's slide on the host: kernel/src/chord.rs and payloads/map/src/pair.rs themselves, tested.
 //! `cargo test --manifest-path tools/chords/Cargo.toml`.
 
-#[path = "../../../ferros_kernel/src/chord.rs"]
+#[path = "../../../kernel/src/chord.rs"]
 pub mod chord;
 #[path = "../../../payloads/map/src/pair.rs"]
 pub mod pair;

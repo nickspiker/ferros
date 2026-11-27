@@ -33,7 +33,7 @@
   },
   "pre-link-args": {
     "gnu-lld": [
-      "-T/mnt/Harbor/Code/ferros/ferros_rt/ferros.ld",
+      "-T/mnt/Harbor/Code/ferros/crates/rt/ferros.ld",
       "-e",
       "_entry",
       "--no-dynamic-linker",

@@ -17,14 +17,14 @@ vsf = { path = "../../../vsf" }
 # The kist's own vault domain: Lumis's settings and its saves (no files on ferros).
 kete = { path = "../../../kete" }
 # RAW video (docs/RAW-VIDEO.md Part 4): the recorder Lumis hands its camera frames to, clips kept as items of the person's hold (ferros_clip items::ItemSink).
-ferros_clip = { path = "../../ferros_clip" }
+ferros_clip = { path = "../../crates/clip" }
 # The person's hold (docs/HOLD-API.md): stills kept as items of kind photo, the clips page's list and removals.
-ferros_items = { path = "../../ferros_items" }
+ferros_items = { path = "../../crates/items" }
 # The person's app scale and the device's theme, followed live (owner, 2026-11-20: every kist follows them): fluor's ferros host run thru ferros_fluor::run_app.
-ferros_fluor = { path = "../../ferros_fluor" }
+ferros_fluor = { path = "../../crates/fluor" }
 # Lumis's GPU (std/lumis gpu.rs): the queue and the block, surfaces of its own (the kernel's ABI, ferros_sys::gpu), and its kernels (lumis_gpu, recorded with valhall's recorder).
-ferros_sys = { path = "../../ferros_sys" }
-lumis_gpu = { path = "../../lumis_gpu" }
+ferros_sys = { path = "../../crates/sys" }
+lumis_gpu = { path = "../../crates/lumis_gpu" }
 # A save read back from the vault and compared with what was written (kete hashes with it already).
 blake3 = "1.5"
 lumis_accessory = { path = "../../../lumis/accessory" }

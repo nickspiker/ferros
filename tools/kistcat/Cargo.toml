@@ -10,7 +10,7 @@ description = "The kist directory (docs/KISTS.md \"The directory\"): reads signe
 
 [dependencies]
 # The directory's schema, builder, parser and verifier: the same code the device's stower runs.
-ferros_kist = { path = "../../ferros_kist", features = ["directory"] }
+ferros_kist = { path = "../../crates/kist", features = ["directory"] }
 # text-encode: Photon's manifest writes `platform` and `arch` as `x` (Huffman text), which vsf decodes only with its tables.
 vsf = { path = "../../../vsf", features = ["crypto", "text-encode"] }
 # The project key's every-scheme bundle, and the release key's pinned bundle for Photon's manifest (the bridge's signing machinery for a kist).

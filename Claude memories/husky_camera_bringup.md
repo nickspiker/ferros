@@ -5,7 +5,7 @@ metadata:
   type: project
 ---
 
-Working since 2026-10-19 on slot b, no Linux: `bridge diag "cam bus"`, `"cam up"`, `"cam off"`. Recipe and register detail in ferros/docs/oracle/CAMERA.md; code in ferros_kernel/src/camera.rs, acpm.rs, hsi2c.rs.
+Working since 2026-10-19 on slot b, no Linux: `bridge diag "cam bus"`, `"cam up"`, `"cam off"`. Recipe and register detail in ferros/docs/oracle/CAMERA.md; code in kernel/src/camera.rs, acpm.rs, hsi2c.rs.
 
 **Traps that cost the day (don't re-derive):**
 - Sub-PMIC (S2MPG15) GPIOs/LDOs only via ACPM channel 2 (acpm.rs); camera PMIC chip select = sub GPIO0, must be HIGH (Android idle state) or the SLG51002 NACKs everything.
@@ -94,8 +94,8 @@ Facts found, don't re-derive:
 - The ultrawide's line time from its init: 9568 clocks at 24.576 MHz / 3 x 178 = 6.5616 us, 5081 lines = 33.3 ms (the 30/s seen). Lumis's UW averages are 43 frames: black 2752 = 64 x 43.
 - **Front/tele NACK suspect: sub GPIO2 = CAMS_LVBUCK_EN ("for ldo8")**, raised only by the main's sequence; cold ferros reads G#40 (low); their power-up never touched it, so the 11-06 register comparison could not see it. Their sequences now raise it. Unmeasured.
 - The slg51002 here is REVISION_AB (pattern ID 03 31 B1): its GPIO switches need no SW test mode.
-- The worktree does not build in place (valhall crate collision with another worktree): build in /mnt/Harbor/tmp/othercams/ferros (siblings symlinked, plus the gitignored oracle/display/husky-hk3/cold-power/*.bin copied in).
-- **Each camera's mosaic, levels and orientation are in its 2026-10-21 calibration capture** (`pixel 8 pro calibration data/*average.vsf`, local, a fingerprint: read only the numbers): main G B/R G, ultrawide and tele B G/G R, front G R/B G; all 64/1023; EXIF 6 rear, 8 front. Their sizes match ferros's inits and every crop start is even. Read these before guessing any camera fact (the owner had to point at them).
+- The worktree does not build in place (valhall crate collision with another worktree): build in /mnt/Harbor/tmp/othercams/ferros (siblings symlinked, plus the gitignored data/oracle/display/husky-hk3/cold-power/*.bin copied in).
+- **Each camera's mosaic, levels and orientation are in its 2026-10-21 calibration capture** (`data/pixel-8-pro-calibration/*average.vsf`, local, a fingerprint: read only the numbers): main G B/R G, ultrawide and tele B G/G R, front G R/B G; all 64/1023; EXIF 6 rear, 8 front. Their sizes match ferros's inits and every crop start is even. Read these before guessing any camera fact (the owner had to point at them).
 - **The list's IDTs come from the vault** (`cam.<key>.idt`, the repo's .idt.vsf as is) since 2026-11-15: without `cam.boitata.idt` stored the main is not listed.
 
 ## 2026-11-15: modes, the bench and the slit (built on branch camtrials, not run; the Pro away)

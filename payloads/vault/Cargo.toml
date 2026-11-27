@@ -9,13 +9,13 @@ name = "vault"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-ferros_heap = { path = "../../ferros_heap", features = ["process"] }
-ferros_store = { path = "../../store" }
+ferros_sys = { path = "../../crates/sys" }
+ferros_heap = { path = "../../crates/heap", features = ["process"] }
+ferros_store = { path = "../../crates/store" }
 # The hold (docs/STORE.md): the person's items, served in their items domain (`OP_ITEMS`).
-ferros_items = { path = "../../ferros_items" }
+ferros_items = { path = "../../crates/items" }
 # The person's list of stowed kists (`kists.list`), read for the hold's usage call: each kist's name beside its domain's size.
-ferros_kist = { path = "../../ferros_kist" }
+ferros_kist = { path = "../../crates/kist" }
 manifestus = { path = "../../../manifestus", default-features = false }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 vsf = { path = "../../../vsf", default-features = false }

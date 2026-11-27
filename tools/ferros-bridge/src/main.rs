@@ -19,10 +19,10 @@ mod input;
 mod items;
 mod ledger;
 /// A WiFi credential document, the schema pcie1 reads (shared by path: it uses only vsf and alloc).
-#[path = "../../../ferros_detail/src/network.rs"]
+#[path = "../../../crates/detail/src/network.rs"]
 mod network;
 /// A sponsor placed by hand, the document payloads/fgtw reads from `fgtw.sponsor` (shared by path: it uses only vsf and alloc).
-#[path = "../../../ferros_kept/src/sponsor.rs"]
+#[path = "../../../crates/kept/src/sponsor.rs"]
 mod sponsor;
 /// `part`: partitions block for block off the device, read-only (the per-unit backups).
 mod part;

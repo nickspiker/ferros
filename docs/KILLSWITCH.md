@@ -3,7 +3,7 @@
 ## Mechanism
 Vol Up + Vol Down (held simultaneously) → key-edge interrupt → PSCI SYSTEM_OFF → PMIC power cut.
 
-On husky (since 2026-10-14, `ferros_kernel/src/killswitch.rs`) the key presses ARE the interrupt; nothing polls:
+On husky (since 2026-10-14, `kernel/src/killswitch.rs`) the key presses ARE the interrupt; nothing polls:
 - Both keys are always-on GPIOs that can each raise their own GIC SPI (Exynos wakeup EINT): vol-down = gpa4-1 → SPI 29 (INTID 61), vol-up = gpa6-2 → SPI 32 (INTID 64). They interrupt on both edges.
 - `killswitch::arm()` is the first line of `kernel_main` on both boot paths. It powers off at once if both keys are already held. Otherwise it brings up the GIC (distributor group 1, this CPU's redistributor, system-register CPU interface), switches every other interrupt off (ferros polls everything else), routes physical IRQs to EL2 (HCR_EL2.IMO) and unmasks.
 - The handler (`.Lirq` in main.rs) is a few instructions of assembly with no Rust state. Whatever fired, if both keys read held it issues SYSTEM_OFF on the spot, preempting whatever was running: UFS bring-up, the vault, a RUN payload, a wedged loop. Otherwise it clears the key's pending bit (or switches a stray interrupt off) and returns.

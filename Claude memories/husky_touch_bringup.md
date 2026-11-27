@@ -5,7 +5,7 @@ metadata:
   type: project
 ---
 
-Contact reporting finger-verified 2026-10-20 (2035 readings in 30 s, pressure to A#123, largest contact A#352 by A#224). Working since 2026-10-19 on slot b, no Linux: `bridge diag "touch up"` gives controller ready in 12 ms, chip ID G#3640 (SALIXP), scan mode on; `"touch paint"` draws strokes on the panel for 16 s; `"touch watch"` prints events. Code ferros_kernel/src/touch.rs; recipe, protocol and pins/clocks/rails in ferros/docs/oracle/TOUCH.md.
+Contact reporting finger-verified 2026-10-20 (2035 readings in 30 s, pressure to A#123, largest contact A#352 by A#224). Working since 2026-10-19 on slot b, no Linux: `bridge diag "touch up"` gives controller ready in 12 ms, chip ID G#3640 (SALIXP), scan mode on; `"touch paint"` draws strokes on the panel for 16 s; `"touch watch"` prints events. Code kernel/src/touch.rs; recipe, protocol and pins/clocks/rails in ferros/docs/oracle/TOUCH.md.
 
 **Facts that cost time (don't re-derive):**
 - Driver source is public: AOSP kernel/google-modules/touch/fts_touch, cloned at /mnt/Harbor/ferros-ref/touch-fts (branch android-gs-shusky-6.1-android15-qpr2, dir ftm5/).

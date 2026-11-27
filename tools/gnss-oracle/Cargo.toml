@@ -8,4 +8,4 @@ description = "Host side: an hv oracle capture of akita's spi_21 (the Samsung KE
 
 [dependencies]
 # The link's datagrams and BETP records, as the driver reads them (--betp).
-ferros_kepler = { path = "../../ferros_kepler" }
+ferros_kepler = { path = "../../crates/kepler" }

@@ -26,7 +26,7 @@ unsafe extern "C" {
 #[global_allocator]
 static ALLOC: ferros_heap::ArcHeap<ferros_heap::Kernel> = ferros_heap::ArcHeap::new(ferros_heap::Kernel);
 
-/// The bundled station documents (build.rs: every ferros_tide/stations/*.tide.vsf) and the catalog.
+/// The bundled station documents (build.rs: every crates/tide/stations/*.tide.vsf) and the catalog.
 mod bundled {
     include!(concat!(env!("OUT_DIR"), "/stations.rs"));
 }

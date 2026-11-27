@@ -1,0 +1,15 @@
+[package]
+name = "ferros_thing"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "A thing's identity (VSF `ht`) and how each kind's is derived: a kist or a puck from its developer's key and option, a person from their pinned identity key, a hold item minted when first kept; a kist's icon's content identity (`hp`); the deck's kinds as ideas (`hi`). no_std, no heap; for ferros and Photon alike, host-tested."
+
+[dependencies]
+vsf = { path = "../../../vsf", default-features = false }
+# Pure Rust, as the display and the vault have it: blake3's C and assembly do not build for the bare target.
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+
+[dev-dependencies]
+# The deck's kinds checked against their first phrasings (IDEAS.md), as ferros_idea mints them.
+ferros_idea = { path = "../idea" }

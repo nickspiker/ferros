@@ -9,11 +9,11 @@ name = "compbench"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
+ferros_sys = { path = "../../crates/sys" }
 # The NEON path is fluor's own: its `under` (scalar here: fluor's SIMD needs std; main.rs has the same kernel in NEON) and its background noise (noise_under), as Photon runs them.
 fluor = { path = "../../../fluor", default-features = false, features = ["host-bare"] }
 libm = "0.2"
 
 [build-dependencies]
 # The kernels recorded on the host and shipped as words (as ferros_clip's band coder is): the device never compiles them.
-valhall = { path = "../../valhall", features = ["ssa"] }
+valhall = { path = "../../crates/valhall", features = ["ssa"] }

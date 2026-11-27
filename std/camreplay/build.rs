@@ -24,7 +24,7 @@ fn main() {
     }
     std::fs::write(out.join("frame.bin"), &bytes).unwrap();
     // The IDT, as camera-raw2vsf reads it: the characterization section's Absolute entry, its matrix row-major and its sensitivity.
-    let idt = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pixel 8 pro calibration data/derived/cam2-main.idt.vsf");
+    let idt = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/pixel-8-pro-calibration/derived/cam2-main.idt.vsf");
     println!("cargo:rerun-if-changed={idt}");
     let doc = vsf::container::Document::open(std::fs::File::open(idt).unwrap()).unwrap();
     let sec = doc.section(doc.entry("characterization").expect("the IDT has no characterization")).unwrap();

@@ -8,7 +8,7 @@
 # ferros reports into ramoops (0xFD60_0000) and PSCI warm-resets; the next Linux boot prints the report in dmesg.
 # Nothing is armed at boot, so every reset — report, fault sink, panic reporter, watchdog — lands back in Android with adb, and `adb reboot bootloader` is always one command away. Measured round trip: about one minute.
 #
-# The default shim build is the USB service (ferros_kernel/src/shim_usb.rs): it adopts UFS, probes the vault, then serves Photon Transport on the inherited USB controller, so `ferros-bridge diag|reload|run|reboot` work with the disk live. It leaves (report + reset to Android) on `bridge reboot`, 64 s without enumerating, 512 s without a command, or both volume buttons. `bridge reboot fastboot` asks the next Linux boot to drop into the bootloader.
+# The default shim build is the USB service (kernel/src/shim_usb.rs): it adopts UFS, probes the vault, then serves Photon Transport on the inherited USB controller, so `ferros-bridge diag|reload|run|reboot` work with the disk live. It leaves (report + reset to Android) on `bridge reboot`, 64 s without enumerating, 512 s without a command, or both volume buttons. `bridge reboot fastboot` asks the next Linux boot to drop into the bootloader.
 #
 # Usage:
 #   tools/husky-hotload.sh            # build the USB-service shim, hot-load it, wait for it on USB, print DIAG

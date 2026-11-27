@@ -11,7 +11,7 @@ edition = "2024"
 photon-messenger = { path = "../../../photon" }
 vsf = { path = "../../../vsf" }
 # The device's icon conversion (ferros_kept::icon `from_srgb`), the one function, for `looks`.
-ferros_kept = { path = "../../ferros_kept" }
+ferros_kept = { path = "../../crates/kept" }
 # A source's size and whether it has alpha, read from its header, for `--assign-inside`'s polygon (decoding only; Photon's own `image`, unified).
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff", "gif", "bmp"] }
 

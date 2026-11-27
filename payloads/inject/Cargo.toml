@@ -9,8 +9,8 @@ name = "inject"
 path = "src/main.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-ferros_heap = { path = "../../ferros_heap", features = ["process"] }
-ferros_inject = { path = "../../ferros_inject" }
+ferros_sys = { path = "../../crates/sys" }
+ferros_heap = { path = "../../crates/heap", features = ["process"] }
+ferros_inject = { path = "../../crates/inject" }
 # vsf hashes with blake3; pure Rust, as the display has it: its C and assembly do not build for the bare target.
 blake3 = { version = "1", default-features = false, features = ["pure"] }

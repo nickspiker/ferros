@@ -30,4 +30,4 @@ sha2 = "0.10"
 # `log send`: one HTTPS POST to fgtw.org/report (rustls and the web's roots: nothing of the system's to find on Windows).
 ureq = { version = "2", default-features = false, features = ["tls"] }
 # The signing key's one reader (keys/ferros.key.vsf), for `release make` only.
-ferros_kist = { path = "../../ferros_kist", optional = true }
+ferros_kist = { path = "../../crates/kist", optional = true }

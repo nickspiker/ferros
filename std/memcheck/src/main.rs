@@ -1,4 +1,4 @@
-//! memcheck: ferros_rt's `memcpy`, `memmove` and `memset` (ferros_rt/src/mem.rs) checked on the device against a reference that moves one byte at a time thru volatile accesses (which LLVM can never turn back into a call to the functions under test).
+//! memcheck: ferros_rt's `memcpy`, `memmove` and `memset` (crates/rt/src/mem.rs) checked on the device against a reference that moves one byte at a time thru volatile accesses (which LLVM can never turn back into a call to the functions under test).
 //! Every length from 0 to 2^9, then 2^12 + 1 and 2^16 + 3; every source offset from 0 to 2^4 (alignment) and five destination offsets; for `memmove` every overlap with the destination from 2^7 below the source to 2^7 above it. The guard bytes around each destination must come back untouched: each case compares the whole window it could have touched and 2^6 bytes past either end.
 //! `ferros-bridge spawn memcheck.bin --name memcheck`: one line for each function, and a line for the first mismatch of each if any.
 

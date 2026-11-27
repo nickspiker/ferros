@@ -11,5 +11,5 @@ path = "src/lib.rs"
 [dependencies]
 # Plain Rust USB on Linux, macOS and Windows: no libusb.
 nusb = "0.1"
-ferros_pt = { path = "../../ferros_pt", features = ["std"] }
+ferros_pt = { path = "../../crates/pt", features = ["std"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

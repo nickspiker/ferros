@@ -566,12 +566,12 @@ pub fn ten_bpc(p: &Pipe, dsi: &ferros_dsi::Dsim<crate::DsiGrant>, force: bool, j
     m.rep
 }
 
-/// The captured running pipe (oracle/display/husky-hk3/cold-pipe: ferros's own 10 bpc state on a cold boot), as the words `ten_bpc` snapshots from a live one.
+/// The captured running pipe (data/oracle/display/husky-hk3/cold-pipe: ferros's own 10 bpc state on a cold boot), as the words `ten_bpc` snapshots from a live one.
 fn words(b: &[u8]) -> Vec<u32> {
     b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
-/// A running cold boot's pipe as ABL leaves it (oracle/display/husky-hk3/cold-pipe): DECON's main, DSC 0 and DSC 1 and window 5 blocks, the window's control word, DSIM's link, the D-PHY's bias and the PHY. `from_off` builds from it, and `ten_bpc` after a jump.
+/// A running cold boot's pipe as ABL leaves it (data/oracle/display/husky-hk3/cold-pipe): DECON's main, DSC 0 and DSC 1 and window 5 blocks, the window's control word, DSIM's link, the D-PHY's bias and the PHY. `from_off` builds from it, and `ten_bpc` after a jump.
 /// akita: each raster word the modeset writes, against the word ABL's running pipe holds (the snapshot), named where they differ; empty when AK3B's raster (ferros_dsc::AKITA) is exactly ABL's. The link's CONFIG may read back without its compression bit (19), as on husky. The first run on akita (2026-11-08) matched every word but the encoders' PPS, which hold half the picture each and are kept as ABL wrote them.
 fn akita_check(r: &Raster, c: &ColdPipe) -> Vec<u8> {
     let mut bad = Vec::new();
@@ -615,14 +615,14 @@ struct ColdPipe {
 impl ColdPipe {
     fn new() -> ColdPipe {
         ColdPipe {
-            main: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_main.bin")),
-            sub0: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_sub_dsc0.bin")),
-            sub1: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_sub_dsc1.bin")),
-            win: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_win5.bin")),
-            wincon: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/decon_wincon5.bin"))[0],
-            link: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/dsim0.bin")),
-            bias: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/dphy_bias.bin")),
-            phy: words(include_bytes!("../../../oracle/display/husky-hk3/cold-pipe/dphy.bin")),
+            main: words(include_bytes!("../../../data/oracle/display/husky-hk3/cold-pipe/decon_main.bin")),
+            sub0: words(include_bytes!("../../../data/oracle/display/husky-hk3/cold-pipe/decon_sub_dsc0.bin")),
+            sub1: words(include_bytes!("../../../data/oracle/display/husky-hk3/cold-pipe/decon_sub_dsc1.bin")),
+            win: words(include_bytes!("../../../data/oracle/display/husky-hk3/cold-pipe/decon_win5.bin")),
+            wincon: words(include_bytes!("../../../data/oracle/display/husky-hk3/cold-pipe/decon_wincon5.bin"))[0],
+            link: words(include_bytes!("../../../data/oracle/display/husky-hk3/cold-pipe/dsim0.bin")),
+            bias: words(include_bytes!("../../../data/oracle/display/husky-hk3/cold-pipe/dphy_bias.bin")),
+            phy: words(include_bytes!("../../../data/oracle/display/husky-hk3/cold-pipe/dphy.bin")),
         }
     }
 }

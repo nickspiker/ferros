@@ -40,7 +40,7 @@ ferros-bridge is one tool, one transport (PT), one device that never has to drop
 ## How verbs map to the wire
 
 The wire protocol is the spec; bridge verbs are CLI sugar over it.
-Every verb that touches device state rides a cap-addressed command — `[cap: 32][op: 1][params...]` where cap is a BLAKE3 credential from the registry in [ferros_pt/src/command.rs](ferros_pt/src/command.rs). That registry is the source of truth for what a device can be asked to do.
+Every verb that touches device state rides a cap-addressed command — `[cap: 32][op: 1][params...]` where cap is a BLAKE3 credential from the registry in [crates/pt/src/command.rs](crates/pt/src/command.rs). That registry is the source of truth for what a device can be asked to do.
 
 | Verb | Dev cap | Op(s) |
 |---|---|---|
@@ -250,7 +250,7 @@ The bridge stays the bridge: the tool that connects a dev box to a device, whate
 USB becomes one link among several.
 
 ### The same commands, any link
-- The commands do not change: the cap-addressed `[cap][op][params]` of [ferros_pt/src/command.rs](../ferros_pt/src/command.rs), each one a complete VSF document, as are the replies.
+- The commands do not change: the cap-addressed `[cap][op][params]` of [crates/pt/src/command.rs](../crates/pt/src/command.rs), each one a complete VSF document, as are the replies.
 - Off the cable they ride the fleet's own channel: the FGTW peer network Photon already uses (LAN beacon, direct UDP, WAN), device to device first, fgtw.org never in the path ([PHOTON.md](PHOTON.md), Claude memories/feedback_fgtw_devices_first.md).
 - The channel's encrypted frames stay lean (counter, ciphertext, tag); VSF is for the assembled command and reply (Claude memories/feedback_vsf_not_for_framing.md).
 - The bridge picks the link: `FERROS_PORT` for USB as today, a fleet device name for the rest; a command means the same on either.

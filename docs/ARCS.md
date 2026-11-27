@@ -72,7 +72,7 @@ So every arc, masked or native, is now a window of virtual addresses, and its fr
 
 ### Step 0: the memory map (built)
 
-`ferros_kernel/src/frames.rs` and BOARDS.md "Memory map": per board, the ranges and their proof, in the order frames are taken; `diag frames` reads them back.
+`kernel/src/frames.rs` and BOARDS.md "Memory map": per board, the ranges and their proof, in the order frames are taken; `diag frames` reads them back.
 husky: the two old pools (336 MiB) and the high bank's 9092 MiB that Android's memblock left unreserved (its boot log of 2026-08-17).
 akita: the two old pools and 4990 MiB of its high bank (2026-11-12, its own memblock under Android, BOARDS.md), 5326 MiB in all; written, read back and wiped end to end by `diag frames test` with no word wrong.
 

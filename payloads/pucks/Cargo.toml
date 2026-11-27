@@ -34,18 +34,18 @@ name = "puck_thermo"
 path = "src/thermo.rs"
 
 [dependencies]
-ferros_sys = { path = "../../ferros_sys" }
-ferros_heap = { path = "../../ferros_heap", features = ["process"] }
-ferros_puck = { path = "../../ferros_puck", features = ["sys"] }
+ferros_sys = { path = "../../crates/sys" }
+ferros_heap = { path = "../../crates/heap", features = ["process"] }
+ferros_puck = { path = "../../crates/puck", features = ["sys"] }
 # The typeface each puck draws its words in (the display's own).
-ferros_glyphs = { path = "../../ferros_glyphs" }
-ferros_faces = { path = "../../ferros_faces" }
-ferros_tide = { path = "../../ferros_tide", features = ["vsf"] }
-ferros_sky = { path = "../../ferros_sky" }
-ferros_compass = { path = "../../ferros_compass" }
-ferros_weather = { path = "../../ferros_weather" }
+ferros_glyphs = { path = "../../crates/glyphs" }
+ferros_faces = { path = "../../crates/faces" }
+ferros_tide = { path = "../../crates/tide", features = ["vsf"] }
+ferros_sky = { path = "../../crates/sky" }
+ferros_compass = { path = "../../crates/compass" }
+ferros_weather = { path = "../../crates/weather" }
 # The weather's POST to fgtw.org over the `ip` process: the response decoded as it arrives, as the stower's GET does (ferros_kist::fetch).
-ferros_kist = { path = "../../ferros_kist", features = ["process"] }
+ferros_kist = { path = "../../crates/kist", features = ["process"] }
 libm = "0.2"
 # The compass's kept calibration, a VSF document in its own domain.
 vsf = { path = "../../../vsf", default-features = false }

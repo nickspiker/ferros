@@ -168,11 +168,11 @@ The owner's decisions, 2026-11-19: VSF video; lossless only ("I'd just stick wit
 
 | piece | where | what |
 |---|---|---|
-| the codec | `ferros_rawcodec/` | no_std, no alloc, format Zil: tools/raw-codec's default path, its bytes less the 4-byte stream length (the container keeps both); the bitstream specified in lib.rs; a `neon` feature (residuals, block sums, codes) |
+| the codec | `crates/rawcodec/` | no_std, no alloc, format Zil: tools/raw-codec's default path, its bytes less the 4-byte stream length (the container keeps both); the bitstream specified in lib.rs; a `neon` feature (residuals, block sums, codes) |
 | the format | vsf branch `raw-video`: `visual::clip`, `visual::cfa_band`, `v('c')` | one VSF document a clip: generation 0, far-form `frame` sections as recorded (each naming the one before by BLAKE3), a closing generation with `index.b0`; a clip cut short reads to its last whole frame; vsf's `idt/image.md` "A RAW clip" has the tables |
 | the store | manifestus branch `single-copy` (`extent`), payloads/vault | single-copy extents: the table one mirrored vault value, the data written once into the `clips` window, no mirror, no read-back, its BLAKE3 at the seal |
 | the kernel | process.rs, service.rs | the `clips` window (48 GiB from 24 GiB, held inside the proven-free stretch at build time) granted to the vault process; `SYS_STORE` x1 bit 6 forwards extent ops (`VOP_EXTENT`, 1 MiB a write); WriteBooster on at the window's first write; bridge `store extent` pulls one |
-| the recorder | `ferros_clip/` (std) | bands coded on pinned workers, a writer staging whole blocks a UFS command at a time, the camera's pacing |
+| the recorder | `crates/clip/` (std) | bands coded on pinned workers, a writer staging whole blocks a UFS command at a time, the camera's pacing |
 | the harness | `std/rawrec`, `tools/clip-check` | records the binned main, hashes frames as captured, decodes the clip from the flash on the device; the host decodes a pulled clip against the hashes |
 
 ### Pacing: every whole rate from 1 to 60
@@ -208,7 +208,7 @@ The binned main's frame is a whole number of lines of 6320 clocks at 2,007,040,0
 
 The owner: "60FPS lock with 2x headroom on GPU or whatever's clever so I can shoot 24 in desert heat and not blink about it."
 
-**The split.** The band coder is cut in two (ferros_rawcodec `split_codes` and `pack_band`, byte for byte `encode_band`'s). The GPU does everything a block can do alone: one Valhall kernel (ferros_clip/src/gpu_kernel.rs, an invocation a block of 32 samples of one row, the whole frame in one run) reads the RAW10 rows, makes both residuals of every sample (Left or Avg4, and MED), the block's sums, the selection and k, every residual's code, and lays the block's codes end to end into a bit string (its body). The CPU chains each block's k code from the block before and copies the bodies' words into the band's two streams (`pack_band_bodies`), BLAKE3s the coded bands, and writes. The kernel is compiled on the host by valhall's SSA recorder (ferros_clip/build.rs) and shipped in the binary as words; the device never runs a compiler.
+**The split.** The band coder is cut in two (ferros_rawcodec `split_codes` and `pack_band`, byte for byte `encode_band`'s). The GPU does everything a block can do alone: one Valhall kernel (crates/clip/src/gpu_kernel.rs, an invocation a block of 32 samples of one row, the whole frame in one run) reads the RAW10 rows, makes both residuals of every sample (Left or Avg4, and MED), the block's sums, the selection and k, every residual's code, and lays the block's codes end to end into a bit string (its body). The CPU chains each block's k code from the block before and copies the bodies' words into the band's two streams (`pack_band_bodies`), BLAKE3s the coded bands, and writes. The kernel is compiled on the host by valhall's SSA recorder (crates/clip/build.rs) and shipped in the binary as words; the device never runs a compiler.
 
 **Bit exact.** tests/gpu.rs runs the kernel on valhall's emulator over a Pro frame against `split_codes` and `encode_band`; tests/record.rs records with `gpu::HostDevice` (the GPU's work on the host's CPU) and compares the whole clip with the CPU path's, byte for byte; on the Pro, rawrec job 7 compares every band of a frame with `encode_band`, and recordings decode bit exact on the device (rawrec's kept copies sample for sample, and the source hashes).
 Two traps found on the Pro: one invocation's stores to one address do not land in the order they were made (storing a body word at every code left about 40 of 393k blocks a frame missing their last codes, different blocks each run: each word is now stored once, whole, the partial stores going to a scratch word in the body's own cache line); and valhall's SSA recorder is one global (two tests recording at once corrupt each other: they take a lock).
@@ -293,7 +293,7 @@ Opsin builds against vsf `raw-video` with `clip::edit_generation` and `Reader::v
    ```
 3. **Give it its camera's IDT.** A clip from ferros carries no characterization yet (`ferros_clip::Camera::characterization` is `None` in rawrec and Lumis); the IDT is a property of the sensor, appended to the clip as a generation (undo: `vsfinfo undo`):
    ```bash
-   opsin --characterize clip.vsf "pixel 8 pro calibration data/derived/cam2-main.idt.vsf"
+   opsin --characterize clip.vsf "data/pixel-8-pro-calibration/derived/cam2-main.idt.vsf"
    ```
    The device's own copy is the vault's `cam.<key>.idt` (the main is `boitata`).
    Or measured on the shoot: with the colour target in frame for a moment, `Cal` in Opsin (built with `--features calibrate`) on that frame scans it and pastes the solved DSR IDT into the clip at `unit`/`relative`; or copy a profile from a still of the same camera and paste it, as for stills:

@@ -8,7 +8,7 @@ description = "Reads a gtrace capture of lhd's /dev/ttyBCM traffic (both directi
 
 [dependencies]
 # The broadcast ephemerides (RINEX 3 GPS LNAV), for `brdc`.
-ferros_gnss = { path = "../../ferros_gnss" }
+ferros_gnss = { path = "../../crates/gnss" }
 # Eagle time and the documents (ferros_kept), for `eph`.
 vsf = { path = "../../../vsf" }
-ferros_kept = { path = "../../ferros_kept" }
+ferros_kept = { path = "../../crates/kept" }

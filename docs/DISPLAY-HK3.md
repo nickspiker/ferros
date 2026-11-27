@@ -1,6 +1,6 @@
 # DISPLAY-HK3 — the husky panel, from its driver
 
-The Pixel 8 Pro (husky) panel is **google-hk3** (model HK3-A0B-00), on **DSIM0**, driven by DECON0. This is the driver-author's inventory of it, read from the stock driver with line citations, 2026-10-16. The live confirmation of every sequence below, as Android actually sends it, is `oracle/display/husky-hk3/` (register dumps and DSI packet traces per state). An earlier inventory in DISPLAY-DESIGN.md came from `panel-samsung-s6e3hc3-c10.c`, a sibling device's panel; it is superseded by this.
+The Pixel 8 Pro (husky) panel is **google-hk3** (model HK3-A0B-00), on **DSIM0**, driven by DECON0. This is the driver-author's inventory of it, read from the stock driver with line citations, 2026-10-16. The live confirmation of every sequence below, as Android actually sends it, is `data/oracle/display/husky-hk3/` (register dumps and DSI packet traces per state). An earlier inventory in DISPLAY-DESIGN.md came from `panel-samsung-s6e3hc3-c10.c`, a sibling device's panel; it is superseded by this.
 
 Sources (under `/mnt/Harbor/husky-kernel/private/`):
 - **HK3** = `devices/google/shusky/display/panel-google-hk3.c` — the bound driver (`compatible = "google,hk3"`, HK3:2917, `shusky/dts/zuma-husky-display.dtsi:11-17`). `panel-gs-hk3.c` beside it is an unfinished port (`google,gs-hk3`), not bound; it lacks LP, HBM, self-refresh, op_hz, TE2 and refresh_ctrl hooks and differs in NS TE width (546 vs 1223 µs), FFC at init and enable order. Use HK3.

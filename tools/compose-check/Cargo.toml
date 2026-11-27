@@ -9,7 +9,7 @@ name = "compose-check"
 path = "src/main.rs"
 
 [dependencies]
-valhall = { path = "../../valhall", features = ["ssa", "sim"] }
+valhall = { path = "../../crates/valhall", features = ["ssa", "sim"] }
 libm = "0.2"
 
 [workspace]

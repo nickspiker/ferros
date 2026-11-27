@@ -28,9 +28,9 @@ A snapshot of what runs on the Pixel 8 Pro (husky) today and what's next. Area d
 
 ## Storage and the boot gate (2026-10-20)
 
-- **The kernel vault runs on manifestus** (`ferros_kernel/src/kvault.rs`), the owner's own store, rather than a kernel copy of it: two mirrored UFS regions, sealed values, a sealed name index, proven across reboots. Reserved names stay out of listings. The in-tree `ferros_vault` is still referenced by `shim.rs`, `ira.rs` and the wairua nonce source, and comes out next.
+- **The kernel vault runs on manifestus** (`kernel/src/kvault.rs`), the owner's own store, rather than a kernel copy of it: two mirrored UFS regions, sealed values, a sealed name index, proven across reboots. Reserved names stay out of listings. The in-tree `ferros_vault` is still referenced by `shim.rs`, `ira.rs` and the wairua nonce source, and comes out next.
 - **An append-only text log on the flash** (`flashlog.rs`, `diag log`): a bus stall loses the PT response, so anything being bisected names each step on the flash before it takes it. This is what found the camera read that stalls the bus.
-- **The boot gate in the hv** (`ferros_hv/src/gate.rs`): one pre-assembled slot-a image, `[hv][Linux][ferros]`, showing "Ready?" before Linux — power (or 1 s on dev) boots ferros, volume down continues to Android, volume up holds. Android on slot a stays the escape hatch and the register oracle.
+- **The boot gate in the hv** (`hv/src/gate.rs`): one pre-assembled slot-a image, `[hv][Linux][ferros]`, showing "Ready?" before Linux — power (or 1 s on dev) boots ferros, volume down continues to Android, volume up holds. Android on slot a stays the escape hatch and the register oracle.
 - **The wedged USB port recovers itself** (`tools/usb-kick.sh`): the host port, not the phone, is what gives up after a -71 storm; the scripts kick it through its sysfs switch instead of asking for a replug.
 
 ## Photon and FGTW on ferros (corrected 2026-11-05)

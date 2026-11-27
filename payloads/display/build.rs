@@ -26,7 +26,7 @@ fn main() {
     // No kist's icon is built in (owner, 2026-11-20): the map hands each over by its `hp` and the display keeps them in its cache (main.rs `ICON_SLOT`). Until then the bundle (tools/app-icons `bundle`, target/icons/icons.bin) went in here, numbered, and two builds with different numbering swapped the settings and Kūaha icons on the Pro.
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     // The ferros mark (logo.vsf, tools/logo-vsf's analytic pieces) as a table the display draws at any size (draw::logo), in place of the bundle's raster (owner, 2026-11-07). Each piece: its inner and outer radius as fractions of the mark's outer radius, where it starts and how far it sweeps (turns, from +x toward +y, the sweep made positive), and its colour as working values (gamma 2, white at Q14), lit and at rest (the grey: photopic luminance, VSF RGB's weights R 0.2584, G 0.6346, B 0.1070, as tools/app-icons makes the map's greys).
-    let mark = manifest.join("../../logo.vsf");
+    let mark = manifest.join("../../assets/logo.vsf");
     println!("cargo:rerun-if-changed={}", mark.display());
     let bytes = std::fs::read(&mark).expect("logo.vsf");
     let vsf::VsfType::ron(node) = vsf::types::renderable::read_scene(&bytes).expect("logo.vsf: its scene") else { panic!("logo.vsf: the scene is not a node") };

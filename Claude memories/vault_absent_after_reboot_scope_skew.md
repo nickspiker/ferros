@@ -16,4 +16,4 @@ The harm it can do: an older copy re-put by hand under the older kernel is laid 
 
 **How to apply:** when a vault entry "vanishes" after a reboot, compare the kernels' scopes first (`git log -G'StoreScope'`), and grep the flash log (`diag "log 256"`) for `store moved` / `store remove ... (process)`; never re-store before checking.
 Since the fix (VAULT-OUT.md "Kernels that know different scopes"), a bridge get or rm of an unknown-scope name reads thru to the vault process, and migrations log `store moved "<name>" into the vault process, scope <s>`.
-Building in a worktree: `.claude/worktrees/tapuwae` is another agent's copy pointing at its own valhall; build thru a sibling symlink farm in the scratchpad with `--manifest-path`, and copy the ignored `oracle/display/husky-hk3/cold-power/*.bin` into the worktree.
+Building in a worktree: `.claude/worktrees/tapuwae` is another agent's copy pointing at its own valhall; build thru a sibling symlink farm in the scratchpad with `--manifest-path`, and copy the ignored `data/oracle/display/husky-hk3/cold-power/*.bin` into the worktree.

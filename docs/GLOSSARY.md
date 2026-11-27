@@ -92,7 +92,7 @@ A two-bit field, value = the chip's vitality on the four-pair redundancy scale (
 | [`ihi`](../ihi) | `handle_proof` / `spaghettify` — *mana* made outwardly verifiable | *ihi* (perceptible mana) |
 | [`tohu`](../tohu) | device identity: per-platform oracle + frozen derivation; the software stand-in for *ira*/PIPE | *tohu* (a sign drawn from the formless) |
 | [`manifestus`](../manifestus) | content-addressed storage engine (mirrored blocks, generation ring, COW HAMT) | manifest |
-| [`miro`](../ferros_miro) | reversible avalanching permutation with tunable secret/check split; seals a payload into an opaque codeword (see [MIRO.md](MIRO.md)) | *miro* (to twist strands into cord) |
+| [`miro`](../tools/miro) | reversible avalanching permutation with tunable secret/check split; seals a payload into an opaque codeword (see [MIRO.md](MIRO.md)) | *miro* (to twist strands into cord) |
 | [`custodes`](../custodes) | K-of-N social recovery for total device loss | custodians |
 | `photon` | the messenger — CLUTCH key ceremony, CHAIN rolling encryption, FGTW transport, RUA dead-drop | a quantum of light |
 | *photon* (unit) | a message: discrete, quantized, arrives whole — "shoot me a photon" | the particle |

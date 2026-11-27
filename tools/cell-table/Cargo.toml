@@ -10,5 +10,5 @@ description = "Cell tables as VSF (docs/LOCATION.md): converts a cell source's e
 
 [dependencies]
 # The table's schema and checks: the same code the place service runs.
-ferros_cell = { path = "../../ferros_cell", features = ["vsf"] }
+ferros_cell = { path = "../../crates/cell", features = ["vsf"] }
 vsf = { path = "../../../vsf" }

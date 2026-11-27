@@ -3,7 +3,7 @@
 # ferros hv on husky (HV.md): build the EL2 layer, pack it in front of the slot-a Linux Image as one boot.img v4 kernel, and (with --flash) hand it to tools/husky-cold.sh to sign, keep and flash.
 # Blob = [hv flat binary padded to G#18_0000][Linux Image], LZ4-legacy compressed as ABL expects; ABL loads it at G#8008_0000, so the Image lands 2 MiB aligned at G#8020_0000.
 # The Linux Image defaults to the one unpacked from the 2026-10-13 boot_a backup (the kernel Android runs today).
-# The boot gate (ferros_hv/src/gate.rs): by default the blob also carries the cold ferros image, packed past Linux's image_size (rounded up to 2 MiB) behind a 4 KiB header {"FERROSGT", u64 length}; the hv then shows "Ready?" before Linux: power (or 1 s on dev builds) = ferros, volume down = Android, volume up = hold. --no-ferros leaves it out (the hv boots Android straight away, as before: oracle captures).
+# The boot gate (hv/src/gate.rs): by default the blob also carries the cold ferros image, packed past Linux's image_size (rounded up to 2 MiB) behind a 4 KiB header {"FERROSGT", u64 length}; the hv then shows "Ready?" before Linux: power (or 1 s on dev builds) = ferros, volume down = Android, volume up = hold. --no-ferros leaves it out (the hv boots Android straight away, as before: oracle captures).
 # Usage: tools/husky-hv.sh [--image <Linux Image>] [--no-ferros] [--flash]
 set -eu
 # Only husky: every fastboot and adb call goes to it, and fastboot refuses a phone that is not (tools/lib/devices.sh).
