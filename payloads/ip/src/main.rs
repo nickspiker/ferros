@@ -45,7 +45,7 @@
 //! DHCPv4 (`dhcp_in`, `dhcp_retry`): DISCOVER, OFFER, REQUEST, ACK, retransmitted every 2 s until bound; four REQUESTs unanswered give the offer up for a fresh DISCOVER (RFC 2131 4.4.1). What it sent and heard since WiFi came up is a console line every 16th retransmit while unbound and once at the bind: `DHCP <no lease yet|bound>: A#<n> DISCOVERs and A#<n> REQUESTs out; A#<n> OFFERs, A#<n> ACKs, A#<n> NAKs in, A#<n> replies to other transactions; WiFi frames in A#<n> broadcast, A#<n> multicast, A#<n> unicast (A#<n> ARP, A#<n> IPv4); state A#<1 discovering, 2 requesting, 3 bound>[, lease A#<s> s]`. The DISCOVER asks for unicast replies (broadcast flag clear). No renewal yet: the lease is said, not kept to.
 //!
 //! TCP here, client only, re-engineered for throughput on 2026-11-11 (owner: "sounds like it needs re-engineered", after Mahere's 1.6 MB base cells crawled thru two connections of a 4 KiB window, about 80 KB/s at a 50 ms round trip). The protocol's pure parts are ferros_tcp, tested on the host.
-//! - Sixteen connections (`TCPN`). An idle one costs its control state alone (`Tcb`, a static table); an open one holds a block of the arc (`Blocks`): a 1 MiB receive buffer and a 256 KiB send buffer. The kernel maps 4 MiB of heap at spawn (three blocks); the arc grows for more as connections open (SYS_ARC, docs/ARCS.md) and shrinks again when the highest blocks are free.
+//! - A connection for every handle a byte names (`TCPN`, 256; sixteen until 2026-11-27). An idle one costs its control state alone (`Tcb`, a static table); an open one holds a block of the arc (`Blocks`): a 1 MiB receive buffer and a 256 KiB send buffer. The kernel maps 4 MiB of heap at spawn (three blocks); the arc grows for more as connections open (SYS_ARC, docs/ARCS.md) and shrinks again when the highest blocks are free.
 //! - The receive window is the free room of the 1 MiB buffer, said with window scaling (RFC 7323, shift 5); a peer that offers no scaling gets 64 KiB of it. Its right edge moves by a segment, or half the buffer, at least (silly-window avoidance), and a read that reopens a window shrunk under half says so at once.
 //! - Segments past a hole are kept in place in the buffer (eight ranges, `ferros_tcp::Ooo`) and delivered when the hole fills; each is ACKed at once with SACK blocks (RFC 2018), so the peer resends only what is missing.
 //! - ACKs: every second in-order segment and one with PSH at once (RFC 5681 4.2, RFC 1122 4.2.3.2), an odd one at the end of the batch of frames it came in (after each exchange with the WiFi driver, and at the end of each pass over the links: `tcp_acks`); at once for FIN, out-of-order data, a filled hole or a duplicate. No delayed-ACK timer: the batch is microseconds, and the loop does not sleep while an ACK waits to go. The ACKs of a batch go out together in the next exchange. (From 2026-11-11 to 2026-11-12 a batch of up to 88 segments was ACKed once, and senders starved: docs/WIFI.md, "ACKs".)
@@ -733,8 +733,9 @@ struct Cell {
 }
 const CELL_DOWN: Cell = Cell { flags: 0, mtu: 0, v4: [0; 4], v6: [0; 16], dns4: [0; 4], dns6: [0; 16] };
 
-/// Connections at once: sixteen (owner, 2026-11-11, the re-engineering's plan; two until then, and Mahere held one of them at a time). An idle one costs its `Tcb` alone.
-const TCPN: usize = 1 << 4;
+/// Connections at once: every one a handle names, the handle being one byte on the wire (ops 4-7 and 14). An idle one costs its control state alone (`Tcb` and its two `TcpHeld`, 520 bytes; 133 KB for all of them), an open one its block of the arc, taken when it opens and given back when it is freed (`Blocks`), so what bounds them is the device's memory: a connection the arc cannot grow for is refused ([6]).
+/// Sixteen until 2026-11-27 (owner, 2026-11-11; then "Def grow on demand. Not sure why we have so many hardcoded limits around", after Mahere's eight filled half of them); two before 2026-11-11.
+const TCPN: usize = 1 << 8;
 /// A connection's receive buffer: 1 MiB, the most its window says with scaling (2^20 >> `RCV_WS` fits the 16-bit field). At a 50 ms round trip that is 20 MB/s from one connection before the window, not the link, is what holds it back.
 const RXB: usize = 1 << 20;
 /// A connection's send buffer: 256 KiB (an upload's window in flight; the requests Mahere and the stower send are a few hundred bytes).
@@ -760,7 +761,7 @@ const HEAP_START: usize = 4 << 20;
 /// Retransmission expiries a connection survives: the eighth fails it (from 250 ms, doubling to the 8 s ceiling: about 30 s in all).
 const TRIES: u32 = 1 << 3;
 /// `blk` while a connection holds no block.
-const NO_BLOCK: u8 = u8::MAX;
+const NO_BLOCK: u16 = u16::MAX;
 /// Segment flags.
 const FIN: u8 = 1;
 const SYN: u8 = 2;
@@ -785,7 +786,7 @@ struct Tcb {
     addr: [u8; 16],
     rport: u16,
     lport: u16,
-    blk: u8,
+    blk: u16,
     iss: u32,
     snd_una: u32,
     snd_nxt: u32,
@@ -931,13 +932,13 @@ struct Blocks {
     top0: usize,
     top: usize,
     grows: bool,
-    /// Bit k: block k is a connection's.
-    used: u32,
+    /// Bit k: block k is a connection's (word k >> 6, bit k & 63).
+    used: [u64; TCPN / 64],
 }
 
 impl Blocks {
     /// Block k's address.
-    fn addr(&self, k: u8) -> usize {
+    fn addr(&self, k: u16) -> usize {
         let k = k as usize;
         if k < self.start { self.heap + k * BLOCK } else { ferros_sys::arc_base() as usize + self.top0 + (k - self.start) * BLOCK }
     }
@@ -948,11 +949,9 @@ impl Blocks {
     }
 
     /// The lowest free block, the arc grown to hold it when it lies above the top; None when every connection holds one or the kernel refuses the growth (its ceiling, or too few free frames).
-    fn take(&mut self) -> Option<u8> {
-        let k = (!self.used).trailing_zeros() as usize;
-        if k >= TCPN {
-            return None;
-        }
+    fn take(&mut self) -> Option<u16> {
+        let w = self.used.iter().position(|&u| u != u64::MAX)?;
+        let k = w * 64 + (!self.used[w]).trailing_zeros() as usize;
         let need = self.need(k + 1);
         if need > self.top {
             if !self.grows {
@@ -961,17 +960,19 @@ impl Blocks {
             let (top, _) = ferros_sys::arc::grow(need - self.top).ok()?;
             self.top = top;
         }
-        self.used |= 1 << k;
-        Some(k as u8)
+        self.used[k >> 6] |= 1 << (k & 63);
+        Some(k as u16)
     }
 
     /// Block k given back, and the arc shrunk to the highest block still taken.
-    fn give(&mut self, k: u8) {
-        self.used &= !(1u32 << k);
+    fn give(&mut self, k: u16) {
+        self.used[k as usize >> 6] &= !(1u64 << (k & 63));
         if !self.grows {
             return;
         }
-        let want = self.need(32 - self.used.leading_zeros() as usize);
+        // One past the highest block still taken (0 with none).
+        let n = self.used.iter().rposition(|&u| u != 0).map_or(0, |w| w * 64 + 64 - self.used[w].leading_zeros() as usize);
+        let want = self.need(n);
         if want < self.top {
             if let Ok((top, _)) = ferros_sys::arc::shrink(want) {
                 self.top = top;
@@ -4048,7 +4049,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let blocks = if top as u64 == ERR {
         panic!("ip: the kernel answered no arc size (SYS_ARC): ip needs a kernel from 2026-11-11 or later")
     } else {
-        Blocks { heap, start: (HEAP_START - 64) / BLOCK, top0: top, top, grows: true, used: 0 }
+        Blocks { heap, start: (HEAP_START - 64) / BLOCK, top0: top, top, grows: true, used: [0; TCPN / 64] }
     };
     let mut ip = Ip {
         grants,
