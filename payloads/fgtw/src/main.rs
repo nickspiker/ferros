@@ -427,10 +427,11 @@ impl Udp {
         c[2..18].copy_from_slice(&to.ip);
         c[18..20].copy_from_slice(&80u16.to_be_bytes());
         let mut r = [0u8; 16];
-        if self.call(&c, &mut r) != 2 || r[0] != 0 {
+        if self.call(&c, &mut r) != 3 || r[0] != 0 {
             return None;
         }
-        let h = r[1];
+        // The handle: two bytes (payloads/ip ops 4-7).
+        let h = [r[1], r[2]];
         let mut req = Vec::with_capacity(160 + body.len());
         req.extend_from_slice(b"POST / HTTP/1.1\r\nHost: ");
         req.extend_from_slice(host);
@@ -457,10 +458,10 @@ impl Udp {
         let mut state = 0u8;
         while now() < deadline {
             if sent < req.len() {
-                // A call carries 4096 bytes: the op and handle, and 4094 of the request.
-                let n = (req.len() - sent).min((1 << 12) - 2);
-                let mut s = Vec::with_capacity(2 + n);
-                s.extend_from_slice(&[5, h]);
+                // A call carries 4096 bytes: the op and handle, and 4093 of the request.
+                let n = (req.len() - sent).min((1 << 12) - 3);
+                let mut s = Vec::with_capacity(3 + n);
+                s.extend_from_slice(&[5, h[0], h[1]]);
                 s.extend_from_slice(&req[sent..sent + n]);
                 if self.call(&s, &mut r) == 3 && r[0] == 0 {
                     sent += u16::from_be_bytes([r[1], r[2]]) as usize;
@@ -468,8 +469,8 @@ impl Udp {
             }
             // Held a second at most once the request is all in ip's hands; at once while it is not.
             let wait = if sent < req.len() { 0 } else { 1 };
-            let mut q = [6, h, wait, 0, 0, 0, 0];
-            q[3..7].copy_from_slice(&(most as u32).to_be_bytes());
+            let mut q = [6, h[0], h[1], wait, 0, 0, 0, 0];
+            q[4..8].copy_from_slice(&(most as u32).to_be_bytes());
             let n = self.call(&q, &mut out);
             if n == 0 || n == ERR {
                 break;
@@ -485,7 +486,7 @@ impl Udp {
                 ferros_sys::sleep_until(now() + f / 1000);
             }
         }
-        let _ = self.call(&[7, h], &mut r);
+        let _ = self.call(&[7, h[0], h[1]], &mut r);
         if state != 3 {
             return None;
         }

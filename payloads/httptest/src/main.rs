@@ -263,23 +263,24 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     let t = now();
     let mut r = [0u8; 16];
     let n = a.udp(&c, &mut r);
-    if n != 2 || r[0] != 0 {
+    if n != 3 || r[0] != 0 {
         a.put(b"httptest: connect refused, status ");
         a.dec(r[0] as u64);
         a.done(b"");
     }
-    let h = r[1];
+    // The handle: two bytes (payloads/ip ops 4-7).
+    let h = [r[1], r[2]];
 
     // The request, through the send buffer as it takes it.
     let mut req = [0u8; 600];
     req[0] = 5;
-    req[1] = h;
-    let mut k = 2;
+    req[1..3].copy_from_slice(&h);
+    let mut k = 3;
     for part in [&b"GET "[..], path, b" HTTP/1.1\r\nHost: ", host, b"\r\nUser-Agent: ferros\r\nConnection: close\r\n\r\n"] {
         req[k..k + part.len()].copy_from_slice(part);
         k += part.len();
     }
-    let body = req[2..k].len();
+    let body = req[3..k].len();
     let mut sent = 0;
     let mut fnv: u64 = 0xcbf2_9ce4_8422_2325;
     let mut total = 0u64;
@@ -293,21 +294,21 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     // The receive buffer: 256 KiB, the most one reply of ip carries (its RECV_MAX), so a fast link is not held to a 16 KiB call (a static: the payload's stack is far smaller).
     let rx = unsafe { &mut *core::ptr::addr_of_mut!(RX) };
     // TCP RECV: held a second at most for data or a change of state once the request is all in ip's send buffer (never a poll), the most data the buffer takes after the state byte.
-    let mut q = [6, h, 0, 0, 0, 0, 0];
-    q[3..7].copy_from_slice(&(rx.len() as u32 - 1).to_be_bytes());
+    let mut q = [6, h[0], h[1], 0, 0, 0, 0, 0];
+    q[4..8].copy_from_slice(&(rx.len() as u32 - 1).to_be_bytes());
     loop {
         if sent < body {
             let mut s = [0u8; 600];
             s[0] = 5;
-            s[1] = h;
+            s[1..3].copy_from_slice(&h);
             let left = body - sent;
-            s[2..2 + left].copy_from_slice(&req[2 + sent..2 + body]);
-            let n = a.udp(&s[..2 + left], &mut r);
+            s[3..3 + left].copy_from_slice(&req[3 + sent..3 + body]);
+            let n = a.udp(&s[..3 + left], &mut r);
             if n == 3 && r[0] == 0 {
                 sent += u16::from_be_bytes([r[1], r[2]]) as usize;
             }
         }
-        q[2] = if sent < body { 0 } else { 1 };
+        q[3] = if sent < body { 0 } else { 1 };
         let n = a.udp(&q, rx);
         if n == 0 || n == ERR {
             a.done(b"httptest: recv failed");
@@ -339,7 +340,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         }
         if state >= 3 && n == 1 {
             let ms = ferros_sys::us_since(t) / 1000;
-            let _ = a.udp(&[7, h], &mut r);
+            let _ = a.udp(&[7, h[0], h[1]], &mut r);
             let line_end = head[..head_len].iter().position(|&c| c == b'\r').unwrap_or(head_len);
             a.put(b"httptest: ");
             let hl = head;
@@ -360,7 +361,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             a.done(b"");
         }
         // The send buffer took none of the request yet: a millisecond before more of it.
-        if n == 1 && q[2] == 0 {
+        if n == 1 && q[3] == 0 {
             sleep_ms(1);
         }
     }

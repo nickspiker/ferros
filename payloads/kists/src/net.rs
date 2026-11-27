@@ -55,7 +55,7 @@ fn address(cap: u64, host: &str) -> Option<[u8; 4]> {
 }
 
 /// A TCP connection to `ip`:`port`. ip holds sixteen; a full table frees as others finish, so it is asked again each second a few times.
-fn connect(cap: u64, ip: [u8; 4], port: u16) -> Option<u8> {
+fn connect(cap: u64, ip: [u8; 4], port: u16) -> Option<u16> {
     let mut c = [0u8; 20];
     c[0] = 4;
     c[1] = 4;
@@ -64,11 +64,11 @@ fn connect(cap: u64, ip: [u8; 4], port: u16) -> Option<u8> {
     for _ in 0..1 << 3 {
         let mut r = [0u8; 16];
         let n = ask(cap, &c, &mut r);
-        if n == 2 && r[0] == 0 {
-            return Some(r[1]);
+        if n == 3 && r[0] == 0 {
+            return Some(u16::from_be_bytes([r[1], r[2]]));
         }
-        // 4: no free connection; anything else will not change by asking.
-        if n != 1 || r[0] != 4 {
+        // 6: no memory for its block yet (another connection may close); anything else will not change by asking.
+        if n != 1 || r[0] != 6 {
             return None;
         }
         sleep_until(now() + freq());
@@ -83,16 +83,16 @@ pub fn get(cap: u64, url: &str, mut head: impl FnMut(&Response) -> Result<(), &'
     let h = connect(cap, ip, port).ok_or(Fail::Network)?;
     let r = transfer(cap, h, host, path, &mut head, &mut body);
     let mut x = [0u8; 4];
-    let _ = ask(cap, &[7, h], &mut x);
+    let _ = ask(cap, &[7, (h >> 8) as u8, h as u8], &mut x);
     r
 }
 
-fn transfer(cap: u64, h: u8, host: &str, path: &str, head: &mut impl FnMut(&Response) -> Result<(), &'static str>, body: &mut impl FnMut(&[u8]) -> Result<(), &'static str>) -> Result<(), Fail> {
+fn transfer(cap: u64, h: u16, host: &str, path: &str, head: &mut impl FnMut(&Response) -> Result<(), &'static str>, body: &mut impl FnMut(&[u8]) -> Result<(), &'static str>) -> Result<(), Fail> {
     // The request: one line, the host, nothing kept alive.
     let mut req = [0u8; 600];
     req[0] = 5;
-    req[1] = h;
-    let mut k = 2;
+    req[1..3].copy_from_slice(&h.to_be_bytes());
+    let mut k = 3;
     for part in [b"GET ".as_slice(), path.as_bytes(), b" HTTP/1.1\r\nHost: ", host.as_bytes(), b"\r\nUser-Agent: ferros\r\nConnection: close\r\n\r\n"] {
         // WHY: the path is the directory's or the person's list's; one longer than the request holds is no capsule this fetches.
         if k + part.len() > req.len() {
@@ -101,13 +101,13 @@ fn transfer(cap: u64, h: u8, host: &str, path: &str, head: &mut impl FnMut(&Resp
         req[k..k + part.len()].copy_from_slice(part);
         k += part.len();
     }
-    let total = k - 2;
+    let total = k - 3;
     let mut sent = 0;
     let mut resp = Response::new();
     let mut headed = false;
     let mut out = [0u8; 1 + RECV_MOST];
-    let mut hold = [6, h, STALL_S, 0, 0, 0, 0];
-    hold[3..7].copy_from_slice(&(RECV_MOST as u32).to_be_bytes());
+    let mut hold = [6, (h >> 8) as u8, h as u8, STALL_S, 0, 0, 0, 0];
+    hold[4..8].copy_from_slice(&(RECV_MOST as u32).to_be_bytes());
     // The state ip answered last: a held receive is also answered when it changes (the connection opened).
     let mut was = 1u8;
     loop {
@@ -115,16 +115,16 @@ fn transfer(cap: u64, h: u8, host: &str, path: &str, head: &mut impl FnMut(&Resp
         if sent < total {
             let mut s = [0u8; 600];
             s[0] = 5;
-            s[1] = h;
+            s[1..3].copy_from_slice(&h.to_be_bytes());
             let left = total - sent;
-            s[2..2 + left].copy_from_slice(&req[2 + sent..2 + total]);
+            s[3..3 + left].copy_from_slice(&req[3 + sent..3 + total]);
             let mut r = [0u8; 4];
-            if ask(cap, &s[..2 + left], &mut r) == 3 && r[0] == 0 {
+            if ask(cap, &s[..3 + left], &mut r) == 3 && r[0] == 0 {
                 sent += u16::from_be_bytes([r[1], r[2]]) as usize;
             }
         }
         // Held until data comes, the connection's state changes, or STALL_S with nothing; at once while the request is still going out.
-        hold[2] = if sent < total { 0 } else { STALL_S };
+        hold[3] = if sent < total { 0 } else { STALL_S };
         let n = ask(cap, &hold, &mut out);
         if n == 0 || n == ERR {
             return Err(Fail::Broken("the connection was lost"));
@@ -155,7 +155,7 @@ fn transfer(cap: u64, h: u8, host: &str, path: &str, head: &mut impl FnMut(&Resp
             continue;
         }
         // Nothing came for the whole wait: the server stopped sending. With the request still going out (ip's send buffer full), a moment before more of it.
-        if hold[2] != 0 {
+        if hold[3] != 0 {
             return Err(Fail::Broken("the server stopped sending"));
         }
         pause();

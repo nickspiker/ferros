@@ -11,13 +11,13 @@
 //! - 3 INFO: → MAC (6), IPv4 address, mask, router (4 each), IPv6 link-local (16), IPv6 global (16), flags (bit 0 IPv4 bound, bit 1 IPv6 global, bit 2 the cellular call is up, bit 3 a person is present, so applications are served), the IPv4 DNS server (4), then the IPv6 DNS server (16): 71 bytes. The addresses and DNS servers are the ones traffic of each family leaves with: WiFi's when it has them (DHCP's option 6; the router advertisement's RDNSS), else the call's; a server of zeros when that link named none.
 //!
 //! While nobody is present (bit 3 clear) every request but INFO is answered with nothing: a SEND sends nothing, a RECV brings nothing, a CONNECT opens nothing. An application asks INFO first and says so (2026-11-12: Mahere and httptest said "DNS gave no address" all night on a locked device, their questions never sent).
-//! - 4 TCP CONNECT: family, address (16), port (u16 BE) → [0, handle] connecting, [2] no address yet, [4] no free connection, [6] no memory for its buffers (the arc could not grow).
-//! - 5 TCP SEND: handle, data (up to 4094 bytes: a call carries 4096, process.rs SYS_CALL) → [0, accepted u16 BE] (what the send buffer took; send the rest later), [5] not a connection.
-//! - 6 TCP RECV: handle, wait, most (u32 BE) → [state, data…]: state 1 connecting, 2 open, 3 the peer closed (no more data once this is empty), 4 failed (reset or timed out), 5 not a connection (or a request shorter than its 7 bytes). The data is what the connection has taken in, up to `most` and at most 2^18 bytes (`RECV_MAX`, the kernel's largest reply), so the caller's reply buffer holds 1 + most (the kernel cuts a reply at the caller's length). With `wait` 1 to 255 (seconds) the call is held while the connection has nothing new: answered as data lands, as its state changes (it opens, the peer closes, it fails), or when the wait runs out (then its state and no data); 0 answers at once. A held receive is its app asking (no idle reaping while it waits); a second held receive on the same connection answers the first as things stand.
+//! - 4 TCP CONNECT: family, address (16), port (u16 BE) → [0, handle (u16 BE)] connecting, [2] no address yet, [6] no memory for its buffers (the arc could not grow).
+//! - 5 TCP SEND: handle (u16 BE), data (up to 4094 bytes: a call carries 4096, process.rs SYS_CALL) → [0, accepted u16 BE] (what the send buffer took; send the rest later), [5] not a connection.
+//! - 6 TCP RECV: handle (u16 BE), wait, most (u32 BE) → [state, data…]: state 1 connecting, 2 open, 3 the peer closed (no more data once this is empty), 4 failed (reset or timed out), 5 not a connection (or a request shorter than its 8 bytes). The data is what the connection has taken in, up to `most` and at most 2^18 bytes (`RECV_MAX`, the kernel's largest reply), so the caller's reply buffer holds 1 + most (the kernel cuts a reply at the caller's length). With `wait` 1 to 255 (seconds) the call is held while the connection has nothing new: answered as data lands, as its state changes (it opens, the peer closes, it fails), or when the wait runs out (then its state and no data); 0 answers at once. A held receive is its app asking (no idle reaping while it waits); a second held receive on the same connection answers the first as things stand.
 //!   The deadline form (2026-11-18, ferros_rt::tcp): eight more bytes after `most`, a deadline on the counter (u64 BE, the ticks `cntvct_el0` counts; 0 at once, u64::MAX until something changes), hold the call to exactly then in place of the wait byte's seconds. Its state byte carries why a failed connection failed in its high four bits: 4 | 1 << 4 a reset (while connecting: refused), 4 | 2 << 4 unanswered (the eighth retransmission expiry, or the SYN's). A client that sends the deadline puts 255 in the wait byte, so an ip from before holds it 255 s instead of answering at once again and again.
 //!
 //! Held UDP receives: up to sixteen at once (`HELDN`), the oldest answered as things stand when a seventeenth comes. A connection's held calls have places of their own, one receive and one wait for room a connection (`TcpHeld`), so no reader pushes another out; a second of the same kind on one connection answers the first as things stand. While nobody is present each is answered with nothing, as any request would be. A connection with a held call is asked about however long ip sleeps, so idle reaping never takes it.
-//! - 7 TCP CLOSE: handle → [0]: a FIN after the data already sent; the connection is freed once both sides have closed (or 16 s on). A connection its app has not asked about (send, receive, close) for 32 s is reset and freed: an app that dies leaves no slot behind.
+//! - 7 TCP CLOSE: handle (u16 BE) → [0]: a FIN after the data already sent; the connection is freed once both sides have closed (or 16 s on). A connection its app has not asked about (send, receive, close) for 32 s is reset and freed: an app that dies leaves no slot behind.
 //!
 //! No op carries a version: every caller is in this repo or Mahere's and changes with it (owner, 2026-11-11: "No existing callers yet, so no need to version it").
 //! - 8 JOIN: family, group address (16) → [0]: join a multicast group — an IGMPv2 membership report (IPv4) or an MLDv1 listener report (IPv6) now and every 60 s, so a snooping access point forwards the group to us (2026-10-26: the desktop's Photon beacons to 239.104.199.144 never reached the device until it reported itself a member; broadcast did). The firmware already passes all multicast; the switch was the filter. Up to eight groups.
@@ -37,7 +37,7 @@
 //!   - Eight held at once (`WATCHN`), a table of their own: a second watch with the same id answers the first as things stand, a ninth the oldest.
 //! - 12 KICK: id (u32 BE) → [0]: the watch held with that id answered at once as things stand, or, with none held, the next WATCH with that id (a process whose watcher thread sits in a WATCH tells it of a port added since; the KICK may arrive first: it is latched for the id).
 //! - 13 UNWATCH: id (u32 BE) → [0]: the reader is gone (a socket dropped): its watch answered as things stand, its KICKs dropped, its reader entries retired, so no datagram waits for it. A reader no watch of its id has named for 64 s is retired the same way at the next datagram (a process that ended).
-//! - 14 TCP ROOM: handle, want (u32 BE), deadline (u64 BE, counter ticks; 0 at once) → [state, room (u32 BE)]: the state byte as op 6's deadline form says it, and the free bytes of the send buffer; [5] not a connection (or a request shorter than its 14 bytes). Held while the room is under `want` (at most the buffer's 256 KiB) and the connection is connecting, open or closed by the peer and not closed by its app: answered when that much is free, the state changes, the app closes, or the deadline passes (2026-11-18, ferros_rt::tcp: a writer whose op 5 found the buffer full waits here, where fgtw's post sleeps a millisecond and sends again).
+//! - 14 TCP ROOM: handle (u16 BE), want (u32 BE), deadline (u64 BE, counter ticks; 0 at once) → [state, room (u32 BE)]: the state byte as op 6's deadline form says it, and the free bytes of the send buffer; [5] not a connection (or a request shorter than its 14 bytes). Held while the room is under `want` (at most the buffer's 256 KiB) and the connection is connecting, open or closed by the peer and not closed by its app: answered when that much is free, the state changes, the app closes, or the deadline passes (2026-11-18, ferros_rt::tcp: a writer whose op 5 found the buffer full waits here, where fgtw's post sleeps a millisecond and sends again).
 //! - 15 RING OPEN: port (u16 BE), log2 of the send ring, log2 of the receive ring (each at least 12) → status, view id (u64 BE), the run's bytes (u64 BE): a socket ring, a run of ip's pool given to the caller (docs/KERNEL.md "Shared regions"), laid out by ferros_netring, bound to the port; status 0 open, 3 a bad request, 4 no memory, 6 every ring in use. Sends land in the ring and go in the pass ip sees them (it looks at every ring each pass, and sleeps only after telling each ring so); arrivals for the port are written into it and wake its reader only when it waits (docs/WIFI.md "Datagrams at speed").
 //! - 16 RING CLOSE: view id (u64 BE) → [0]: the ring let go and its view taken back; a holder that ends lets it go the same way (the kernel rings ip's bell).
 //! - 17 SEND with a class: class (ferros_netring CLASS_*), then op 1's fields → op 1's answer: the class's DSCP on the datagram (voice EF, video AF41), which pcie1 maps to the chip's voice queue.
@@ -45,7 +45,7 @@
 //! DHCPv4 (`dhcp_in`, `dhcp_retry`): DISCOVER, OFFER, REQUEST, ACK, retransmitted every 2 s until bound; four REQUESTs unanswered give the offer up for a fresh DISCOVER (RFC 2131 4.4.1). What it sent and heard since WiFi came up is a console line every 16th retransmit while unbound and once at the bind: `DHCP <no lease yet|bound>: A#<n> DISCOVERs and A#<n> REQUESTs out; A#<n> OFFERs, A#<n> ACKs, A#<n> NAKs in, A#<n> replies to other transactions; WiFi frames in A#<n> broadcast, A#<n> multicast, A#<n> unicast (A#<n> ARP, A#<n> IPv4); state A#<1 discovering, 2 requesting, 3 bound>[, lease A#<s> s]`. The DISCOVER asks for unicast replies (broadcast flag clear). No renewal yet: the lease is said, not kept to.
 //!
 //! TCP here, client only, re-engineered for throughput on 2026-11-11 (owner: "sounds like it needs re-engineered", after Mahere's 1.6 MB base cells crawled thru two connections of a 4 KiB window, about 80 KB/s at a 50 ms round trip). The protocol's pure parts are ferros_tcp, tested on the host.
-//! - A connection for every handle a byte names (`TCPN`, 256; sixteen until 2026-11-27). An idle one costs its control state alone (`Tcb`, a static table); an open one holds a block of the arc (`Blocks`): a 1 MiB receive buffer and a 256 KiB send buffer. The kernel maps 4 MiB of heap at spawn (three blocks); the arc grows for more as connections open (SYS_ARC, docs/ARCS.md) and shrinks again when the highest blocks are free.
+//! - As many connections as the device has memory for (`Conns`; sixteen until 2026-11-27, then 256 for an hour): each lives in a block of the arc taken when it opens, its control state and held calls in the block's first page (`Head`) and its buffers after, the arc shrunk back as the highest close; an idle one costs nothing. The handle is two bytes on the wire (ops 4-7 and 14), a fixed width with its proof (owner, 2026-11-27: "no fixed sizes isn't quite right. it's more of a proof for the right size if it's fixed"): 2^16 connections would hold 2^16 blocks of 1.25 MiB, 80 GiB, past any device's memory, so the arc refuses ([6]) long before the handle runs out.
 //! - The receive window is the free room of the 1 MiB buffer, said with window scaling (RFC 7323, shift 5); a peer that offers no scaling gets 64 KiB of it. Its right edge moves by a segment, or half the buffer, at least (silly-window avoidance), and a read that reopens a window shrunk under half says so at once.
 //! - Segments past a hole are kept in place in the buffer (eight ranges, `ferros_tcp::Ooo`) and delivered when the hole fills; each is ACKed at once with SACK blocks (RFC 2018), so the peer resends only what is missing.
 //! - ACKs: every second in-order segment and one with PSH at once (RFC 5681 4.2, RFC 1122 4.2.3.2), an odd one at the end of the batch of frames it came in (after each exchange with the WiFi driver, and at the end of each pass over the links: `tcp_acks`); at once for FIN, out-of-order data, a filled hole or a duplicate. No delayed-ACK timer: the batch is microseconds, and the loop does not sleep while an ACK waits to go. The ACKs of a batch go out together in the next exchange. (From 2026-11-11 to 2026-11-12 a batch of up to 88 segments was ACKed once, and senders starved: docs/WIFI.md, "ACKs".)
@@ -206,8 +206,8 @@ struct Ip {
     pins: [(u32, u16, u64); READERN],
     qseq: u32,
     /// The connections' control state (a static table) and their buffers' blocks of the arc.
-    tcb: &'static mut [Tcb; TCPN],
-    blocks: Blocks,
+    /// The connections (`Conns`): each one's control state, held calls and buffers in its own block of the arc.
+    tcb: Conns,
     eph: u16,
     seed: u32,
     groups: [(u8, [u8; 16]); 8],
@@ -236,9 +236,6 @@ struct Ip {
     net_gen: u64,
     /// UDP receives held until something comes (op 2 with a wait), answered by `answer_held`.
     held: [Held; HELDN],
-    /// Each connection's held receive (op 6 with a wait) and held wait for room (op 14), answered by `answer_held` too: statics, not the 64 KiB stack.
-    rd: &'static mut [TcpHeld; TCPN],
-    wr: &'static mut [TcpHeld; TCPN],
     /// Stamps the holds in arrival order: the oldest gives way when all are taken.
     held_seq: u32,
     /// Watches held until something changes (op 11), answered by `answer_watches`; KICKs (op 12) that came before their watch, the oldest giving way.
@@ -733,15 +730,14 @@ struct Cell {
 }
 const CELL_DOWN: Cell = Cell { flags: 0, mtu: 0, v4: [0; 4], v6: [0; 16], dns4: [0; 4], dns6: [0; 16] };
 
-/// Connections at once: every one a handle names, the handle being one byte on the wire (ops 4-7 and 14). An idle one costs its control state alone (`Tcb` and its two `TcpHeld`, 520 bytes; 133 KB for all of them), an open one its block of the arc, taken when it opens and given back when it is freed (`Blocks`), so what bounds them is the device's memory: a connection the arc cannot grow for is refused ([6]).
-/// Sixteen until 2026-11-27 (owner, 2026-11-11; then "Def grow on demand. Not sure why we have so many hardcoded limits around", after Mahere's eight filled half of them); two before 2026-11-11.
-const TCPN: usize = 1 << 8;
 /// A connection's receive buffer: 1 MiB, the most its window says with scaling (2^20 >> `RCV_WS` fits the 16-bit field). At a 50 ms round trip that is 20 MB/s from one connection before the window, not the link, is what holds it back.
 const RXB: usize = 1 << 20;
 /// A connection's send buffer: 256 KiB (an upload's window in flight; the requests Mahere and the stower send are a few hundred bytes).
 const TXB: usize = 1 << 18;
-/// A connection's buffers together, one block of the arc: the receive buffer, then the send buffer.
-const BLOCK: usize = RXB + TXB;
+/// A block's head (`Head`): a page, the buffers after it on a page.
+const HEAD: usize = 1 << 12;
+/// A connection, one block of the arc: its head, the receive buffer, then the send buffer.
+const BLOCK: usize = HEAD + RXB + TXB;
 /// Our window scale shift: 5, the least that says 1 MiB in 16 bits.
 const RCV_WS: u8 = 5;
 /// The window a peer that offers no scaling is given: 65535 bytes of the buffer, the most an unscaled field says.
@@ -760,8 +756,6 @@ const HEAP_CEILING: usize = ferros_sys::HEAP_DEVICE;
 const HEAP_START: usize = 4 << 20;
 /// Retransmission expiries a connection survives: the eighth fails it (from 250 ms, doubling to the 8 s ceiling: about 30 s in all).
 const TRIES: u32 = 1 << 3;
-/// `blk` while a connection holds no block.
-const NO_BLOCK: u16 = u16::MAX;
 /// Segment flags.
 const FIN: u8 = 1;
 const SYN: u8 = 2;
@@ -775,7 +769,7 @@ const WHY_TIMEOUT: u8 = 2;
 const WHY_IDLE: u8 = 3;
 const WHY_LINGER: u8 = 4;
 
-/// One client connection (see the header): state 0 free, 1 SYN sent, 2 open, 3 the peer closed, 4 failed. It keeps the link and source address it opened with (`cell`, `src`), and its buffers' block while it is not free (`blk`).
+/// One client connection (see the header): state 0 free, 1 SYN sent, 2 open, 3 the peer closed, 4 failed. It keeps the link and source address it opened with (`cell`, `src`); its buffers are its block's (`Conns`).
 /// The receive buffer is a ring: the `rx_len` bytes from `rx_head` are in order for the app, and the byte at sequence number s past `rcv_nxt` lives `s - rcv_nxt` past them (`Ooo` says which such ranges are there). The send buffer is a ring too: `tx_len` bytes from `tx_head`, the first of them at `snd_una`.
 #[derive(Clone, Copy)]
 struct Tcb {
@@ -786,7 +780,6 @@ struct Tcb {
     addr: [u8; 16],
     rport: u16,
     lport: u16,
-    blk: u16,
     iss: u32,
     snd_una: u32,
     snd_nxt: u32,
@@ -864,7 +857,6 @@ const TCB_FREE: Tcb = Tcb {
     addr: [0; 16],
     rport: 0,
     lport: 0,
-    blk: NO_BLOCK,
     iss: 0,
     snd_una: 0,
     snd_nxt: 0,
@@ -924,22 +916,30 @@ const TCB_FREE: Tcb = Tcb {
     burst_most: 0,
 };
 
-/// The connections' buffers, a block (`BLOCK`) each, from the arc (owner, 2026-11-11: taken when a connection opens, given back when it closes, from the arc grown on demand). Block k lives in the heap the kernel maps at spawn while k < `start`, else `k - start` blocks above the arc's top at spawn (`top0`, an arc offset), which the arc grows to reach (SYS_ARC, `ferros_sys::arc`). A connection takes the lowest free block, so the arc stays as low as it can, and when the highest blocks are free it shrinks back (the kernel rounds as the arc's mode needs: a masked arc keeps its power of two until it can halve).
+/// The connections, each in a block of the arc (`BLOCK`) that holds its control state and held calls (`Head`) and its buffers (owner, 2026-11-11: taken when a connection opens, given back when it closes, from the arc grown on demand; 2026-11-27, "Def grow on demand": the control state moved in with them, so the table is as long as the connections open and no longer). Block k lives in the heap the kernel maps at spawn while k < `start`, else `k - start` blocks above the arc's top at spawn (`top0`, an arc offset), which the arc grows to reach (SYS_ARC, `ferros_sys::arc`).
+/// Connection k is block k, and its handle on the wire is k (two bytes). A connection takes the lowest free block, so the arc stays as low as it can; a freed one is marked free at once and the arc shrinks back to the highest still open at the pass's end (`trim`), never under a walk of the table.
 /// A kernel without SYS_ARC maps the whole declared heap at spawn: every block is then in it, and nothing grows (`grows` false).
-struct Blocks {
+struct Conns {
     heap: usize,
     start: usize,
     top0: usize,
     top: usize,
     grows: bool,
-    /// Bit k: block k is a connection's (word k >> 6, bit k & 63).
-    used: [u64; TCPN / 64],
 }
 
-impl Blocks {
+/// A block's head: the connection's control state and its two held calls, the buffers after it at `HEAD`.
+#[repr(C)]
+struct Head {
+    tcb: Tcb,
+    rd: TcpHeld,
+    wr: TcpHeld,
+}
+const HEAD_FREE: Head = Head { tcb: TCB_FREE, rd: TCP_HELD_FREE, wr: TCP_HELD_FREE };
+const _: () = assert!(core::mem::size_of::<Head>() <= HEAD, "a block's head outgrew its page");
+
+impl Conns {
     /// Block k's address.
-    fn addr(&self, k: u16) -> usize {
-        let k = k as usize;
+    fn addr(&self, k: usize) -> usize {
         if k < self.start { self.heap + k * BLOCK } else { ferros_sys::arc_base() as usize + self.top0 + (k - self.start) * BLOCK }
     }
 
@@ -948,37 +948,87 @@ impl Blocks {
         if n <= self.start { self.top0 } else { self.top0 + (n - self.start) * BLOCK }
     }
 
-    /// The lowest free block, the arc grown to hold it when it lies above the top; None when every connection holds one or the kernel refuses the growth (its ceiling, or too few free frames).
-    fn take(&mut self) -> Option<u16> {
-        let w = self.used.iter().position(|&u| u != u64::MAX)?;
-        let k = w * 64 + (!self.used[w]).trailing_zeros() as usize;
-        let need = self.need(k + 1);
-        if need > self.top {
-            if !self.grows {
-                return None;
-            }
-            let (top, _) = ferros_sys::arc::grow(need - self.top).ok()?;
-            self.top = top;
-        }
-        self.used[k >> 6] |= 1 << (k & 63);
-        Some(k as u16)
+    /// The blocks mapped: the table's length, every head below it written.
+    fn len(&self) -> usize {
+        self.start + (self.top - self.top0) / BLOCK
     }
 
-    /// Block k given back, and the arc shrunk to the highest block still taken.
-    fn give(&mut self, k: u16) {
-        self.used[k as usize >> 6] &= !(1u64 << (k & 63));
+    fn head(&self, k: usize) -> &'static mut Head {
+        // WHY the assert: a head past the table is unmapped memory; every caller has checked its index against `len` (a handle from the wire) or walks `0..len`, so this firing is a bug here.
+        assert!(k < self.len(), "ip: a connection past the table");
+        // SAFETY: block k is mapped (k < len) and its head was written when it was (`new` for the heap's, `take` for the arc's); the head is this table's alone.
+        unsafe { &mut *(self.addr(k) as *mut Head) }
+    }
+
+    /// Connection k's held receive and held wait for room.
+    fn rd(&self, k: usize) -> &'static mut TcpHeld {
+        &mut self.head(k).rd
+    }
+    fn wr(&self, k: usize) -> &'static mut TcpHeld {
+        &mut self.head(k).wr
+    }
+
+    /// Every connection's control state, free ones included.
+    fn iter(&self) -> impl Iterator<Item = &Tcb> {
+        (0..self.len()).map(|k| &self.head(k).tcb)
+    }
+
+    /// The lowest free connection, the arc grown by a block when every mapped one is open; None when the kernel refuses the growth (too few free frames) or the handle's two bytes are spent.
+    fn take(&mut self) -> Option<usize> {
+        if let Some(k) = (0..self.len()).find(|&k| self.head(k).tcb.state == 0) {
+            return Some(k);
+        }
+        let k = self.len();
+        // WHY: the handle is two bytes on the wire (ops 4-7 and 14).
+        if k > u16::MAX as usize || !self.grows {
+            return None;
+        }
+        let need = self.need(k + 1);
+        let (top, _) = ferros_sys::arc::grow(need - self.top).ok()?;
+        // The kernel rounds as the arc's mode needs (a masked arc grows by doubling): the table is every whole block under the top it gave (`len`), each new head written free.
+        self.top = top;
+        for j in k..self.len() {
+            *self.head(j) = HEAD_FREE;
+        }
+        Some(k)
+    }
+
+    /// Connection k freed: its head written free; the arc keeps it until `trim`.
+    fn give(&mut self, k: usize) {
+        *self.head(k) = HEAD_FREE;
+    }
+
+    /// The arc shrunk to the highest connection still open, at a pass's end (no walk of the table is under way).
+    fn trim(&mut self) {
         if !self.grows {
             return;
         }
-        // One past the highest block still taken (0 with none).
-        let n = self.used.iter().rposition(|&u| u != 0).map_or(0, |w| w * 64 + 64 - self.used[w].leading_zeros() as usize);
+        let n = (0..self.len()).rposition(|k| self.head(k).tcb.state != 0).map_or(0, |k| k + 1);
         let want = self.need(n);
         if want < self.top {
             if let Ok((top, _)) = ferros_sys::arc::shrink(want) {
+                // The kernel rounds as the arc's mode needs (a masked arc keeps its power of two until it can halve): the table is the whole blocks under the top it left (`len`).
                 self.top = top;
             }
         }
     }
+}
+
+impl core::ops::Index<usize> for Conns {
+    type Output = Tcb;
+    fn index(&self, k: usize) -> &Tcb {
+        &self.head(k).tcb
+    }
+}
+impl core::ops::IndexMut<usize> for Conns {
+    fn index_mut(&mut self, k: usize) -> &mut Tcb {
+        &mut self.head(k).tcb
+    }
+}
+
+/// A TCP request's handle (ops 5, 6, 7 and 14): two bytes after the op, big-endian (the callers have checked the length).
+fn handle(m: &[u8]) -> usize {
+    u16::from_be_bytes([m[1], m[2]]) as usize
 }
 
 /// `data` into the ring `buf` (a power of two long) from position `at`, wrapping at its end.
@@ -1163,8 +1213,10 @@ impl Ip {
         for h in self.held.iter().filter(|h| h.used) {
             t = t.min(h.until);
         }
-        for h in self.rd.iter().chain(self.wr.iter()).filter(|h| h.used) {
-            t = t.min(h.until);
+        for k in 0..self.tcb.len() {
+            for h in [self.tcb.rd(k), self.tcb.wr(k)].into_iter().filter(|h| h.used) {
+                t = t.min(h.until);
+            }
         }
         for w in self.watches.iter().filter(|w| w.used) {
             t = t.min(w.until);
@@ -2716,13 +2768,13 @@ impl Ip {
     /// Connection `i`'s receive buffer.
     /// SAFETY: the block is this connection's alone while it holds it (`Blocks::take`), the arc holds its bytes (grown before the block is taken, shrunk only past the highest block still taken), and this process has one thread, so nothing else reaches these bytes while the slice is used.
     fn rx(&self, i: usize) -> &'static mut [u8] {
-        let a = self.blocks.addr(self.tcb[i].blk);
+        let a = self.tcb.addr(i) + HEAD;
         unsafe { core::slice::from_raw_parts_mut(a as *mut u8, RXB) }
     }
 
     /// Connection `i`'s send buffer, right after its receive buffer (SAFETY as `rx`).
     fn tx(&self, i: usize) -> &'static mut [u8] {
-        let a = self.blocks.addr(self.tcb[i].blk) + RXB;
+        let a = self.tcb.addr(i) + HEAD + RXB;
         unsafe { core::slice::from_raw_parts_mut(a as *mut u8, TXB) }
     }
 
@@ -2808,7 +2860,7 @@ impl Ip {
 
     /// The ACKs still owed at the end of a batch of frames (an odd in-order segment's): no delayed-ACK timer, the batch is microseconds, and the loop never sleeps while an ACK waits to go (`busy`).
     fn tcp_acks(&mut self) {
-        for i in 0..TCPN {
+        for i in 0..self.tcb.len() {
             if self.tcb[i].state != 0 && self.tcb[i].owed {
                 self.tcp_ack(i);
             }
@@ -2830,11 +2882,7 @@ impl Ip {
             out[0] = 2;
             return 1;
         };
-        let Some(i) = self.tcb.iter().position(|c| c.state == 0) else {
-            out[0] = 4;
-            return 1;
-        };
-        let Some(blk) = self.blocks.take() else {
+        let Some(i) = self.tcb.take() else {
             out[0] = 6;
             return 1;
         };
@@ -2847,11 +2895,11 @@ impl Ip {
         let mtu = if cell { self.cell.mtu } else { 1500 };
         let rmss = ferros_tcp::mss_for(mtu, fam) as u32;
         let one = iss.wrapping_add(1);
-        self.tcb[i] = Tcb { state: 1, fam, cell, src, addr, rport: port, lport: self.eph, blk, iss, snd_una: iss, snd_nxt: one, snd_max: one, rmss, smss: rmss, rcv_total: NO_WS_WIN, rtt: ferros_tcp::Rtt::new(self.freq), rto_t: t + self.freq, timing: true, rtt_seq: one, rtt_t: t, touched: t, asked_t: t, ..TCB_FREE };
+        self.tcb[i] = Tcb { state: 1, fam, cell, src, addr, rport: port, lport: self.eph, iss, snd_una: iss, snd_nxt: one, snd_max: one, rmss, smss: rmss, rcv_total: NO_WS_WIN, rtt: ferros_tcp::Rtt::new(self.freq), rto_t: t + self.freq, timing: true, rtt_seq: one, rtt_t: t, touched: t, asked_t: t, ..TCB_FREE };
         self.tcp_out(i, SYN, iss, &[]);
         out[0] = 0;
-        out[1] = i as u8;
-        2
+        out[1..3].copy_from_slice(&(i as u16).to_be_bytes());
+        3
     }
 
     /// Connection `i` failed (`why`: reset, or unanswered): its data still unread stays for its app, nothing more is sent.
@@ -2868,19 +2916,13 @@ impl Ip {
     /// Connection `i` freed: its report on the console, its block given back, and its held calls answered "not a connection" now (the slot may open again for another app before the pass looks at them).
     fn tcp_free(&mut self, i: usize, why: u8) {
         let gone = [5u8];
-        for h in [self.rd[i], self.wr[i]] {
+        for h in [*self.tcb.rd(i), *self.tcb.wr(i)] {
             if h.used {
                 svc(REPLY, self.off(h.tok.as_ptr()), self.off(gone.as_ptr()), 1, 0, 0);
             }
         }
-        self.rd[i] = TCP_HELD_FREE;
-        self.wr[i] = TCP_HELD_FREE;
         self.report(i, why);
-        let blk = self.tcb[i].blk;
-        if blk != NO_BLOCK {
-            self.blocks.give(blk);
-        }
-        self.tcb[i] = TCB_FREE;
+        self.tcb.give(i);
     }
 
     /// A segment in for us: `src` the peer, `dst` our address it came to, `seg` the TCP header and data (20 bytes at least, the callers' check).
@@ -3188,7 +3230,7 @@ impl Ip {
     fn tcp_tick(&mut self) {
         let t = now();
         let (_, _, rto_max) = self.rto_bounds();
-        for i in 0..TCPN {
+        for i in 0..self.tcb.len() {
             let c = self.tcb[i];
             if c.state == 0 {
                 continue;
@@ -3202,7 +3244,7 @@ impl Ip {
                 continue;
             }
             // Abandoned: a reset to the peer if it was open (it stops sending), then the slot is free. A call held on it is its app asking, however long ip slept: the pass that wakes after a long idle sleep runs this before `answer_held` would mark it touched (a reader held on a quiet WebSocket, 2026-11-18).
-            if t.wrapping_sub(c.touched) > 32 * self.freq && !self.rd[i].used && !self.wr[i].used {
+            if t.wrapping_sub(c.touched) > 32 * self.freq && !self.tcb.rd(i).used && !self.tcb.wr(i).used {
                 if c.state == 2 || c.state == 3 {
                     self.tcp_out(i, RST | ACK, c.snd_nxt, &[]);
                 }
@@ -3510,14 +3552,14 @@ impl Ip {
 
     /// Hold a call on connection `i` (`tok` its reply token): its receive (`room` false, op 6, `most` the data it takes) or its wait for room (`room`, op 14, `want` the room it asks for), until the counter passes `until` (u64::MAX: until something changes). A call of the same kind already held on the connection is answered first as things stand: one reader and one writer a connection.
     fn hold_tcp(&mut self, i: usize, room: bool, most: u32, want: u32, until: u64, long: bool, tok: &[u8; 32], out: &mut [u8]) {
-        if if room { self.wr[i].used } else { self.rd[i].used } {
+        if if room { self.tcb.wr(i).used } else { self.tcb.rd(i).used } {
             self.answer_tcp(i, room, out);
         }
         let h = TcpHeld { used: true, long, state: self.tcb[i].state, most, want, until, tok: *tok };
         if room {
-            self.wr[i] = h;
+            *self.tcb.wr(i) = h;
         } else {
-            self.rd[i] = h;
+            *self.tcb.rd(i) = h;
         }
     }
 
@@ -3531,11 +3573,11 @@ impl Ip {
 
     /// Answer connection `i`'s held receive (`room` false) or wait for room (`room`) as things stand, and free it. Nothing while nobody is present, as any request would be answered.
     fn answer_tcp(&mut self, i: usize, room: bool, out: &mut [u8]) {
-        let h = if room { self.wr[i] } else { self.rd[i] };
+        let h = if room { *self.tcb.wr(i) } else { *self.tcb.rd(i) };
         if room {
-            self.wr[i] = TCP_HELD_FREE;
+            *self.tcb.wr(i) = TCP_HELD_FREE;
         } else {
-            self.rd[i] = TCP_HELD_FREE;
+            *self.tcb.rd(i) = TCP_HELD_FREE;
         }
         let l = if !self.person {
             0
@@ -3565,9 +3607,9 @@ impl Ip {
                 any = true;
             }
         }
-        for i in 0..TCPN {
+        for i in 0..self.tcb.len() {
             let c = self.tcb[i];
-            let (r, w) = (self.rd[i], self.wr[i]);
+            let (r, w) = (*self.tcb.rd(i), *self.tcb.wr(i));
             if r.used {
                 if !self.person || t > r.until || c.state != r.state || c.state >= 3 || c.rx_len > 0 {
                     self.answer_tcp(i, false, out);
@@ -3795,24 +3837,24 @@ impl Ip {
             }
             Some(10) => return self.resolve(m, tok, out),
             Some(6) => {
-                // WHY the checks: the request is the caller's; shorter than its 7 bytes, or a handle past the table, is no connection.
-                let i = if m.len() >= 7 { m[1] as usize } else { TCPN };
-                if i >= TCPN || self.tcb[i].state == 0 {
+                // WHY the checks: the request is the caller's; shorter than its 8 bytes, or a handle past the table, is no connection.
+                let i = if m.len() >= 8 { handle(m) } else { usize::MAX };
+                if i >= self.tcb.len() || self.tcb[i].state == 0 {
                     out[0] = 5;
                     return Some(1);
                 }
                 self.tcb[i].touched = now();
                 // WHY the min: the caller's most, held to what one reply carries.
-                let most = u32::from_be_bytes([m[3], m[4], m[5], m[6]]).min(RECV_MAX as u32);
+                let most = u32::from_be_bytes([m[4], m[5], m[6], m[7]]).min(RECV_MAX as u32);
                 // The deadline form (8 bytes after `most`, counter ticks: 0 at once, u64::MAX until something changes) holds to exactly then in place of the wait byte's seconds, and its state byte says why a connection failed (`tcp_state`).
-                let long = m.len() >= 15;
+                let long = m.len() >= 16;
                 let until = if long {
-                    match u64::from_be_bytes(m[7..15].try_into().unwrap()) {
+                    match u64::from_be_bytes(m[8..16].try_into().unwrap()) {
                         0 => None,
                         d => Some(d),
                     }
                 } else {
-                    (m[2] > 0).then(|| now() + m[2] as u64 * self.freq)
+                    (m[3] > 0).then(|| now() + m[3] as u64 * self.freq)
                 };
                 let c = &self.tcb[i];
                 if let (0, 1 | 2, Some(until)) = (c.rx_len, c.state, until) {
@@ -3822,16 +3864,16 @@ impl Ip {
                 return Some(self.tcp_take(i, out, most, long));
             }
             Some(14) => {
-                // WHY the checks: the request is the caller's; shorter than its 14 bytes, or a handle past the table, is no connection.
-                let i = if m.len() >= 14 { m[1] as usize } else { TCPN };
-                if i >= TCPN || self.tcb[i].state == 0 {
+                // WHY the checks: the request is the caller's; shorter than its 15 bytes, or a handle past the table, is no connection.
+                let i = if m.len() >= 15 { handle(m) } else { usize::MAX };
+                if i >= self.tcb.len() || self.tcb[i].state == 0 {
                     out[0] = 5;
                     return Some(1);
                 }
                 self.tcb[i].touched = now();
                 // WHY the min: the room never passes the send buffer's size, so a want past it would hold until the deadline.
-                let want = u32::from_be_bytes([m[2], m[3], m[4], m[5]]).min(TXB as u32);
-                let until = u64::from_be_bytes(m[6..14].try_into().unwrap());
+                let want = u32::from_be_bytes([m[3], m[4], m[5], m[6]]).min(TXB as u32);
+                let until = u64::from_be_bytes(m[7..15].try_into().unwrap());
                 let c = &self.tcb[i];
                 if until != 0 && TXB as u32 - c.tx_len < want && (1..=3).contains(&c.state) && !c.fin_queued {
                     self.hold_tcp(i, true, 0, want, until, true, tok, out);
@@ -3902,18 +3944,18 @@ impl Ip {
                 let port = u16::from_be_bytes([m[18], m[19]]);
                 self.tcp_connect(m[1], addr, port, out)
             }
-            Some(5) if m.len() >= 2 => {
-                let i = m[1] as usize;
+            Some(5) if m.len() >= 3 => {
+                let i = handle(m);
                 // WHY: the handle is the caller's; one past the table is no connection.
-                if i >= TCPN || self.tcb[i].state == 0 || self.tcb[i].state == 4 || self.tcb[i].fin_queued {
+                if i >= self.tcb.len() || self.tcb[i].state == 0 || self.tcb[i].state == 4 || self.tcb[i].fin_queued {
                     out[0] = 5;
                     return 1;
                 }
                 self.tcb[i].touched = now();
                 let c = &self.tcb[i];
                 // WHY the min: what the send buffer has room for; the rest is the caller's to send again.
-                let n = (m.len() - 2).min(TXB - c.tx_len as usize);
-                ring_put(self.tx(i), (c.tx_head + c.tx_len) as usize, &m[2..2 + n]);
+                let n = (m.len() - 3).min(TXB - c.tx_len as usize);
+                ring_put(self.tx(i), (c.tx_head + c.tx_len) as usize, &m[3..3 + n]);
                 self.tcb[i].tx_len += n as u32;
                 out[0] = 0;
                 out[1..3].copy_from_slice(&(n as u16).to_be_bytes());
@@ -3930,10 +3972,10 @@ impl Ip {
                 out[0] = 0;
                 1
             }
-            Some(7) if m.len() >= 2 => {
-                let i = m[1] as usize;
+            Some(7) if m.len() >= 3 => {
+                let i = handle(m);
                 // WHY: the handle is the caller's; one past the table is no connection (answered as closed).
-                if i < TCPN && self.tcb[i].state != 0 {
+                if i < self.tcb.len() && self.tcb[i].state != 0 {
                     let c = &mut self.tcb[i];
                     c.touched = now();
                     c.fin_queued = true;
@@ -4028,10 +4070,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     static mut REASM: [Reasm; RN] = [REASM_FREE; RN];
     static mut BIG: [[u8; REASM_MAX]; BIGN] = [[0; REASM_MAX]; BIGN];
     // The connections' control state, and the request and reply buffers (a reply up to `RECV_MAX` bytes of data): statics, not the 64 KiB stack (the kernel maps .bss from the image header's tail).
-    static mut TCBS: [Tcb; TCPN] = [TCB_FREE; TCPN];
     // Each connection's held receive and held wait for room (`TcpHeld`).
-    static mut RD: [TcpHeld; TCPN] = [TCP_HELD_FREE; TCPN];
-    static mut WR: [TcpHeld; TCPN] = [TCP_HELD_FREE; TCPN];
     static mut MSG: [u8; MSG_MAX] = [0; MSG_MAX];
     // The frames batched for the WiFi driver's next exchange (`Ip::txb`): the driver's request buffer, 4096 bytes.
     static mut TXB: [u8; TX_MAX] = [0; TX_MAX];
@@ -4046,11 +4085,15 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     }
     let heap = ((&raw const __image_end) as usize + 16 + 63) & !63;
     let (top, _) = ferros_sys::arc::size();
-    let blocks = if top as u64 == ERR {
+    let conns = if top as u64 == ERR {
         panic!("ip: the kernel answered no arc size (SYS_ARC): ip needs a kernel from 2026-11-11 or later")
     } else {
-        Blocks { heap, start: (HEAP_START - 64) / BLOCK, top0: top, top, grows: true, used: [0; TCPN / 64] }
+        Conns { heap, start: (HEAP_START - 64) / BLOCK, top0: top, top, grows: true }
     };
+    // The heap's blocks' heads written free: the table starts as long as they are.
+    for k in 0..conns.start {
+        *conns.head(k) = HEAD_FREE;
+    }
     let mut ip = Ip {
         grants,
         base,
@@ -4090,8 +4133,7 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         ports_at: 0,
         pins: [(0, 0, 0); READERN],
         qseq: 0,
-        tcb: unsafe { &mut *(&raw mut TCBS) },
-        blocks,
+        tcb: conns,
         eph: 0,
         seed: 0,
         groups: [(0, [0; 16]); 8],
@@ -4110,8 +4152,6 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         family: 0,
         net_gen: u64::MAX,
         held: [HELD_FREE; HELDN],
-        rd: unsafe { &mut *(&raw mut RD) },
-        wr: unsafe { &mut *(&raw mut WR) },
         held_seq: 0,
         watches: [WATCH_FREE; WATCHN],
         kicks: [None; WATCHN],
@@ -4157,17 +4197,15 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     let ll = ip.ll;
     ip.v6_put(ll);
     ip.put(b"\n");
-    // Where the connections' buffers come from (`Blocks`).
-    ip.put(b"TCP: A#");
-    ip.dec(TCPN as u64);
-    ip.put(b" connections, each a block of A#");
+    // Where the connections come from (`Conns`).
+    ip.put(b"TCP: a connection a block of A#");
     ip.dec((BLOCK >> 10) as u64);
     ip.put(b" KiB (receive window A#");
     ip.dec((RXB >> 10) as u64);
     ip.put(b" KiB); A#");
-    ip.dec(ip.blocks.start as u64);
-    if ip.blocks.grows {
-        ip.put(b" in the heap mapped at spawn, the arc grown for more as they open\n");
+    ip.dec(ip.tcb.start as u64);
+    if ip.tcb.grows {
+        ip.put(b" in the heap mapped at spawn, the arc grown by a block for each more that opens and shrunk as they close\n");
     } else {
         ip.put(b" in the heap mapped at spawn, no SYS_ARC on this kernel, so no more\n");
     }
@@ -4332,6 +4370,8 @@ pub extern "C" fn payload_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         let dt = now().wrapping_sub(pass_t);
         // WHY the max: the high water, for the measure.
         ip.path.pass_most = ip.path.pass_most.max(dt);
+        // The arc back to the highest connection still open (`Conns::trim`), here where no walk of the table is under way.
+        ip.tcb.trim();
         // Nothing came in either way: a millisecond's sleep, not a spinning core (it spun from boot once init started it, 2026-10-26). With the screen off, each idle pass in a row doubles it up to 8 ms, and anything that comes in brings it back to 1 (2026-11-10: the WiFi and cellular drivers were each asked a thousand times a second in the dark, every one a wakeup of the kernel's core).
         // Every ring told ip sleeps, and one more look at each (ferros_netring's Dekker pair): a send that came meanwhile keeps it awake.
         if !busy && !ip.rings_arm() {

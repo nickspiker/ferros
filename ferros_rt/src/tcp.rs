@@ -32,8 +32,8 @@ const RESOLVE: u8 = 10;
 const WATCH: u8 = 11;
 const ROOM: u8 = 14;
 
-/// The most of a write one SEND carries: ip's request buffer (payloads/ip `MSG_MAX`, 2^16 since docs/NO-CEILINGS.md step 5, when a call came to carry its whole message), less the op and the handle. It was 4094, all of the 4096 bytes a call carried.
-pub const SEND_MAX: usize = (1 << 16) - 2;
+/// The most of a write one SEND carries: ip's request buffer (payloads/ip `MSG_MAX`, 2^16 since docs/NO-CEILINGS.md step 5, when a call came to carry its whole message), less the op and the handle (two bytes). It was 4094, all of the 4096 bytes a call carried.
+pub const SEND_MAX: usize = (1 << 16) - 3;
 /// The most data one RECV reply carries: 2^18 bytes (ip's `RECV_MAX`, the kernel's largest reply), the state byte ahead of it.
 pub const RECV_MAX: usize = 1 << 18;
 /// The longest host name RESOLVE takes: 253 bytes (RFC 1035's 255 on the wire, less the first length byte and the root).
@@ -278,7 +278,8 @@ fn failed(state: u8, connecting: bool) -> Error {
 /// One client connection at the ip server, closed when dropped.
 pub struct Conn {
     ip: Ip,
-    handle: u8,
+    /// ip's handle for it, two bytes on the wire (payloads/ip ops 4-7 and 14).
+    handle: u16,
     /// One read at ip at a time, one write likewise (see the module's head).
     reading: Lock<()>,
     writing: Lock<()>,
@@ -294,14 +295,13 @@ impl Conn {
         req[2..18].copy_from_slice(&bytes);
         req[18..20].copy_from_slice(&addr.port().to_be_bytes());
         let handle = loop {
-            let mut r = [0u8; 2];
+            let mut r = [0u8; 3];
             match ip.call(&req, &mut r)? {
                 0 => ip.present(until)?,
-                2 if r[0] == 0 => break r[1],
+                3 if r[0] == 0 => break u16::from_be_bytes([r[1], r[2]]),
                 _ => {
                     return Err(match r[0] {
                         2 => Error::NoRoute,
-                        4 => Error::Busy,
                         6 => Error::NoMemory,
                         _ => Error::BadReply,
                     });
@@ -329,12 +329,12 @@ impl Conn {
 
     /// One op 6 in its deadline form: `most` bytes at most into `out` after the state byte, held to `until` while there is nothing to take. Some((state byte, data bytes)), or None when nobody is present.
     fn recv(&self, out: &mut [u8], most: usize, until: Until) -> Result<Option<(u8, usize)>, Error> {
-        let mut req = [0u8; 15];
+        let mut req = [0u8; 16];
         req[0] = RECV;
-        req[1] = self.handle;
-        req[2] = OLD_WAIT;
-        req[3..7].copy_from_slice(&(most as u32).to_be_bytes());
-        req[7..15].copy_from_slice(&until.0.to_be_bytes());
+        req[1..3].copy_from_slice(&self.handle.to_be_bytes());
+        req[3] = OLD_WAIT;
+        req[4..8].copy_from_slice(&(most as u32).to_be_bytes());
+        req[8..16].copy_from_slice(&until.0.to_be_bytes());
         match self.ip.call(&req, out)? {
             0 => Ok(None),
             n => Ok(Some((out[0], n - 1))),
@@ -395,13 +395,13 @@ impl Conn {
         // WHY the min: a call carries SEND_MAX bytes of data; the caller writes the rest after.
         let n = buf.len().min(SEND_MAX);
         // On the stack (this crate has no allocator of its own): 64 KiB of a std thread's 1 MiB (ferros_rt thread.rs `DEFAULT_STACK`).
-        let mut req = [0u8; 2 + SEND_MAX];
+        let mut req = [0u8; 3 + SEND_MAX];
         req[0] = SEND;
-        req[1] = self.handle;
-        req[2..2 + n].copy_from_slice(&buf[..n]);
+        req[1..3].copy_from_slice(&self.handle.to_be_bytes());
+        req[3..3 + n].copy_from_slice(&buf[..n]);
         loop {
             let mut r = [0u8; 3];
-            match self.ip.call(&req[..2 + n], &mut r)? {
+            match self.ip.call(&req[..3 + n], &mut r)? {
                 0 => self.ip.present(until)?,
                 3 if r[0] == 0 => match u16::from_be_bytes([r[1], r[2]]) {
                     // Full: held at ip until room for this call's bytes is free.
@@ -427,12 +427,12 @@ impl Conn {
     /// Op 14: held at ip until `want` bytes of the send buffer are free, the state changes, or `until`. Ok when room may be there (the next SEND says), the error when the connection cannot take data.
     fn room(&self, want: u32, until: Until) -> Result<(), Error> {
         loop {
-            let mut req = [0u8; 14];
+            let mut req = [0u8; 15];
             req[0] = ROOM;
-            req[1] = self.handle;
-            req[2..6].copy_from_slice(&want.to_be_bytes());
+            req[1..3].copy_from_slice(&self.handle.to_be_bytes());
+            req[3..7].copy_from_slice(&want.to_be_bytes());
             // A deadline already passed (0 among them, which asks at once) is answered at once as things stand.
-            req[6..14].copy_from_slice(&until.0.to_be_bytes());
+            req[7..15].copy_from_slice(&until.0.to_be_bytes());
             let mut r = [0u8; 5];
             match self.ip.call(&req, &mut r)? {
                 0 => self.ip.present(until)?,
@@ -455,9 +455,9 @@ impl Conn {
 
     /// Why a SEND was refused: the connection failed (and how), or is gone or closed on this side.
     fn why_refused(&self) -> Error {
-        let mut req = [0u8; 14];
+        let mut req = [0u8; 15];
         req[0] = ROOM;
-        req[1] = self.handle;
+        req[1..3].copy_from_slice(&self.handle.to_be_bytes());
         let mut r = [0u8; 5];
         match self.ip.call(&req, &mut r) {
             Ok(5) if r[0] & 15 == FAILED => failed(r[0], false),
@@ -473,6 +473,7 @@ impl Drop for Conn {
     /// Op 7 CLOSE. While nobody is present ip does nothing for it (every request is answered with nothing then); the connection, asked about by no one, is reset and freed by ip 32 s on.
     fn drop(&mut self) {
         let mut r = [0u8; 1];
-        let _ = self.ip.call(&[CLOSE, self.handle], &mut r);
+        let h = self.handle.to_be_bytes();
+        let _ = self.ip.call(&[CLOSE, h[0], h[1]], &mut r);
     }
 }
