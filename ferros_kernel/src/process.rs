@@ -9492,6 +9492,24 @@ fn uses_publish() {
     }
 }
 
+/// `diag uses` (2026-11-26): the indicators' word (fact 90) decoded, every right in use (holder, since, the driver that received a kernel mark's call), and the log since the person last looked. Under the lock.
+pub fn uses_report(s: &mut alloc::string::String) {
+    use core::fmt::Write;
+    let name = |r: u8| ferros_kist::RIGHTS.get(r as usize).copied().unwrap_or("?");
+    let proc_name = |e: u64| k().procs.iter().flatten().find(|q| q.epoch == e).map(|q| alloc::string::String::from_utf8_lossy(&q.name).into_owned()).unwrap_or_else(|| alloc::string::String::from("(ended)"));
+    let short = |c: &Option<[u8; 32]>| c.map(|c| alloc::format!(" kist G#{:02X}{:02X}{:02X}{:02X}", c[0], c[1], c[2], c[3])).unwrap_or_default();
+    let w = USES.load(core::sync::atomic::Ordering::Acquire);
+    let bits = |b: u64| (0..8).filter(|k| b >> k & 1 == 1).map(|k| alloc::format!(" {k}")).collect::<alloc::string::String>();
+    let _ = writeln!(s, "uses (fact 90) G#{w:X}: live indicator bits{}, missed since you looked{}, change A#{} (ferros_kist::indicator: 0 camera, 1 mic, 2 location, 3 nearby, 4 motion, 5 screen)", bits(w & 255), bits(w >> 8 & 255), w >> 16);
+    for c in unsafe { (*(&raw const CLAIMS)).iter() } {
+        let srv = if c.server != 0 { alloc::format!(", received by {}", proc_name(c.server)) } else if c.by_kernel { alloc::string::String::from(", not yet received") } else { alloc::string::String::new() };
+        let _ = writeln!(s, "  in use: {} by {}{} since eagle A#{}{}{}", name(c.right), proc_name(c.epoch), short(&c.capsule), c.since, if c.by_kernel { " (the kernel's mark)" } else { " (claimed)" }, srv);
+    }
+    for u in unsafe { (*(&raw const USED)).iter() } {
+        let _ = writeln!(s, "  since you looked: {}{} from eagle A#{} to A#{}", name(u.right), short(&u.capsule), u.first, u.last);
+    }
+}
+
 /// A use ended, from `since` to now: kept in the log under its (right, kist), the first start and the last end (`Used`). True when the (right, kist) is new to the log, the one change a reader of the log is rung for: a kist reading GPS a fix at a time moves only the last end, and rings nothing.
 fn use_logged(right: u8, capsule: Option<[u8; 32]>, since: i64) -> bool {
     let now = crate::settings::eagle_now();

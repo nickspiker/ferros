@@ -4930,6 +4930,14 @@ pub fn run(mut b: Boot) -> ! {
                     queue_pt_response(&mut pt_out_data, &resp);
                     continue;
                 }
+                if cmd.params == b"uses" {
+                    // `diag uses`: the rights in use, the log since the person last looked, and the indicators' word decoded (process.rs `uses_report`).
+                    let mut t = alloc::string::String::new();
+                    crate::process::with_lock(|| crate::process::uses_report(&mut t));
+                    resp.extend_from_slice(t.as_bytes());
+                    queue_pt_response(&mut pt_out_data, &resp);
+                    continue;
+                }
                 if cmd.params == b"facts" {
                     // `diag facts`: the sensor words of SYS_FACTS as a process receives them, and whether the sensors process has published its block (sensorlink.rs).
                     let v = crate::process::with_lock(facts);
