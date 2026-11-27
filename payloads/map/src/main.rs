@@ -1237,6 +1237,32 @@ fn link_state(k: usize, state: Option<i64>) -> &'static str {
 }
 
 /// What a right is, in the person's words and language, by its place in ferros_kist::RIGHTS (whose MEANS are the English).
+/// `t` wrapped at spaces to `width` at size `px`, by the face's average advance (five eighths of the size) as a page's `row` judges it: its lines, each a slice of `t`, at least one (owner, 2026-11-26: "Can we get the deck screen messages and warnings and such to linewrap?").
+fn wrap_lines(t: &str, width: i64, px: i64) -> alloc::vec::Vec<&str> {
+    let fits = (width * 8 / (px * 5)) as usize;
+    let mut out = alloc::vec::Vec::new();
+    let mut rest = t;
+    loop {
+        let cut = if rest.len() <= fits {
+            rest.len()
+        } else {
+            let mut k = fits;
+            while !rest.is_char_boundary(k) {
+                k -= 1;
+            }
+            rest[..k].rfind(' ').map_or(k, |c| c + 1)
+        };
+        // WHY: a line that takes nothing (a column narrower than a glyph) would never end the loop; it takes its first character.
+        let cut = if cut == 0 { rest.chars().next().map_or(rest.len(), char::len_utf8) } else { cut };
+        out.push(rest[..cut].trim_end());
+        rest = rest[cut..].trim_start();
+        if rest.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
 fn right_name(r: usize) -> &'static str {
     // The puck right (12) is never shown to a person (it is never asked): it reads as its English meaning if anything ever names it.
     const NAMES: [Msg; 12] = [Msg::RightDisplay, Msg::RightTouch, Msg::RightSurface, Msg::RightIra, Msg::RightDomain, Msg::RightEntropy, Msg::RightGps, Msg::RightUdp, Msg::RightAudio, Msg::RightCamera, Msg::RightBeYou, Msg::RightPeople];
@@ -4998,12 +5024,18 @@ impl Map {
                     }
                     l
                 };
-                // A card's top tier: its picture, its name, the line under it (dim or grey), and the chevron saying it opens (when it does); the text cut to the column left of the chevron.
+                // A card's message lines: the line under its name and a stower's words, wrapped to their column, each line past the first a step lower and the card that much taller (`grown`).
+                let step = uu(3, 2);
+                let column = cr - uu(5, 2) - (cl + uu(4, 1));
+                let words_width = cr - u - (cl + uu(4, 1));
+                let grown = |t: &str, width: i64| (wrap_lines(t, width, note).len() as i64 - 1) * step;
+                // A card's top tier: its picture, its name cut to the column left of the chevron, the line under it (dim or grey) wrapped to that column, and the chevron saying it opens (when it does).
                 let face = |b: &mut Batch, y0: i64, index: u8, glow: (ferros_glow::Glow, u16), pie: ferros_glow::pie::Shares, name: &str, under: &str, under_colour: u32, opens: bool| {
                     picture(b, cl + uu(2, 1), y0 + uu(2, 1), uu(3, 2), index, glow, pie);
-                    let column = cr - uu(5, 2) - (cl + uu(4, 1));
                     b.text(cl + uu(4, 1), y0 + uu(7, 4), small as u16, white(), 0, cut(name, column, small).as_str());
-                    b.text(cl + uu(4, 1), y0 + uu(25, 8), note as u16, under_colour, 0, cut(under, column, note).as_str());
+                    for (k, line) in wrap_lines(under, column, note).iter().enumerate() {
+                        b.text(cl + uu(4, 1), y0 + uu(25, 8) + k as i64 * step, note as u16, under_colour, 0, line);
+                    }
                     if opens {
                         b.text(cr - u, y0 + uu(9, 4), uu(3, 2) as u16, dim(), 2, "\u{203A}");
                     }
@@ -5030,28 +5062,11 @@ impl Map {
                             let y0 = y;
                             let x = cl + uu(4, 1);
                             let width = cr - u - x;
-                            // Left-aligned lines in the text column, wrapped at spaces by the face's average advance as `row` wraps.
+                            // Left-aligned lines in the text column, wrapped at spaces by the face's average advance as `row` wraps (`wrap_lines`).
                             let lines = |b: &mut Batch, y: &mut i64, px: i64, colour: u32, t: &str| {
-                                let fits = (width * 8 / (px * 5)) as usize;
-                                let mut rest = t;
-                                loop {
-                                    let cut = if rest.len() <= fits {
-                                        rest.len()
-                                    } else {
-                                        let mut k = fits;
-                                        while !rest.is_char_boundary(k) {
-                                            k -= 1;
-                                        }
-                                        rest[..k].rfind(' ').map_or(k, |c| c + 1)
-                                    };
-                                    // WHY: a line that takes nothing (a column narrower than a glyph) would never end the loop; it takes its first character.
-                                    let cut = if cut == 0 { rest.chars().next().map_or(rest.len(), char::len_utf8) } else { cut };
-                                    b.text(x, *y, px as u16, colour, 0, rest[..cut].trim_end());
-                                    rest = rest[cut..].trim_start();
+                                for line in wrap_lines(t, width, px) {
+                                    b.text(x, *y, px as u16, colour, 0, line);
                                     *y += uu(3, 2);
-                                    if rest.is_empty() {
-                                        break;
-                                    }
                                 }
                             };
                             let mut t = Line::new();
@@ -5327,10 +5342,6 @@ impl Map {
                     heading(b, &mut y, tr(if puck { Msg::DeckPucks } else { Msg::DeckKists }), Some(n));
                     for (ki, k) in ks.iter().enumerate().filter(|(ki, _)| puck_icon(&ks, *ki).is_some() == puck) {
                         let y0 = y;
-                        y += card_h + gap;
-                        if !shows(y0, card_h) {
-                            continue;
-                        }
                         let what = Some(Choice::Card(ki as u8));
                         let running = if puck { self.pucks_up.contains(&k.capsule) && !self.pucks_held.contains(&k.capsule) } else { self.kist_state(&k.capsule).is_some_and(|s| s.0 == Msg::Running) };
                         // Its state in words as its glow says it ("-" before the kernel has said which kists are alive), then its version in the person's base.
@@ -5348,13 +5359,24 @@ impl Map {
                         let newer = inst.dir.iter().position(|e| e.developer == k.developer && e.option == k.option && e.capsule != k.capsule && k.version.as_ref().is_none_or(|v| e.version > *v));
                         let job = inst.job_for(&k.capsule).or_else(|| newer.and_then(|di| inst.job_for(&inst.dir[di].capsule))).filter(|j| j.stage != stower::DONE);
                         let failed = job.filter(|j| j.stage == stower::FAILED).map(|j| stower::words(j, f));
+                        let under = failed.as_ref().map_or(l.as_str(), |w| w.as_str());
+                        let doing = job.filter(|j| j.stage < stower::DONE).map(|j| stower::words(j, f));
+                        // The card as tall as its wrapped words (`grown`), the tier under the message moved down by the message's extra lines.
+                        let lift = grown(under, column);
+                        let h = card_h + lift + doing.as_ref().map_or(0, |w| grown(w.as_str(), words_width));
+                        y += h + gap;
+                        if !shows(y0, h) {
+                            continue;
+                        }
                         let i = ki + 1;
-                        face(b, y0, i as u8, self.state(i), self.pie_of(i), &k.name, failed.as_ref().map_or(l.as_str(), |w| w.as_str()), if failed.is_some() { white() } else { grey() }, true);
-                        match job {
-                            Some(j) if j.stage < stower::DONE => {
-                                b.text(cl + uu(4, 1), y0 + uu(41, 8), note as u16, grey(), 0, stower::words(j, f).as_str());
+                        face(b, y0, i as u8, self.state(i), self.pie_of(i), &k.name, under, if failed.is_some() { white() } else { grey() }, true);
+                        match &doing {
+                            Some(w) => {
+                                for (kk, line) in wrap_lines(w.as_str(), words_width, note).iter().enumerate() {
+                                    b.text(cl + uu(4, 1), y0 + lift + uu(41, 8) + kk as i64 * step, note as u16, grey(), 0, line);
+                                }
                             }
-                            _ => {
+                            None => {
                                 let mut up = Line::new();
                                 let mut ps: Vec<(&str, u8, Option<Choice>)> = Vec::with_capacity(3);
                                 ps.push((tr(Msg::Stop), if running { 1 } else { 2 }, Some(Choice::Stop(ki as u8))));
@@ -5364,10 +5386,10 @@ impl Map {
                                     ps.push((up.as_str(), 0, Some(Choice::StowListed(di as u8))));
                                 }
                                 ps.push((tr(if puck { Msg::RemoveFromDeck } else { Msg::Unstow }), if inst.here { 1 } else { 2 }, Some(Choice::UnstowAsk(ki as u8))));
-                                pills(self, b, y0, &ps);
+                                pills(self, b, y0 + lift, &ps);
                             }
                         }
-                        card(self, b, y0, card_h, what);
+                        card(self, b, y0, h, what);
                     }
                 }
                 // The pandok (the directory, kists.fgtw.org; owner, 2026-11-11: "pandok is the place with the things"), under the deck: each kist it lists that is not on the deck, or is at an older version there, a card with Stow or Update and its size.
@@ -5395,10 +5417,6 @@ impl Map {
                             continue;
                         }
                         let y0 = y;
-                        y += card_h + gap;
-                        if !shows(y0, card_h) {
-                            continue;
-                        }
                         let mut t = Line::new();
                         let _ = write!(t, "{} ", e.name);
                         let _ = ferros_kist::write_version(&mut t, f, &e.version.0);
@@ -5414,19 +5432,30 @@ impl Map {
                             None => (0xFF, (ferros_glow::Glow::None, 0), job.and_then(stower::pie).unwrap_or(ferros_glow::pie::Shares::DONE)),
                         };
                         let failed = job.filter(|j| j.stage == stower::FAILED).map(|j| stower::words(j, f));
-                        face(b, y0, index, glow, pie, t.as_str(), failed.as_ref().map_or(a.as_str(), |w| w.as_str()), if failed.is_some() { white() } else { dim() }, mine.is_some());
-                        match job {
-                            Some(j) if j.stage < stower::DONE => {
-                                b.text(cl + uu(4, 1), y0 + uu(41, 8), note as u16, grey(), 0, stower::words(j, f).as_str());
+                        let under = failed.as_ref().map_or(a.as_str(), |w| w.as_str());
+                        let doing = job.filter(|j| j.stage < stower::DONE).map(|j| stower::words(j, f));
+                        // As a deck card's: as tall as its wrapped words.
+                        let lift = grown(under, column);
+                        let h = card_h + lift + doing.as_ref().map_or(0, |w| grown(w.as_str(), words_width));
+                        y += h + gap;
+                        if !shows(y0, h) {
+                            continue;
+                        }
+                        face(b, y0, index, glow, pie, t.as_str(), under, if failed.is_some() { white() } else { dim() }, mine.is_some());
+                        match &doing {
+                            Some(w) => {
+                                for (kk, line) in wrap_lines(w.as_str(), words_width, note).iter().enumerate() {
+                                    b.text(cl + uu(4, 1), y0 + lift + uu(41, 8) + kk as i64 * step, note as u16, grey(), 0, line);
+                                }
                             }
-                            _ => {
+                            None => {
                                 let mut l = Line::new();
                                 let _ = write!(l, "{} \u{B7} ", tr(if mine.is_some() { Msg::Update } else { Msg::Stow }));
                                 let _ = tatau::size_bits(&mut l, f, e.size << 3, 1);
-                                pills(self, b, y0, &[(l.as_str(), 0, Some(Choice::StowListed(di as u8)))]);
+                                pills(self, b, y0 + lift, &[(l.as_str(), 0, Some(Choice::StowListed(di as u8)))]);
                             }
                         }
-                        card(self, b, y0, card_h, mine.map(|ki| Choice::Card(ki as u8)));
+                        card(self, b, y0, h, mine.map(|ki| Choice::Card(ki as u8)));
                     }
                     if folded {
                         row(self, b, &mut y, note, dim(), tr(Msg::PandokRestOnDeck), None);
