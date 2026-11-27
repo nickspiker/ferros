@@ -2,7 +2,7 @@
 //!
 //! - **The slide** (owner, 2026-11-11, on the Pro, after the first cut's grow-and-fan: "the top console pulldown is stupidly slow and jerky", then "track the finger down from top tho and slide it in so it doesn't need a re-render, just a move and composite, then do the iterate/2 each frame, like we do for the settings page until it snaps in or out of place"). The row's offset `off`, whole pixels: 0 hidden, `slide` open (the display's length, op 56's reply). A finger that lands in the doorway by the camera (op 41: 10) and goes down moves it one to one (owner, 2026-11-11: "the second console row should only show if drug down from the area in the invisible camera circle"); from open a push up brings it back the same way. The display draws the row once and only moves it.
 //! - **The lift.** The row goes open when it was pulled past a third of the way (or, pushed from open, not back past a third), else hidden: each frame the panel showed, what is left to go halves (a right shift), so it lands in a few frames and holds still (`step`). No timer: the steps are the shown frames (owner, 2026-11-08: "we follow shown frames, not composited").
-//! - **Two kinds of circle** (QUICK.md "Quick pages"). A switch acts on a tap (`tap`): radios off and back, sound round its modes, do not disturb, full screen, screencap. A level (the two rings, brightness and the torch) opens its page on a tap and is set by a drag down (owner, 2026-11-12: "tap on torch brings up the torch config screen, when dragging, once your finger goes below the torch circle it goes from 0% to 100% at the screen midpoint"; and "Same for brightness"). In the doorway a tap opens or shuts the row. Behind the row while it shows (op 41: 12): it shuts.
+//! - **Two kinds of circle** (QUICK.md "Quick pages"). A switch acts on a tap (`tap`): radios off and back, sound round its modes, do not disturb, screencap; the permissions circle opens its page on a tap, as a level does. A level (the two rings, brightness and the torch) opens its page on a tap and is set by a drag down (owner, 2026-11-12: "tap on torch brings up the torch config screen, when dragging, once your finger goes below the torch circle it goes from 0% to 100% at the screen midpoint"; and "Same for brightness"). In the doorway a tap opens or shuts the row. Behind the row while it shows (op 41: 12): it shuts.
 //! - **The drag down from a ring** (`pull_to`): nothing while the finger is still above the circle's bottom edge; once below it, the level is where the finger is, not how far it went: 0 at the circle's bottom edge (the torch off, brightness the dimmest the panel goes) to the whole level at the screen's vertical middle, back down as the finger goes back up, eased into both ends (`level_at`, the ring's own C∞ ease pinned to those two rows). Let go, the level is kept. No page opens from a drag (the span/12 open distance of 2026-11-11 went with this), and no long press anywhere (it would need a timer).
 //! - **Full screen** (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"): the display neither draws the row nor gives it, the doorway or the console any pixel of the hit map, so nothing here starts; turned on by the map (the middle circle, home's swipe), the row shuts at once (`shut`).
 //! - **The console's circles** (main.rs): every pixel of the dash is a circle's zone (the display's, nearest rim). Dragged toward the centre a circle opens its page; tapped still a radio switches and any other circle opens its page. No long press (it went 2026-11-11, with drag-to-centre back). Only the doorway pulls or taps the row open.
@@ -20,8 +20,8 @@ pub const ITEM: u8 = 0x80;
 pub const RADIOS_OFF: usize = 0;
 pub const SOUND: usize = 1;
 pub const BRIGHTNESS: usize = 2;
-/// The middle one (owner, 2026-11-11: full screen moves from the deck swipe to "a quick-row circle"): the app in front full screen or not (display op 43); nothing with no app in front, where the display draws it dimmed.
-pub const FULL_SCREEN: usize = 3;
+/// The middle one, the permissions circle (owner, 2026-11-26, replacing full screen, which Deck's swipe still switches): what the privacy indicators by the camera say, larger, and a tap opens the permissions page (who is using what now, and since you last looked).
+pub const PERMISSIONS: usize = 3;
 pub const TORCH: usize = 4;
 pub const DND: usize = 5;
 pub const SCREENCAP: usize = 6;
@@ -38,6 +38,7 @@ pub fn page(k: usize) -> Option<&'static str> {
     match k {
         BRIGHTNESS => Some("appearance"),
         TORCH => Some("torch"),
+        PERMISSIONS => Some("permissions"),
         _ => None,
     }
 }
@@ -173,7 +174,7 @@ impl Quick {
         self.last = frame;
     }
 
-    /// Shut at once, no slide (owner, 2026-11-11, on the Pro: in full screen the console is "gone gone"): full screen turned on by the map's own hand (the middle circle, deck's swipe). The display draws none of the row in full screen and gives none of it to the hit map, so a slide back would move nothing anyone sees; landed hidden here, the row is not found open when full screen goes off. A finger's grab or a held circle ends with it.
+    /// Shut at once, no slide (owner, 2026-11-11, on the Pro: in full screen the console is "gone gone"): full screen turned on by the map's own hand (deck's swipe). The display draws none of the row in full screen and gives none of it to the hit map, so a slide back would move nothing anyone sees; landed hidden here, the row is not found open when full screen goes off. A finger's grab or a held circle ends with it.
     pub fn shut(&mut self) {
         self.grab = None;
         self.held = None;
@@ -296,19 +297,8 @@ impl Quick {
                     opens = page(k);
                 }
             }
-            FULL_SCREEN => {
-                // The display switches the app in front's full screen and says how it stands; with no app in front it refuses (status 3) and nothing changes. Turned on, the row is gone with the console (`shut`).
-                let mut r = [0u8; 4];
-                let n = call(self.display, &[43], &mut r);
-                if n >= 2 && n != ferros_sys::ERR && r[0] == 0 && r[1] == 1 {
-                    self.shut();
-                }
-                let _ = write!(l, "map: quick: {}\n", match (n >= 2 && n != ferros_sys::ERR, r[0], r[1]) {
-                    (true, 0, 1) => "full screen",
-                    (true, 0, _) => "full screen off",
-                    _ => "full screen: no app in front",
-                });
-            }
+            // The permissions circle's tap opens the permissions page (owner, 2026-11-26: "a tap on the permissions circle after the pulldown to open the permissions used detail page"), over a kist too (main.rs sends it behind).
+            PERMISSIONS => opens = page(k),
             DND => {
                 let on = !ferros_sys::dnd::on();
                 dnd_ask(on);

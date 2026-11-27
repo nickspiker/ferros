@@ -59,6 +59,8 @@ mod modeset;
 mod neon;
 mod odt;
 mod quick;
+mod beads;
+mod indicators;
 mod puck;
 /// The compose on the GPU (docs/GPU-COMPOSE.md step 2, behind op 86).
 mod gpu;
@@ -3218,7 +3220,7 @@ struct Win {
     mode: u8,
     /// Behind (op 60; owner, 2026-11-11: "Home backgrounds the kist so depending on how it was designed, like Photon, it doesn't die but it stops rendering everything"): kept in the table with its surface and its process, never composed, never an owner in the hit map, its shows taken (place and format) but published nowhere, until op 59 brings it to the front.
     back: bool,
-    /// Full screen for this window (op 43, the quick row's circle, deck's swipe): no bars while it is the app in front (`FULL` follows the front app window's).
+    /// Full screen for this window (op 43, deck's swipe; the quick row's middle circle from 2026-11-11 to 2026-11-26, permissions since): no bars while it is the app in front, the privacy indicators alone kept (`bar_line`; `FULL` follows the front app window's).
     full: bool,
 }
 /// A surface of fluor's 16-bit pixels (fluor `pixel::G2t16`): α in bits 48-63, then each channel's darkness (the top code less the channel's VSF `g2t` code, scaled by α) in bits 32-47 (R), 16-31 (G) and 0-15 (B); α 0 is see-through.
@@ -3292,7 +3294,7 @@ const CLEAR: u64 = 1 << 63;
 static mut CHROME_TOP: usize = 0;
 /// The console's rows, the bars' top band: `CHROME_TOP`, or down to the quick row's floor where that is lower (quick.rs `rows`; since 2026-11-11 the row reaches past the chrome rows to touch the glass's sides).
 static mut BAR_TOP: usize = 0;
-/// Full screen (owner, 2026-11-07, then the deck swipe; 2026-11-11 the quick row's middle circle, and later that day the deck swipe again with an app in front: "the swipe in on home whilist in a kist needs to show/hide controls"): the console and the helm hidden (the app's circle no longer clips anything since 2026-11-12, "Drawn under the controls", so full screen is only the controls hidden), only the glass's edge left (black, and orange on development builds). The app window in front's own flag (`Win::full`, switched by op 43), followed by `full_follow` whenever the windows change; off with no app in front. The helm is hidden but stays the system's on the hit map, undrawn, so deck's swipe there switches it back; the console and the quick row are gone, not drawn (`bar_line`) and not on the hit map (hit.rs `row`, which reads the bars' ids on the helm's rows alone while this is on), so the app has those pixels and their touches (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"). The map shuts the quick row at once when it turns this on itself (its middle circle, deck's swipe).
+/// Full screen (owner, 2026-11-07, then the deck swipe; 2026-11-11 the quick row's middle circle too, and later that day the deck swipe again with an app in front: "the swipe in on home whilist in a kist needs to show/hide controls"; since 2026-11-26 the deck swipe alone, the middle circle permissions): the console and the helm hidden (the app's circle no longer clips anything since 2026-11-12, "Drawn under the controls", so full screen is only the controls hidden), only the glass's edge left (black, and orange on development builds). The app window in front's own flag (`Win::full`, switched by op 43), followed by `full_follow` whenever the windows change; off with no app in front. The helm is hidden but stays the system's on the hit map, undrawn, so deck's swipe there switches it back; the console and the quick row are gone, not drawn (`bar_line`) and not on the hit map (hit.rs `row`, which reads the bars' ids on the helm's rows alone while this is on), so the app has those pixels and their touches (owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"), but for the privacy indicators beside the camera, drawn in full screen too and on no pixel of the hit map (owner, 2026-11-26: a full-screen app must not hide a live microphone; indicators.rs). The map shuts the quick row at once when it turns this on itself (deck's swipe).
 static mut FULL: bool = false;
 static mut CHROME_BOT: usize = 0;
 /// The bars (owner, 2026-11-07): the console, the circles at the top of the screen (the radios' switches and the system's indicators), over the `BAR_TOP` rows (the quick row with them), then the helm, deck and back at the bottom, over the `CHROME_BOT` rows. They are the frontmost layer but the glass's edge, over the deck and every app alike, in screen coordinates, so nothing transforms them. Drawn as fluor draws: front to back from empty, into fluor's 16-bit α + darkness (`G2T16`), by fluor's one `under`; redrawn only when what they show changes (`console_draw`, `helm_draw`).
@@ -3342,7 +3344,14 @@ fn bar_row(y: usize, height: usize) -> Option<usize> {
 #[inline]
 fn bar_line(y: usize, width: usize, height: usize) -> ((usize, usize), &'static [u64]) {
     // Full screen: the bars hidden, the quick row with them, every publish passing their rows untouched (owner, 2026-11-11: the console "gone gone"; until then its rows showed while the bars held any of the quick row, pulled from the doorway, so the row's circle could switch full screen off; deck's swipe is the way back now).
+    // But not the privacy indicators (owner, 2026-11-26: a full-screen app must not be able to hide a live microphone): on the hole's rows the columns the bars hold of them (indicators.rs `shown`, swapped with the bars), nothing else; empty while none is lit or missed. The quick row is shut in full screen and the console's circles stand clear of the beads (indicators.rs `geometry`'s check), so those columns hold the indicators alone.
     if unsafe { FULL } {
+        if y < unsafe { BAR_TOP } {
+            let (a, z) = indicators::shown(y);
+            if a < z {
+                return ((a, z), unsafe { core::slice::from_raw_parts((BAR_W as *const u64).add(y * width), width) });
+            }
+        }
         return ((0, 0), &[]);
     }
     match bar_row(y, height) {
@@ -6819,6 +6828,12 @@ extern "C" fn console_worker(arg: u64) -> ! {
         // The quick row: a circle drawn into its sprite only when its look changed, and the rows its slide owes (quick.rs `update`); whether the row moved (a step of the slide).
         let was = quick::composed();
         let quick = quick::update(width, height);
+        // The privacy indicators: their layer drawn again only when what is lit changed (indicators.rs `update`), its rows owed a compose with the quick row's, the union of the two ranges.
+        // WHY the min and max: the rows owed are the union of the two layers' ranges, an extent, never a clamp.
+        let quick = match (quick, indicators::update(width, height)) {
+            (Some((a, b)), Some((c, d))) => Some((a.min(c), b.max(d))),
+            (q, i) => q.or(i),
+        };
         // The first compose at start (from none, −1) is not a step.
         let moved = quick::composed() != was && was >= 0;
         let q_us = ferros_sys::us_since(t_q);
@@ -6976,6 +6991,13 @@ fn bar_decode(b0: usize, rows: usize, width: usize, height: usize) {
             decode_row(unsafe { core::slice::from_raw_parts((BAR as *const u64).add((b - (bt - ct)) * width), width) }, out)
         };
         if b < bt {
+            // Front to back: the console's circles (already in), the privacy indicators under them, the quick row under both (indicators.rs `compose`; the indicators' columns kept for full screen, `bar_line`).
+            let (il, ir) = indicators::compose(b, out);
+            if il < ir {
+                // WHY the min and max: the row's changed columns are the union of the console's and the indicators', an extent, never a clamp.
+                l = l.min(il);
+                rr = rr.max(ir);
+            }
             let (ql, qr) = quick::compose(b, out, width, height);
             if ql < qr {
                 l = l.min(ql);
@@ -7184,6 +7206,8 @@ fn console_draw(width: usize, height: usize, force: bool) -> bool {
     let t_f = ferros_sys::now();
     let facts = ferros_sys::facts().0;
     let f_us = ferros_sys::us_since(t_f);
+    // The rights in use (fact 90) for the privacy indicators' layer and the quick row's permissions circle, which the worker looks at after this (indicators.rs `update`, quick.rs `look`): read here with the rest, every pass, whether or not the console draws.
+    indicators::WORD.store(facts[ferros_sys::uses::FACT], Ordering::Release);
     // Measuring: a slow time or facts call, said once in 64.
     unsafe {
         CONSOLE_SLOW[0] = CONSOLE_SLOW[0].max(cs_us);
@@ -8076,6 +8100,20 @@ static FRAMES: AtomicU64 = AtomicU64::new(0);
 static mut SCREEN_WH: (u16, u16) = (0, 0);
 static mut RECV_STACK: [u8; 32768] = [0; 32768];
 
+/// The facts' doorbell word (SYS_BELL `BELL_FACTS`; 2026-11-26, the privacy indicators): the kernel writes its count here and wakes the waiter when a fact the pages show changes, the rights in use (fact 90) among them.
+static FACTS_WORD: AtomicU64 = AtomicU64::new(0);
+static mut FACTS_STACK: [u8; 1 << 12] = [0; 1 << 12];
+
+/// The facts' doorbell, on a thread of its own: each ring asks the render thread for a pass (`ring_bell`), whose console pass reads the facts, so an indicator lights on the frame after the kernel marks a microphone or a camera open, not at the next idle look. Nothing rings on a kernel without the bell, and the indicators wait for that look as before.
+extern "C" fn facts_bell(_: u64) -> ! {
+    ferros_sys::bell(ferros_sys::BELL_FACTS, &FACTS_WORD);
+    loop {
+        let seen = FACTS_WORD.load(Ordering::Acquire);
+        ferros_sys::wait_world(&FACTS_WORD, seen, 0);
+        ring_bell();
+    }
+}
+
 /// Ops whose reply carries the render thread's result (a DSI read, whether a frame moved, full screen's new state, the glass's columns, an icon's slot): the receive thread waits for them. An op left out is answered 0 at once and its reply dropped (2026-11-08: op 43's state and op 53's columns never reached the map and the keyboard; 2026-11-20: ops 78 and 79, so no icon slot ever came back).
 fn op_is_sync(op: u8) -> bool {
     matches!(op, 4 | 6 | 7 | 8 | 9 | 10 | 11 | 21 | 26 | 28 | 29 | 30 | 31 | 43 | 45 | 53 | 59 | 60 | 61 | 67 | 68 | 70 | 71 | 78 | 79)
@@ -8662,6 +8700,8 @@ fn server(grants: u64) -> ! {
         let top = quick::rows(width, height, top);
         BAR_TOP = top;
         quick::init(width, height);
+        // The privacy indicators' layer and the columns of it the bars carry, over the hole's rows (indicators.rs `init`).
+        indicators::init(width, height);
         BAR_W = alloc::vec![CLEAR; (top + bot) * width].leak().as_mut_ptr() as usize;
         BAR_SPAN = alloc::vec![(0u16, 0u16); top + bot].leak().as_mut_ptr() as usize;
         BAR_W_BACK = alloc::vec![CLEAR; (top + bot) * width].leak().as_mut_ptr() as usize;
@@ -8856,6 +8896,11 @@ fn server(grants: u64) -> ! {
     }
     if ferros_sys::thread_spawn(receive, unsafe { &mut *(&raw mut RECV_STACK) }, grants) != 0 {
         log.s(b"display: no receive thread\n");
+        log.flush();
+    }
+    // The facts' doorbell for the privacy indicators (`facts_bell`).
+    if ferros_sys::thread_spawn(facts_bell, unsafe { &mut *(&raw mut FACTS_STACK) }, 0) != 0 {
+        log.s(b"display: no facts doorbell thread: the privacy indicators follow the next idle look\n");
         log.flush();
     }
     // The pucks' lists arrive on their own endpoint (slot 9; puck.rs), each behind its kist's identity.
@@ -10132,7 +10177,7 @@ fn server(grants: u64) -> ! {
                     }
                 }
                 Some(43) => {
-                    // Full screen on or off for the app window in front (`Win::full`, `FULL`; the quick row's circle since 2026-11-11, owner: full screen "moves to a quick-row circle", where the deck swipe toggled it for the whole screen until then): every phase republished, the bars gone or back, the window told its safe area (`safe_follow`), and with the publish every row of the hit map written again (hit.rs `row`: the console's rows the app's in full screen, the helm's still the system's). Replies the new state; status 3 and the state unchanged with no app in front (the deck always has its bars), 4 (`NOT_YOURS`) when the app in front is neither the caller's nor the caller the system's.
+                    // Full screen on or off for the app window in front (`Win::full`, `FULL`; deck's swipe, and the quick row's middle circle from 2026-11-11, owner: full screen "moves to a quick-row circle", until 2026-11-26, when that circle became permissions): every phase republished, the bars gone or back, the window told its safe area (`safe_follow`), and with the publish every row of the hit map written again (hit.rs `row`: the console's rows the app's in full screen, the helm's still the system's). Replies the new state; status 3 and the state unchanged with no app in front (the deck always has its bars), 4 (`NOT_YOURS`) when the app in front is neither the caller's nor the caller the system's.
                     match front_app() {
                         Some(k) if !manages(unsafe { HOLDS }, k) => out[0] = not_yours(43, k),
                         Some(k) => unsafe {
@@ -10810,6 +10855,8 @@ fn server(grants: u64) -> ! {
                 BAR_SPAN = BAR_SPAN_BACK;
                 BAR_W_BACK = w;
                 BAR_SPAN_BACK = s;
+                // The privacy indicators' columns go with the bars (`bar_line` gives them in full screen).
+                indicators::swap();
                 let mut r = CON_RECT;
                 // The front layer the GPU composes under (gpu.rs) made again on those rows.
                 gpu::bars_changed(r);

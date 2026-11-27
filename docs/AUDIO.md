@@ -362,8 +362,8 @@ Under load and pinned to an A510: to be measured (Lumis pins its intake to cores
 
 ### Proposals for the owner (nothing of these is built)
 
-- **A mic right.** Today any kist holding `audio` (implicit for every kist) can call `MIC_LEVELS` and `RECORD`, and would read the planned `mic` mailbox. Proposed: `mic`, a right of its own in the kists' vocabulary, asked once per person per kist (permissions_asked_once), the proof for SYS_MAILBOX op 0 on `mic` and for `MIC_LEVELS` and `RECORD`; the Sound page's tests keep it as a Settings holder. Until the owner decides, the proof is the `audio` right, swapped in one place.
-- **The capture runs only while someone holds a view.** A kernel-kept count of views (a header word, +1 at an open, -1 at its process's end) the service reads every period: at 0 the microphones stop, so a kist that dies cannot leave them on, and the same count is the mic-in-use indicator.
+- **A mic right.** Built 2026-11-26 (the owner: "mic will need wired up with a permission grant and an indication when being used"): ferros_kist `mic`, asked, the `mic` endpoint; see "The mic right".
+- **The capture runs only while someone holds a view.** Built 2026-11-26 another way: the kernel marks a view held (fact 90, the indicator) and the service stops its stream once fact 90 says none is held (see "The mic right").
 - **Gain policy.** The record soft gain (block 136, component 30, key 16, whole dB) and the hardware gain (cB) are the service's, never a kist's: one setting per use, a call's voice and a recording at Android's measured values (soft 0 dB, hardware 130 cB for voice; 5 dB unprocessed), the level meter at what a recording uses, the defaults stored as device settings; a kist gets the samples at that gain and scales its own copy. The calibration session (the owner's measurement microphone) turns them into dB SPL.
 
 ### What Android sends, and the MMAP path on ferros (2026-11-24, the Pro)

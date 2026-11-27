@@ -9490,6 +9490,8 @@ fn uses_publish() {
     let was = USES.load(core::sync::atomic::Ordering::Relaxed);
     if was & ((1 << 16) - 1) != bits {
         USES.store(((was >> 16) + 1) << 16 | bits, core::sync::atomic::Ordering::Release);
+        // The facts' bell (SYS_BELL `BELL_FACTS`, anyone's): the display's indicators light on the frame after a microphone opens, not at its next idle look at the facts.
+        bell_count(BELL_FACTS);
     }
 }
 

@@ -463,6 +463,10 @@ messages! {
     NoKistsStowed,
     AsksForNothing,
     NewKistsStartOn,
+    /// The permissions page's heading over every right in use now and who holds it (2026-11-26, the privacy indicators; docs/KERNEL.md "Rights in use").
+    InUseNow,
+    /// The permissions page's heading over what was used since the person last opened the page (cleared when they look, never on a timer).
+    SinceYouLooked,
     /// The first-launch question's line over the wants.
     AsksForOnce,
     /// The first-launch question's button.
@@ -490,6 +494,8 @@ messages! {
     RightPeople,
     /// Bluetooth (KISTS.md, the asked rights; BT.md "The client ops", 2026-11-24): scans, connections and channels to devices near the person.
     RightBluetooth,
+    /// The microphones (2026-11-26, the mic right: KISTS.md, the asked rights; AUDIO.md "The mic right"): a wave's voice, the capture a kist may read while the person allowed it, its privacy indicator lit all the while.
+    RightMic,
     // ---- People (docs/FACETS.md "People"): the system's page, its add-a-person sheet, a kist's card's chooser ----
     /// The People page's title, a settings page.
     PagePeople,

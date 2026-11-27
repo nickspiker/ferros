@@ -1266,9 +1266,12 @@ fn wrap_lines(t: &str, width: i64, px: i64) -> alloc::vec::Vec<&str> {
 fn right_name(r: usize) -> &'static str {
     // The puck right (12) is never shown to a person (it is never asked): it reads as its English meaning if anything ever names it.
     const NAMES: [Msg; 12] = [Msg::RightDisplay, Msg::RightTouch, Msg::RightSurface, Msg::RightIra, Msg::RightDomain, Msg::RightEntropy, Msg::RightGps, Msg::RightUdp, Msg::RightAudio, Msg::RightCamera, Msg::RightBeYou, Msg::RightPeople];
-    // Bluetooth (14) has its own words; the hold's items (13) reads as its English meaning, as the puck does.
+    // Bluetooth (14) and the microphones (15) have their own words; the hold's items (13) reads as its English meaning, as the puck does.
     if r == ferros_kist::BLUETOOTH as usize {
         return tr(Msg::RightBluetooth);
+    }
+    if r == ferros_kist::MIC as usize {
+        return tr(Msg::RightMic);
     }
     NAMES.get(r).map_or(ferros_kist::MEANS[r], |m| tr(*m))
 }
@@ -1684,6 +1687,8 @@ struct Map {
     dev: bool,
     /// Whether the display shows its hit map in every fourth frame (display op 58): the Developer page's switch alone switches it (since 2026-11-18; the two-finger slide on the helm is the screenshot), and the display's answer is kept here.
     hit_view: bool,
+    /// The permissions page's "since you last looked", as the kernel's log stood when the page opened (SYS_CLAIM op 6), kept for the visit: opening the page tells the kernel the person looked (op 7), which clears its log, so the page shows what it found. None while the page is not open.
+    perm_snap: Option<alloc::vec::Vec<[u8; ferros_sys::claim::LOG_REC]>>,
     /// Whether the display's frame counter is on (display op 72; owner, 2026-11-13: "can we get a fps counter?"): the Developer page's checkbox switches it, and the display's answer is kept here.
     /// Off at every start, never stored, as the hit map's view.
     frames_on: bool,
@@ -3377,6 +3382,10 @@ impl Map {
     /// Landed on an open circle, the frame is its region (COMPOSITOR.md "The open circle is an app's region"): the ground and the scene made once by the display, the page in front of them, only what changed drawn and published. Flying, or on the plane, every frame is drawn whole.
     fn draw(&mut self) {
         let mut b = Batch::new();
+        // Off the permissions page, its "since you last looked" is let go: the next visit looks again.
+        if !(matches!(self.view, View::Open(0)) && PAGES[self.page] == "permissions") {
+            self.perm_snap = None;
+        }
         // Flying to or from the open circle on the display's prerendered images: the camera now and the fade, nothing drawn (op 46).
         if self.fast && self.target.is_some() && matches!(self.view, View::Open(_)) {
             self.rows.clear();
@@ -5463,15 +5472,48 @@ impl Map {
                 }
             }
             "permissions" => {
-                // Each right the other way round (owner, 2026-11-08: "who has GPS", "who has the network"), with the person's default for every new kist first: what its switch starts at in a first-launch question (out of the box, off).
+                // First what is using a right now and what was used since the person last looked (owner, 2026-11-26: "easily see what is holding the permission open"), from the kernel's table: its own marks (a camera, the microphones, a Bluetooth scan) and the claims (docs/KERNEL.md "Rights in use"); each row a kist's card when the list names it.
+                let settings = cap(self.grants, S_SETTINGS);
+                // The visit's first settled look takes the kernel's log and tells it the person looked (op 7), which also clears the indicators' dimmed slots; the page keeps what it took for the visit (`perm_snap`).
+                if live && hit && self.perm_snap.is_none() {
+                    let mut buf = [0u8; ferros_sys::claim::LOG_REC << 5];
+                    let n = ferros_sys::claim::log(settings, &mut buf).unwrap_or(0);
+                    // WHY the min: the count is every record the kernel keeps; the buffer holds 2^5, the newest first.
+                    self.perm_snap = Some(buf.chunks_exact(ferros_sys::claim::LOG_REC).take(n.min(1 << 5)).map(|r| r.try_into().unwrap()).collect());
+                    ferros_sys::claim::seen(settings);
+                }
+                // A record's holder: a kist's capsule, None for a system process.
+                let holder = |r: &[u8]| (r[1] == 1).then(|| <[u8; 32]>::try_from(&r[2..34]).unwrap());
+                let mut buf = [0u8; ferros_sys::claim::LIVE_REC << 5];
+                let n = ferros_sys::claim::live(settings, &mut buf).unwrap_or(0);
+                // WHY the min: as the log's.
+                let now: alloc::vec::Vec<[u8; ferros_sys::claim::LIVE_REC]> = buf.chunks_exact(ferros_sys::claim::LIVE_REC).take(n.min(1 << 5)).map(|r| r.try_into().unwrap()).collect();
+                let snap = self.perm_snap.clone().unwrap_or_default();
+                for (heading, recs) in [(Msg::InUseNow, now.iter().map(|r| &r[..]).collect::<alloc::vec::Vec<_>>()), (Msg::SinceYouLooked, snap.iter().map(|r| &r[..]).collect())] {
+                    if recs.is_empty() {
+                        continue;
+                    }
+                    row(self, b, &mut y, uu(3, 2), white(), tr(heading), None);
+                    for r in recs {
+                        let who = holder(r);
+                        let mut l = Line::new();
+                        self.user_name(&who, &mut l);
+                        let _ = write!(l, " \u{B7} {}", right_name(r[0] as usize));
+                        let card = who.and_then(|c| self.kists.kists.iter().position(|k| k.capsule == c)).map(|ki| Choice::Card(ki as u8));
+                        row(self, b, &mut y, uu(5, 4), grey(), l.as_str(), card);
+                    }
+                    y += uu(1, 1);
+                }
+                // Then each right the other way round (owner, 2026-11-08: "who has GPS", "who has the network"), with the person's default for every new kist first: what its switch starts at in a first-launch question (out of the box, off).
                 let ks = self.kists.kists.clone();
-                // And who is using each right now (owner, 2026-11-10: "we need to be able to see what kists are using each permission"): a kist holding a claim on it says so by its name (`users`). Only GPS is claimed today; a right nothing marks the use of lists no one as using it.
+                // And who is using each right now (owner, 2026-11-10: "we need to be able to see what kists are using each permission"): a kist holding a claim on it says so by its name (`users`). GPS is claimed, and since 2026-11-26 the kernel marks the cameras, the microphones and Bluetooth's scans itself; a right nothing marks the use of lists no one as using it.
                 // Only the asked rights: the implicit set (ferros_kist::IMPLICIT) is every kist's, with no default and no answer to turn (owner, 2026-11-12, "Yes on the implicit set").
                 for r in (0..ferros_kist::RIGHTS.len()).filter(|&r| ferros_kist::asked_right(r as u8)) {
                     row(self, b, &mut y, uu(3, 2), white(), right_name(r), None);
                     let on = self.kists.defaults >> r & 1 == 1;
                     mark(self, b, &mut y, 50, tr(Msg::NewKistsStartOn), on, Some(Choice::Default(r as u8)));
-                    let using = if r as u64 == ferros_sys::claim::GPS { self.users(r as u64) } else { Vec::new() };
+                    // Every right the kernel marks or a process claims: "using it now" beside the kist (since 2026-11-26 the cameras, the microphones and Bluetooth's scans as well as GPS).
+                    let using = self.users(r as u64);
                     for (ki, k) in ks.iter().enumerate() {
                         if let Some(j) = k.wants.iter().position(|w| w.right as usize == r) {
                             let l = self.want_label(k, j, &using);
@@ -7037,6 +7079,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         taps: 0,
         dev: false,
         hit_view: false,
+        perm_snap: None,
         frames_on: false,
         channels: 7,
         fleet: Fleet::new(),
@@ -8118,7 +8161,13 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                 quick::BEHIND => tap_thru = false,
                 c if c & quick::ITEM != 0 => {
                     // A level circle tapped (brightness, the torch) opens its page, the row shutting as it does.
+                    // The permissions circle's page opens over a kist too, the kist sent behind first as a console circle's page is (`dash_open`): what is using the microphones is worth seeing from anywhere.
                     if let Some(page) = qr.let_go(moved, frame_count) {
+                        let anywhere = page == "permissions";
+                        if anywhere && map.app_front && !map.send_behind(false) {
+                            map.app_front = false;
+                            map.front_kist = None;
+                        }
                         if !map.app_front {
                             qr.settle_to(0, frame_count);
                             map.show_page(page);

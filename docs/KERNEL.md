@@ -519,6 +519,7 @@ The indicators are drawn from what the kernel sees, never from what a kist says 
 - **The log**: a use that ends is kept under its (right, kist), the first start and the last end, so it is as long as the distinct uses since the person last looked and no longer; SYS_CLAIM op 7 (Settings, the permissions page shown) clears it, never a timer.
 - **Fact 90** (`USES`, ferros_sys::uses): bits 0-7 an indicator lit now (camera, microphones, fine location, nearby, motion, screen; ferros_kist::indicator maps a right to its bit), bits 8-15 one used since the person last looked and not lit now, a change count above.
 - **For Settings**: SYS_CLAIM op 5 every right in use (who, since when), op 6 the log, newest first, op 7 seen; the claims' doorbell (op 4) rings at every change.
+- **The display's doorbell**: when fact 90's lit or missed bits change the kernel rings the facts' bell (SYS_BELL `BELL_FACTS`, anyone's), so the indicators light on the frame after, not at the display's next idle look.
 - **The microphones' right** (ferros_kist `mic`, asked): a send right on the audio service's `mic` endpoint, served beside `audio` (`served_by`: a call on `mic` starts the audio service on demand), the proof that opens the microphone mailbox and the only door to the capture ops (docs/AUDIO.md "The mic right").
 
 **Not marked yet**: motion and screen (no right exists for either; their bits stay dark); WiFi scans (no kist may ask for one).
