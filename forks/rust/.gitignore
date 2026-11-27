@@ -1,0 +1,2 @@
+# stdarch-gen-arm, upstream's generator for the Arm intrinsics, is left out of this fork's commits: std never builds it, and its upstream author metadata trips the handle guard, which is never bypassed and whose upstream text is never edited (2026-11-23).
+library/stdarch/crates/stdarch-gen-arm/
