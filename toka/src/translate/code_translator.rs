@@ -2664,6 +2664,8 @@ fn prepare_addr(
     // Each memory is its own alias region, apart from the globals, the tables and the stack.
     let region = environ.memory_alias_region(builder.func, memory_index);
     flags.set_alias_region(Some(region));
+    // A shared memory: the address is an offset into the region of its handle slot, which the flags carry to the back end (the handle forms, docs/TOKA.md "Memories").
+    flags.set_ferros_handle(environ.memory_handle_slot(memory_index));
     Ok(Reachability::Reachable((flags, index, addr)))
 }
 

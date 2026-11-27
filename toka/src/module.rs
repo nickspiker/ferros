@@ -11,8 +11,18 @@ pub struct Import {
     pub name: String,
 }
 
+/// A memory imported from "ferros": a region another process shares, reached thru a handle slot of the process's table (docs/TOKA.md "Memories"): `share` read-write, `view` read-only.
+#[derive(Clone, Copy, Debug)]
+pub struct Handle {
+    /// The slot its accesses name: the i-th imported handle memory takes slot 31 - i, which the program binds a view to with SYS_SHARE's BIND.
+    pub slot: u8,
+    pub read_only: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Memory {
+    /// Some for a memory imported from "ferros" (a shared region); None for the module's own, which lives in its arc after the image.
+    pub handle: Option<Handle>,
     pub memory64: bool,
     pub shared: bool,
     /// Initial and maximum size in pages of 2^page_log2 bytes.
@@ -173,7 +183,21 @@ pub fn parse(bytes: &[u8]) -> WasmResult<Module<'_>> {
                                 name: import.name.to_string(),
                             });
                         }
-                        other => return Err(wasm_unsupported!("an import of {other:?} ({}.{}): toka takes only function imports", import.module, import.name)),
+                        wasmparser::TypeRef::Memory(mem) if import.module == "ferros" && (import.name == "share" || import.name == "view") => {
+                            let n = m.memories.iter().filter(|x| x.handle.is_some()).count();
+                            if n >= 32 {
+                                return Err(wasm_unsupported!("more handle memories than a handle table holds (32)"));
+                            }
+                            m.memories.push(Memory {
+                                handle: Some(Handle { slot: 31 - n as u8, read_only: import.name == "view" }),
+                                memory64: mem.memory64,
+                                shared: mem.shared,
+                                initial: mem.initial,
+                                maximum: mem.maximum,
+                                page_log2: mem.page_size_log2.unwrap_or(16),
+                            });
+                        }
+                        other => return Err(wasm_unsupported!("an import of {other:?} ({}.{}): toka takes function imports and \"ferros\" \"share\" / \"view\" memories", import.module, import.name)),
                     }
                 }
             }
@@ -202,6 +226,7 @@ pub fn parse(bytes: &[u8]) -> WasmResult<Module<'_>> {
                 for mem in r {
                     let mem = mem?;
                     m.memories.push(Memory {
+                        handle: None,
                         memory64: mem.memory64,
                         shared: mem.shared,
                         initial: mem.initial,
@@ -260,7 +285,12 @@ pub fn parse(bytes: &[u8]) -> WasmResult<Module<'_>> {
                     let d = d?;
                     let active = match d.kind {
                         wasmparser::DataKind::Passive => None,
-                        wasmparser::DataKind::Active { memory_index, offset_expr } => Some((MemoryIndex::from_u32(memory_index), const_offset(&offset_expr)?)),
+                        wasmparser::DataKind::Active { memory_index, offset_expr } => {
+                            if m.memories[memory_index as usize].handle.is_some() {
+                                return Err(wasm_unsupported!("an active data segment into a shared memory (its holder's bytes are its server's)"));
+                            }
+                            Some((MemoryIndex::from_u32(memory_index), const_offset(&offset_expr)?))
+                        }
                     };
                     m.data.push(Data { active, bytes: d.data.to_vec() });
                 }

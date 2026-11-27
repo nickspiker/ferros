@@ -63,6 +63,8 @@ pub fn isa(opts: &Options) -> Result<OwnedTargetIsa, String> {
         Mask::Fixed(k) => ("fixed", k),
     };
     set(&mut flags, "ferros_mask", mask)?;
+    // `get_pinned_reg` reads x28, the arc base, under ferros (a shared memory's size from the grants page).
+    set(&mut flags, "enable_pinned_reg", "true")?;
     set(&mut flags, "ferros_fixed_log2", &k.to_string())?;
     let triple: target_lexicon::Triple = "aarch64-unknown-unknown-elf".parse().map_err(|e| format!("{e:?}"))?;
     let mut b = isa::lookup(triple).map_err(|e| e.to_string())?;

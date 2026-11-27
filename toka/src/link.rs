@@ -85,20 +85,22 @@ pub fn link(module: &Module<'_>, plan: &Plan, compiled: Vec<Compiled>, opts: &Op
         let at = put(&mut bytes, DATA_TABLE | t as u32, 16, &vec![0u8; table.slots.len() * TABLE_ENTRY as usize]);
         table_at.push(at);
     }
-    for (m, mem) in module.memories.iter().enumerate() {
+    // A shared memory (a handle) has no cell and no place in the image: its size is its pair's, its bytes its server's.
+    for (m, mem) in module.memories.iter().enumerate().filter(|(_, x)| x.handle.is_none()) {
         put(&mut bytes, DATA_MEMORY_PAGES | m as u32, 8, &mem.initial.to_le_bytes());
     }
     for (k, d) in module.data.iter().enumerate() {
         put(&mut bytes, DATA_SEGMENT | k as u32, 16, &d.bytes);
     }
-    let mut memory_at = vec![];
-    for (m, _) in module.memories.iter().enumerate() {
+    let mut memory_at = vec![0usize; module.memories.len()];
+    let own: Vec<usize> = (0..module.memories.len()).filter(|&m| module.memories[m].handle.is_none()).collect();
+    for (k, &m) in own.iter().enumerate() {
         bytes.resize(align(bytes.len(), MEMORY_ALIGN), 0);
         let at = bytes.len();
         symbols.push((UserExternalName::new(NS_DATA, DATA_MEMORY | m as u32), at));
-        memory_at.push(at);
+        memory_at[m] = at;
         // The next memory starts past this one's whole reserve; the image itself ends at the last byte a segment writes.
-        if m + 1 < module.memories.len() {
+        if k + 1 < own.len() {
             bytes.resize(at + (1usize << opts.memory_reserve_log2), 0);
         }
     }

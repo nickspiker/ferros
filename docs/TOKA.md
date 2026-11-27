@@ -35,12 +35,23 @@ Refused, with the reason: garbage collection, reference types and every table op
 WebAssembly's out-of-bounds trap is not kept: an access is masked, so it wraps inside its arc's window, and the window's unbacked rest faults.
 Division by zero, an overflowing signed division, an unrepresentable float conversion, `unreachable`, a `call_indirect` out of its table or of the wrong type: those trap (`brk`), and the process ends.
 
+## Memories: private by default, shared by capability (decided 2026-11-26)
+
+The owner: "we need to think about shared memory since we will likely want to have it and other fun memory tricks. none of this isolated page table shit. sharing is caring but privacy is key"; on read-only sharing thru a second window ("view, yes"), "sounds super gooder", and "Was honestly stressing on how to share the font stack among all the kists."
+
+- **Memory 0 and the module's other own memories** are private: they live in the process's arc after its image, nothing else ever maps them, and their accesses are masked into the arc.
+- **A shared memory is an import from "ferros":** `(import "ferros" "share" (memory ...))` read-write, `(import "ferros" "view" (memory ...))` read-only. The i-th such import takes handle slot 31 - i; the program binds a view it was given to that slot at runtime (SYS_SHARE's BIND, KERNEL.md "Views"), and toka compiles its accesses to the handle forms (SANDBOX.md "Handles"): the pair selected before every access (`ldp x23, x22, [x28, #16 * slot]`), the offset masked by the region's mask (`and x21, xN, x22`), the access at `[x23, x21]`. A store into a `view` memory is refused when compiling; the view's pair points into the pool's read-only mirror, so a store that got past toka would fault.
+- **Its size** is its region's (the pair's mask plus one, read from the grants page); it cannot grow (its server's pool grows), and an active data segment into it is refused.
+- **Not yet, each a step of its own:** atomics on a shared memory (an atomic takes a bare base register, and a handle offers none: it needs one more address register usable only with no offset, an owner's call since it costs a register; `[x25, #imm]` cannot serve, its immediates reach past a run that has no guard); the bulk operations on a shared memory (toka's runtime works on addresses); a view of a view; shared code (one copy of std or fluor in an executable mirror for every kist, running under each one's own arc).
+- **Revocation** is the kernel clearing the pair: every access selects it again, so the holder's next access after a TAKE finds nothing (the kernel does not yet clear a pair a thread holds in its registers; in toka's code that is the one instruction between a select and its access).
+
 ## The image
 
 No runtime context pointer: every function is Cranelift's tail calling convention with only its WebAssembly parameters, and what it reaches lies in its own image at a place the linker fixes, reached PC-relatively.
 From the image's start (arc offset G#1000, a 4 KiB boundary, so ADRP's pages are the arc's):
 
 - the code, each function on 16 bytes, padding `brk #0`;
+- (a shared memory has no place here: its bytes are its server's, reached thru its handle);
 - the globals, 16 bytes each (an immutable global is folded into the code as its constant);
 - each table: per slot the callee's canonical type id and its offset from the table (a null slot's type matches none, so calling it traps);
 - each memory's size in pages;

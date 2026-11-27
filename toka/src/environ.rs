@@ -141,8 +141,8 @@ impl<'a> FuncEnvironment<'a> {
     pub fn after_translate_function(&mut self, _builder: &mut FunctionBuilder) -> WasmResult<()> {
         Ok(())
     }
-    pub fn before_translate_operator(&mut self, _op: &wasmparser::Operator, _types: Option<&[WasmValType]>, _builder: &mut FunctionBuilder) -> WasmResult<()> {
-        Ok(())
+    pub fn before_translate_operator(&mut self, op: &wasmparser::Operator, _types: Option<&[WasmValType]>, _builder: &mut FunctionBuilder) -> WasmResult<()> {
+        self.check_memory_use(op)
     }
     pub fn after_translate_operator(&mut self, _op: &wasmparser::Operator, _validator: &wasmparser::FuncValidator<impl wasmparser::WasmModuleResources>, _builder: &mut FunctionBuilder) -> WasmResult<()> {
         Ok(())
@@ -319,14 +319,64 @@ impl<'a> FuncEnvironment<'a> {
     pub fn memory_index_type(&self, memory: MemoryIndex) -> ir::Type {
         if self.module.memories[memory.as_u32() as usize].memory64 { I64 } else { I32 }
     }
+    /// The handle slot of a shared memory (imported from "ferros"), None for the module's own.
+    pub fn memory_handle_slot(&self, memory: MemoryIndex) -> Option<u8> {
+        self.module.memories[memory.as_u32() as usize].handle.map(|h| h.slot)
+    }
+
+    /// What toka refuses on a memory before translating an operator (`before_translate_operator`): a store, fill, copy or init into a view (read-only), and on any shared memory (a handle) what has no handle form yet: atomics (they take a bare base register, docs/TOKA.md "Memories"), the bulk operations (toka's runtime works on addresses) and growing (the region's size is its server's).
+    fn check_memory_use(&self, op: &wasmparser::Operator) -> WasmResult<()> {
+        use wasmparser::Operator as O;
+        let mem = |idx: u32| &self.module.memories[idx as usize];
+        let (store, atomic, idx) = match op {
+            O::I32Store { memarg } | O::I64Store { memarg } | O::F32Store { memarg } | O::F64Store { memarg } | O::I32Store8 { memarg } | O::I32Store16 { memarg } | O::I64Store8 { memarg } | O::I64Store16 { memarg } | O::I64Store32 { memarg } | O::V128Store { memarg } => (true, false, memory_of(memarg)),
+            O::V128Store8Lane { memarg, .. } | O::V128Store16Lane { memarg, .. } | O::V128Store32Lane { memarg, .. } | O::V128Store64Lane { memarg, .. } => (true, false, memory_of(memarg)),
+            O::I32AtomicLoad { memarg } | O::I64AtomicLoad { memarg } | O::I32AtomicLoad8U { memarg } | O::I32AtomicLoad16U { memarg } | O::I64AtomicLoad8U { memarg } | O::I64AtomicLoad16U { memarg } | O::I64AtomicLoad32U { memarg } | O::MemoryAtomicNotify { memarg } | O::MemoryAtomicWait32 { memarg } | O::MemoryAtomicWait64 { memarg } => (false, true, memory_of(memarg)),
+            O::I32AtomicStore { memarg } | O::I64AtomicStore { memarg } | O::I32AtomicStore8 { memarg } | O::I32AtomicStore16 { memarg } | O::I64AtomicStore8 { memarg } | O::I64AtomicStore16 { memarg } | O::I64AtomicStore32 { memarg } => (true, true, memory_of(memarg)),
+            O::I32AtomicRmwAdd { memarg } | O::I64AtomicRmwAdd { memarg } | O::I32AtomicRmw8AddU { memarg } | O::I32AtomicRmw16AddU { memarg } | O::I64AtomicRmw8AddU { memarg } | O::I64AtomicRmw16AddU { memarg } | O::I64AtomicRmw32AddU { memarg }
+            | O::I32AtomicRmwSub { memarg } | O::I64AtomicRmwSub { memarg } | O::I32AtomicRmw8SubU { memarg } | O::I32AtomicRmw16SubU { memarg } | O::I64AtomicRmw8SubU { memarg } | O::I64AtomicRmw16SubU { memarg } | O::I64AtomicRmw32SubU { memarg }
+            | O::I32AtomicRmwAnd { memarg } | O::I64AtomicRmwAnd { memarg } | O::I32AtomicRmw8AndU { memarg } | O::I32AtomicRmw16AndU { memarg } | O::I64AtomicRmw8AndU { memarg } | O::I64AtomicRmw16AndU { memarg } | O::I64AtomicRmw32AndU { memarg }
+            | O::I32AtomicRmwOr { memarg } | O::I64AtomicRmwOr { memarg } | O::I32AtomicRmw8OrU { memarg } | O::I32AtomicRmw16OrU { memarg } | O::I64AtomicRmw8OrU { memarg } | O::I64AtomicRmw16OrU { memarg } | O::I64AtomicRmw32OrU { memarg }
+            | O::I32AtomicRmwXor { memarg } | O::I64AtomicRmwXor { memarg } | O::I32AtomicRmw8XorU { memarg } | O::I32AtomicRmw16XorU { memarg } | O::I64AtomicRmw8XorU { memarg } | O::I64AtomicRmw16XorU { memarg } | O::I64AtomicRmw32XorU { memarg }
+            | O::I32AtomicRmwXchg { memarg } | O::I64AtomicRmwXchg { memarg } | O::I32AtomicRmw8XchgU { memarg } | O::I32AtomicRmw16XchgU { memarg } | O::I64AtomicRmw8XchgU { memarg } | O::I64AtomicRmw16XchgU { memarg } | O::I64AtomicRmw32XchgU { memarg }
+            | O::I32AtomicRmwCmpxchg { memarg } | O::I64AtomicRmwCmpxchg { memarg } | O::I32AtomicRmw8CmpxchgU { memarg } | O::I32AtomicRmw16CmpxchgU { memarg } | O::I64AtomicRmw8CmpxchgU { memarg } | O::I64AtomicRmw16CmpxchgU { memarg } | O::I64AtomicRmw32CmpxchgU { memarg } => (true, true, memory_of(memarg)),
+            O::MemoryFill { mem: m } | O::MemoryInit { mem: m, .. } | O::MemoryGrow { mem: m } => {
+                return match mem(*m).handle {
+                    Some(_) => Err(wasm_unsupported!("{op:?} on shared memory {m} (bulk operations and growth on a handle come later; a shared region's size is its server's)")),
+                    None => Ok(()),
+                };
+            }
+            O::MemoryCopy { dst_mem, src_mem } => {
+                return if mem(*dst_mem).handle.is_some() || mem(*src_mem).handle.is_some() {
+                    Err(wasm_unsupported!("memory.copy with shared memory {dst_mem} or {src_mem} (bulk operations on a handle come later)"))
+                } else {
+                    Ok(())
+                };
+            }
+            _ => return Ok(()),
+        };
+        let Some(idx) = idx else { return Ok(()) };
+        let Some(h) = mem(idx).handle else { return Ok(()) };
+        if store && h.read_only {
+            return Err(wasm_unsupported!("{op:?}: a store into memory {idx}, a view (read-only: imported as \"ferros\" \"view\")"));
+        }
+        if atomic {
+            return Err(wasm_unsupported!("{op:?} on shared memory {idx}: an atomic takes a bare base register, which a handle does not offer yet (docs/TOKA.md \"Memories\")"));
+        }
+        Ok(())
+    }
+
     /// The absolute address of the memory's first byte.
     pub fn memory_base(&mut self, builder: &mut FunctionBuilder, memory: MemoryIndex) -> ir::Value {
         self.data_address(builder, DATA_MEMORY | memory.as_u32())
     }
-    /// `base + index`, the index zero-extended from a 32-bit memory.
+    /// `base + index`, the index zero-extended from a 32-bit memory; for a shared memory the index alone, an offset into the region its handle selects (the access's flags name the slot, and the back end masks the offset by the region's mask).
     pub fn memory_address(&mut self, builder: &mut FunctionBuilder, memory: MemoryIndex, index: ir::Value) -> ir::Value {
-        let base = self.memory_base(builder, memory);
         let index = if self.memory_index_type(memory) == I32 { builder.ins().uextend(I64, index) } else { index };
+        if self.memory_handle_slot(memory).is_some() {
+            return index;
+        }
+        let base = self.memory_base(builder, memory);
         builder.ins().iadd(base, index)
     }
     fn pages_cell(&mut self, builder: &mut FunctionBuilder, memory: MemoryIndex) -> (ir::Value, MemFlagsData) {
@@ -335,6 +385,15 @@ impl<'a> FuncEnvironment<'a> {
         (cell, flags)
     }
     pub fn translate_memory_size(&mut self, mut pos: FuncCursor<'_>, memory: MemoryIndex) -> WasmResult<ir::Value> {
+        // A shared memory's size is its region's: its pair's mask (in the grants page at arc offset 16 * slot + 8) plus one, in pages.
+        if let Some(slot) = self.memory_handle_slot(memory) {
+            let m = &self.module.memories[memory.as_u32() as usize];
+            let arc = pos.ins().get_pinned_reg(I64);
+            let mask = pos.ins().load(I64, MemFlagsData::trusted(), arc, Offset32::new(16 * i32::from(slot) + 8));
+            let bytes = pos.ins().iadd_imm_s(mask, 1);
+            let pages = pos.ins().ushr_imm_u(bytes, i64::from(m.page_log2));
+            return Ok(if self.memory_index_type(memory) == I32 { pos.ins().ireduce(I32, pages) } else { pages });
+        }
         let gv = self.data_symbol(pos.func, DATA_MEMORY_PAGES | memory.as_u32());
         let cell = pos.ins().symbol_value(I64, gv);
         let flags = Self::flags(pos.func, REGION_GLOBALS, "globals".into());
@@ -497,6 +556,14 @@ impl<'a> FuncEnvironment<'a> {
         let addr = self.table_callee(builder, table, ty, callee);
         builder.ins().return_call_indirect(sig, addr, args);
         Ok(())
+    }
+}
+
+/// The memory an access names (None: an array target, refused by the translator).
+fn memory_of(memarg: &wasmparser::MemArg) -> Option<u32> {
+    match memarg.target {
+        wasmparser::MemArgTarget::Memory(m) => Some(m),
+        _ => None,
     }
 }
 
