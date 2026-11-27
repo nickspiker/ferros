@@ -1855,6 +1855,7 @@ fn recv_big(f: &mut Frame, cur: usize, ep: usize) -> u64 {
     let Some((caller, mut msg)) = kk.endpoints[ep].queue.pop_front() else { return 0 };
     let Some(p) = proc_of(cur) else { return 0 };
     let (buf, tok_off, epoch, len) = (f.x[1], f.x[3], p.epoch, msg.len());
+    use_served(caller, &msg, ep, epoch);
     p.copying += 1;
     let mut at = 0;
     let mut whole = true;
@@ -6312,6 +6313,7 @@ fn deliver(server: usize, ep: usize, handoff: bool) {
     } else {
         let (caller, mut msg) = kk.endpoints[ep].queue.pop_front().unwrap();
         sp.write(buf, &msg);
+        use_served(caller, &msg, ep, sp.epoch);
         // Wiped once delivered: a forwarded store call carries domain keys (`store_forward`), which must not outlive it in the kernel's heap.
         msg.fill(0);
         let token = mint(Object::Reply(caller), RIGHT_SEND, sp.epoch);
@@ -7781,7 +7783,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         ERR
                     } else {
                         if !claims.iter().any(|c| c.epoch == p.epoch && c.right == f.x[1] as u8) {
-                            claims.push(Claim { epoch: p.epoch, right: f.x[1] as u8, capsule: p.capsule, by_kernel: false, since: crate::settings::eagle_now() });
+                            claims.push(Claim { epoch: p.epoch, right: f.x[1] as u8, capsule: p.capsule, by_kernel: false, since: crate::settings::eagle_now(), server: 0 });
                             claims_publish();
                         }
                         0
@@ -8884,6 +8886,8 @@ struct Claim {
     by_kernel: bool,
     /// The Eagle time it began (oscillations; `settings::eagle_now`).
     since: i64,
+    /// For a kernel mark read off a driver's call (a camera OPEN, a Bluetooth scan): the driver process that received the call (its epoch), 0 until one does. A driver's end takes only the marks it received (`claims_orphaned`): an OPEN still queued for the next instance of an on-demand driver, while the last one answered a list and ended, stays lit (2026-11-26, the Pro: Lumis lists before it opens, and the list's driver ending cleared the open's mark).
+    server: u64,
 }
 
 /// One holder's uses of one right since the person last looked (SYS_CLAIM op 6, the permissions page's "since you last looked"): the first began, the last ended. One record a (right, kist), however often it opened and closed, so the log is as long as the distinct uses and no longer; cleared when the person looks (op 7).
@@ -9509,8 +9513,22 @@ fn use_logged(right: u8, capsule: Option<[u8; 32]>, since: i64) -> bool {
 fn use_begin(p: &Process, right: u8) {
     let claims = unsafe { &mut *(&raw mut CLAIMS) };
     if !claims.iter().any(|c| c.epoch == p.epoch && c.right == right) {
-        claims.push(Claim { epoch: p.epoch, right, capsule: p.capsule, by_kernel: true, since: crate::settings::eagle_now() });
+        claims.push(Claim { epoch: p.epoch, right, capsule: p.capsule, by_kernel: true, since: crate::settings::eagle_now(), server: 0 });
         claims_publish();
+    }
+}
+
+/// The call that set a kernel mark delivered to its driver (`deliver`): the mark is that driver instance's from now, ended with it if it ends before the caller's CLOSE (a refused OPEN, a driver that died), and no other's.
+fn use_served(caller: usize, msg: &[u8], ep: usize, server_epoch: u64) {
+    let right = match (k().endpoints[ep].name.as_slice(), msg.first()) {
+        (b"camera", Some(&1)) => ferros_kist::CAMERA,
+        (b"bt", Some(&8)) => ferros_kist::BLUETOOTH,
+        _ => return,
+    };
+    let Some(epoch) = proc_of(caller).map(|q| q.epoch) else { return };
+    let claims = unsafe { &mut *(&raw mut CLAIMS) };
+    if let Some(c) = claims.iter_mut().find(|c| c.epoch == epoch && c.right == right && c.by_kernel && c.server == 0) {
+        c.server = server_epoch;
     }
 }
 
@@ -9524,14 +9542,14 @@ fn use_end(epoch: u64, right: u8) {
     }
 }
 
-/// A process ended (exit, fault, kill): its claims go with it, each use logged. A driver that ends takes every mark on its hardware with it (`ENDS_WITH`): a camera OPEN the driver refused, or a scan of a Bluetooth driver that died, lights nothing.
+/// A process ended (exit, fault, kill): its claims go with it, each use logged. A driver that ends takes the marks on its hardware it received with it (`ENDS_WITH`, `Claim::server`): a camera OPEN the driver refused, or a scan of a Bluetooth driver that died, lights nothing; an OPEN still on its way to the driver's next instance stays.
 fn claims_orphaned(epoch: u64) {
     let c = unsafe { &mut *(&raw mut CLAIMS) };
     let driver = k().procs.iter().flatten().find(|q| q.epoch == epoch).and_then(|q| ENDS_WITH.iter().find(|(n, _)| q.name == *n)).map(|(_, r)| *r);
     let before = c.len();
     let mut ended = Vec::new();
     c.retain(|x| {
-        let gone = x.epoch == epoch || (x.by_kernel && Some(x.right) == driver);
+        let gone = x.epoch == epoch || (x.by_kernel && Some(x.right) == driver && x.server == epoch);
         if gone {
             ended.push((x.right, x.capsule, x.since));
         }
