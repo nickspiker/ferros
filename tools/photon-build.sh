@@ -4,7 +4,7 @@
 set -e
 here=$(cd "$(dirname "$0")/.." && pwd)
 pkg=${PHOTON_FERROS_PKG:-$here/std/photon}
-export __CARGO_TESTS_ONLY_SRC_ROOT=/mnt/Harbor/Code/ferros-rust/library
+export __CARGO_TESTS_ONLY_SRC_ROOT=/mnt/Harbor/Code/ferros/forks/rust/library
 export CC_aarch64_unknown_ferros=aarch64-linux-gnu-gcc
 export AR_aarch64_unknown_ferros=aarch64-linux-gnu-ar
 # No branch protection in the C: Fedora's cross gcc defaults to pac-ret, and its PACIASP/AUTIASP would sign with the pointer-authentication keys, which hold shares of the ira and wairua (the kernel keeps them switched off for EL0 as well, cachemap.rs).

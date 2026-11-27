@@ -25,4 +25,4 @@ panic = "abort"
 [workspace]
 
 [patch.crates-io]
-libc = { path = "/mnt/Harbor/Code/ferros-libc" }
+libc = { path = "../../forks/libc" }

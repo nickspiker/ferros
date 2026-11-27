@@ -4,7 +4,7 @@
 set -e
 dir=$1; shift
 cd "$dir"
-export __CARGO_TESTS_ONLY_SRC_ROOT=${FERROS_STD_SRC:-/mnt/Harbor/Code/ferros-rust/library}
+export __CARGO_TESTS_ONLY_SRC_ROOT=${FERROS_STD_SRC:-/mnt/Harbor/Code/ferros/forks/rust/library}
 # C in the dependency graph (blake3's NEON kernels, the PQClean suites) cross-compiles with the GNU aarch64 toolchain, freestanding: the cc crate knows no "ferros" OS.
 export CC_aarch64_unknown_ferros=aarch64-linux-gnu-gcc
 export AR_aarch64_unknown_ferros=aarch64-linux-gnu-ar

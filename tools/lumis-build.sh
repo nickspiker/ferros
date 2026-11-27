@@ -6,9 +6,9 @@ set -e
 here=$(cd "$(dirname "$0")/.." && pwd)
 code=$(cd "$here/.." && pwd)
 # In a worktree of ferros (.claude/worktrees/<name>) the siblings are four levels up.
-[ -d "$code/ferros-rust" ] || code=$(cd "$here/../../../.." && pwd)
+[ -d "$code/ferros/forks/rust" ] || code=$(cd "$here/../../../.." && pwd)
 pkg="$here/std/lumis"
-export __CARGO_TESTS_ONLY_SRC_ROOT="$code/ferros-rust/library"
+export __CARGO_TESTS_ONLY_SRC_ROOT="$code/ferros/forks/rust/library"
 export CC_aarch64_unknown_ferros=aarch64-linux-gnu-gcc
 export AR_aarch64_unknown_ferros=aarch64-linux-gnu-ar
 # No branch protection in the C: Fedora's cross gcc defaults to pac-ret, and its PACIASP/AUTIASP would sign with the pointer-authentication keys, which hold shares of the ira and wairua (the kernel keeps them switched off for EL0 as well, cachemap.rs).
@@ -22,7 +22,7 @@ profile_flag=$( [ "$profile" = release ] && echo --release )
 cd "$pkg"
 cargo +nightly build -Zjson-target-spec -Zbuild-std=core,alloc,std,panic_abort -Zbuild-std-features=compiler-builtins-mem \
     --target "$here/targets/aarch64-unknown-ferros.json" \
-    --config "patch.crates-io.libc.path='$code/ferros-libc'" \
+    --config "patch.crates-io.libc.path='$code/ferros/forks/libc'" \
     $profile_flag "$@"
 out="$CARGO_TARGET_DIR/aarch64-unknown-ferros/$profile/lumis"
 aarch64-linux-gnu-objcopy -O binary "$out" "$out.bin" && echo "$out.bin: $(stat -c %s "$out.bin") bytes"

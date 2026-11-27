@@ -18,7 +18,7 @@ for a in "$@"; do
 done
 [ "$build" = 0 ] || tools/lumis-build.sh
 code=$(cd "$here/.." && pwd)
-[ -d "$code/ferros-rust" ] || code=$(cd "$here/../../../.." && pwd)
+[ -d "$code/ferros/forks/rust" ] || code=$(cd "$here/../../../.." && pwd)
 lumis=${LUMIS:-$code/lumis}
 bin=${CARGO_TARGET_DIR:-$here/std/lumis/target/ferros}/aarch64-unknown-ferros/${LUMIS_PROFILE:-release}/lumis.bin
 version=${LUMIS_VERSION:-$(sed -n -E 's/^version = "([0-9.]+)"$/\1/p' "$lumis/rust/Cargo.toml" | head -n 1)}

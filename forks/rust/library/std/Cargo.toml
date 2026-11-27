@@ -74,7 +74,7 @@ fortanix-sgx-abi = { version = "0.6.1", features = [
 moto-rt = { version = "0.16", features = ['rustc-dep-of-std'], public = true }
 
 [target.'cfg(target_os = "ferros")'.dependencies]
-ferros-rt = { path = "/mnt/Harbor/Code/ferros/ferros_rt", features = ['rustc-dep-of-std'], public = true }
+ferros-rt = { path = "../../../../crates/rt", features = ['rustc-dep-of-std'], public = true }
 
 [target.'cfg(target_os = "hermit")'.dependencies]
 hermit-abi = { version = "0.5.0", features = [

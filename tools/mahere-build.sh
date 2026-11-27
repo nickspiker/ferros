@@ -7,7 +7,7 @@ code=$(cd "$here/.." && pwd)
 mahere=${MAHERE:-$code/mahere}
 fluor=${FLUOR:-$code/fluor}
 kete=${KETE:-$code/kete}
-export __CARGO_TESTS_ONLY_SRC_ROOT="$code/ferros-rust/library"
+export __CARGO_TESTS_ONLY_SRC_ROOT="$code/ferros/forks/rust/library"
 export CC_aarch64_unknown_ferros=aarch64-linux-gnu-gcc
 export AR_aarch64_unknown_ferros=aarch64-linux-gnu-ar
 # No branch protection in the C: Fedora's cross gcc defaults to pac-ret, and its PACIASP/AUTIASP would sign with the pointer-authentication keys, which hold shares of the ira and wairua (the kernel keeps them switched off for EL0 as well, cachemap.rs).
@@ -25,7 +25,7 @@ cargo +nightly build -Zjson-target-spec -Zbuild-std=core,alloc,std,panic_abort -
     --config "patch.crates-io.fluor.path='$fluor'" \
     --config "patch.crates-io.kete.path='$kete'" \
     --config "patch.crates-io.valhall.path='$here/valhall'" \
-    --config "patch.crates-io.libc.path='$code/ferros-libc'" \
+    --config "patch.crates-io.libc.path='$code/ferros/forks/libc'" \
     --config "patch.crates-io.ferros_fluor.path='$here/ferros_fluor'" \
     --config "patch.crates-io.ferros_theme.path='$here/ferros_theme'" \
     --config "patch.crates-io.ferros_sys.path='$here/ferros_sys'" \

@@ -35,7 +35,7 @@ panic = "abort"
 
 [patch.crates-io]
 # rav1d spells its types through libc, whose ferros arm lives in this fork (as Photon's and camreplay's builds take it).
-libc = { path = "/mnt/Harbor/Code/ferros-libc" }
+libc = { path = "../../forks/libc" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }

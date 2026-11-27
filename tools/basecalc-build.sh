@@ -8,7 +8,7 @@ set -e
 here=$(cd "$(dirname "$0")/.." && pwd)
 code=$(cd "$here/.." && pwd)
 # In a worktree of ferros (.claude/worktrees/<name>) the siblings are four levels up.
-[ -d "$code/ferros-rust" ] || code=$(cd "$here/../../../.." && pwd)
+[ -d "$code/ferros/forks/rust" ] || code=$(cd "$here/../../../.." && pwd)
 pkg="$here/std/basecalc"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$pkg/target/ferros}"
 target=aarch64-unknown-ferros
@@ -54,7 +54,7 @@ if [ "$(cat "$libs/stamp" 2>/dev/null)" != "$stamp" ]; then
 fi
 export GMP_MPFR_SYS_CACHE="$cache"
 
-export __CARGO_TESTS_ONLY_SRC_ROOT="$code/ferros-rust/library"
+export __CARGO_TESTS_ONLY_SRC_ROOT="$code/ferros/forks/rust/library"
 export CC_aarch64_unknown_ferros=aarch64-linux-gnu-gcc
 export AR_aarch64_unknown_ferros=aarch64-linux-gnu-ar
 export CFLAGS_aarch64_unknown_ferros="-ffreestanding -fno-stack-protector -fno-builtin -mbranch-protection=none -ffixed-x24 -ffixed-x25 -ffixed-x26 -ffixed-x27 -ffixed-x28 -O2 -isystem $here/tools/std-sysroot/include"

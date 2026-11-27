@@ -27,7 +27,7 @@ sha2 = { version = "0.10", default-features = false, features = ["asm"] }
 
 [patch.crates-io]
 # libc with a ferros arm: the C scalar types, no functions, for the crates that spell their types through it (pqcrypto-internals, rav1d).
-libc = { path = "/mnt/Harbor/Code/ferros-libc" }
+libc = { path = "../../forks/libc" }
 # libopus for ferros (Photon's waves): the audiopus_sys fork's ferros path builds it with cc, fixed point, no float API (Photon session, photon 1e6b69ca).
 audiopus_sys = { git = "https://github.com/nickspiker/audiopus_sys", rev = "a0002f15c94d0b29d2b03e48f5ac252eaa980c1c" }
 # OpenH264 for ferros (Photon's beams): the openh264-sys2 0.9.8 fork beside this crate builds Cisco's codec for aarch64-unknown-ferros and links ferros_rt's C++ shims, so no C++ runtime library (docs/STD-TARGET.md "C++ through ferros_rt"; the Photon session asked for it, 2026-11-26).
