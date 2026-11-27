@@ -1,7 +1,7 @@
 //! The toka image: functions laid out, their references resolved, every instruction held to the sandbox checker (docs/TOKA.md "The image").
 //!
 //! Layout, from the image's start (which the kernel places at arc offset G#1000, a 4 KiB boundary, so ADRP's pages are the arc's):
-//! the code (each function on a 16-byte boundary, padding `brk #0`); the globals area; each table; each memory's size cell; each data segment's bytes; then each memory, on a 64 KiB boundary, its active segments in place.
+//! the header (ferros_rt's: a branch to the entry, flags, "ferrosRT", the zeroed tail's size; 56 bytes, padded to 64); the code (the entry first, each function on a 16-byte boundary, padding `brk #0`); the globals area; each table; each memory's size cell; each data segment's bytes; then each memory, on a 64 KiB boundary, its active segments in place.
 //! Everything is reached PC-relatively, so the image runs wherever its arc is.
 
 use crate::environ::*;
@@ -32,6 +32,8 @@ pub struct Image {
     pub functions: Vec<Function>,
     /// Instructions the checker accepted.
     pub checked: usize,
+    /// The zeroed bytes past the image the kernel maps at spawn (the header's tail word): memory 0's reserve beyond what the image carries.
+    pub tail: u64,
 }
 
 /// `brk #0`: padding the checker accepts and that ends the process if ever reached.
@@ -50,8 +52,11 @@ fn sandbox_mode(m: Mask) -> ferros_sandbox::Mode {
 }
 
 pub fn link(module: &Module<'_>, plan: &Plan, compiled: Vec<Compiled>, opts: &Options) -> Result<Image, String> {
-    // The code.
-    let mut bytes: Vec<u8> = vec![];
+    // The header (ferros_sys `entry!`'s layout): word 0 the branch to the entry (patched below), the flags word (0: no growing heap), "ferrosRT" at 8, the tail at 16, zeros to 56, then `brk #0` to 64. The checker steps over words 1 to 13.
+    let mut bytes: Vec<u8> = vec![0; 56];
+    bytes[8..16].copy_from_slice(b"ferrosRT");
+    bytes.extend_from_slice(&BRK_0.to_le_bytes());
+    bytes.extend_from_slice(&BRK_0.to_le_bytes());
     let mut functions = vec![];
     for c in &compiled {
         while bytes.len() % 16 != 0 {
@@ -173,6 +178,23 @@ pub fn link(module: &Module<'_>, plan: &Plan, compiled: Vec<Compiled>, opts: &Op
         }
     }
 
+    // The header's branch to the entry, the first function.
+    let word0 = if opts.library { BRK_0 } else { 0x1400_0000u32 | (functions[0].offset as u32 >> 2) };
+    bytes[0..4].copy_from_slice(&word0.to_le_bytes());
+    // The tail: memory 0's reserve past the image's end, zeroed by the kernel at spawn.
+    let tail = match own.first() {
+        Some(&m) => {
+            let end = memory_at[m] + (1usize << opts.memory_reserve_log2);
+            // A data segment past memory 0's reserve made the image longer than the memory may ever be: refused, never a tail that wraps.
+            if bytes.len() > end {
+                return Err(format!("a data segment ends past memory 0's reserve (2^{} bytes): raise --reserve", opts.memory_reserve_log2));
+            }
+            (end - bytes.len()) as u64
+        }
+        None => 0,
+    };
+    bytes[16..24].copy_from_slice(&tail.to_le_bytes());
+
     // The checker, function by function, so a refusal names its function.
     let mode = sandbox_mode(opts.mask);
     let mut checked = 0;
@@ -187,5 +209,7 @@ pub fn link(module: &Module<'_>, plan: &Plan, compiled: Vec<Compiled>, opts: &Op
     if !refused.is_empty() {
         return Err(format!("the checker refused {} function(s):\n{}", refused.len(), refused.join("\n")));
     }
-    Ok(Image { bytes, text_len, functions, checked })
+    // And the whole text as the kernel checks it at stow, the header included.
+    ferros_sandbox::check_image_with(&bytes[..text_len], mode, opts.bti).map_err(|v| format!("the checker refused the image at +G#{:X}: G#{:08X} {:?}", v.offset, v.insn, v.why))?;
+    Ok(Image { bytes, text_len, functions, checked, tail })
 }

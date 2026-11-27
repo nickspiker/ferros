@@ -36,6 +36,8 @@ pub struct Options {
     pub bti: bool,
     /// The address space each memory may grow into, as a power of two (its reserve; memory.grow past it answers -1).
     pub memory_reserve_log2: u32,
+    /// Compile and check only, no entry (a module that exports neither `_ferros_main` nor `_start`): the image's first word is `brk #0`, so it cannot run.
+    pub library: bool,
 }
 
 impl Default for Options {
@@ -44,6 +46,7 @@ impl Default for Options {
             mask: Mask::Ring,
             bti: false,
             memory_reserve_log2: 26,
+            library: false,
         }
     }
 }
@@ -125,6 +128,11 @@ pub fn compile(bytes: &[u8], opts: &Options) -> Result<link::Image, String> {
             .map_err(|e| format!("function {}: {e}", body.index.as_u32()))?;
         compiled.push(compile_function(&*isa, func, name).map_err(|e| format!("function {}: {e}", body.index.as_u32()))?);
     }
+    // The entry first: the header's branch lands on it.
+    if !opts.library {
+        let entry = runtime::entry(&module, isa.frontend_config())?;
+        compiled.insert(0, compile_function(&*isa, entry, ir::UserExternalName::new(environ::NS_RUNTIME, environ::RUNTIME_ENTRY))?);
+    }
     for f in runtime::functions(isa.frontend_config()) {
         let name = match &f.name {
             ir::UserFuncName::User(n) => n.clone(),
@@ -132,6 +140,11 @@ pub fn compile(bytes: &[u8], opts: &Options) -> Result<link::Image, String> {
         };
         compiled.push(compile_function(&*isa, f, name)?);
     }
+    compiled.push(Compiled {
+        name: ir::UserExternalName::new(environ::NS_RUNTIME, environ::RUNTIME_SYSCALL),
+        code: runtime::syscall_stub(opts.bti),
+        relocs: vec![],
+    });
     link::link(&module, &plan, compiled, opts)
 }
 

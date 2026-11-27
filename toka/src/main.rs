@@ -1,6 +1,6 @@
 //! toka: compile a WebAssembly module (.wasm, or .wat text) into a masked ferros image the sandbox checker has passed (docs/TOKA.md).
 //!
-//! Usage: toka <in.wasm|in.wat> [-o <out.bin>] [--fixed K] [--bti] [--reserve LOG2]
+//! Usage: toka <in.wasm|in.wat> [-o <out.bin>] [--fixed K] [--bti] [--reserve LOG2] [--lib]
 
 use std::process::exit;
 use toka::{Mask, Options};
@@ -23,6 +23,7 @@ fn main() {
                 opts.mask = Mask::Fixed(v);
             }
             "--bti" => opts.bti = true,
+            "--lib" => opts.library = true,
             "--reserve" => {
                 k += 1;
                 opts.memory_reserve_log2 = args.get(k).and_then(|v| v.parse().ok()).unwrap_or_else(|| usage("--reserve needs a power of two"));
@@ -51,11 +52,14 @@ fn main() {
                 });
             }
             eprintln!(
-                "{input}: {} functions, {} bytes of code, {} instructions, 0 refused; image {} bytes",
+                "{input}: {} functions, {} bytes of code, {} instructions, 0 refused; image {} bytes, tail {} bytes; capsule with --masked --text-len {}{}",
                 image.functions.len(),
                 image.text_len,
                 image.checked,
-                image.bytes.len()
+                image.bytes.len(),
+                image.tail,
+                image.text_len,
+                if opts.bti { " --bti" } else { "" }
             );
         }
         Err(e) => {
@@ -79,6 +83,6 @@ fn wat_to_wasm(path: &str) -> Vec<u8> {
 }
 
 fn usage(why: &str) -> ! {
-    eprintln!("toka: {why}\nusage: toka <in.wasm|in.wat> [-o <out.bin>] [--fixed K] [--bti] [--reserve LOG2]");
+    eprintln!("toka: {why}\nusage: toka <in.wasm|in.wat> [-o <out.bin>] [--fixed K] [--bti] [--reserve LOG2] [--lib]");
     exit(2)
 }

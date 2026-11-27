@@ -25,7 +25,7 @@ Today it runs on the developer's machine; it is built to run on the device (pure
   - The atomic retry loops and CASP take fixed registers from x8 to x15, and a trap is `brk #G#C11F` (the checker refuses `udf`).
   - Branches resolve after the masking is in, and Cranelift bridges a short branch the masking moved out of reach with a veneer (ferros-as's assembler relaxes nothing).
 - **toka** (toka/, its own workspace and lock, as tools/transcribe): the module reader and validator (wasmparser), wasmtime's operator translator (toka/src/translate, NOTICE beside it) over toka's own environment, toka's runtime functions, the linker, and the checker over every function.
-  `cargo build --manifest-path toka/Cargo.toml` (needs the fork beside the checkout, at ../wasmtime), then `toka/target/debug/toka <in.wasm|in.wat> -o <out.bin> [--fixed K] [--bti]`.
+  `cargo build --manifest-path toka/Cargo.toml` (needs the fork beside the checkout, at ../wasmtime), then `toka/target/debug/toka <in.wasm|in.wat> -o <out.bin> [--fixed K] [--bti] [--reserve LOG2] [--lib]`.
 
 ## What toka takes
 
@@ -50,6 +50,8 @@ The owner: "we need to think about shared memory since we will likely want to ha
 No runtime context pointer: every function is Cranelift's tail calling convention with only its WebAssembly parameters, and what it reaches lies in its own image at a place the linker fixes, reached PC-relatively.
 From the image's start (arc offset G#1000, a 4 KiB boundary, so ADRP's pages are the arc's):
 
+- the header, ferros_rt's (ferros_sys `entry!`): word 0 a branch to the entry, the flags word (0), "ferrosRT" at 8, the zeroed tail's size at 16 (memory 0's reserve past what the image carries), zeros to 56, `brk #0` to 64; the checker steps over words 1 to 13, the kernel reads them;
+- the entry (runtime.rs `entry`, AAPCS64): it takes the kernel's x0 to x2 (the grants offset, the input's offset and length), runs the module's start function, then `_ferros_main(grants, input, length: i64)` if exported, else `_start()`, then exits (syscall 0);
 - the code, each function on 16 bytes, padding `brk #0`;
 - (a shared memory has no place here: its bytes are its server's, reached thru its handle);
 - the globals, 16 bytes each (an immutable global is folded into the code as its constant);
@@ -58,16 +60,22 @@ From the image's start (arc offset G#1000, a 4 KiB boundary, so ADRP's pages are
 - each data segment's bytes (for `memory.init`);
 - each memory, on 64 KiB, its active segments in place; `memory.grow` is branchless, up to the memory's reserve (`--reserve`, default 2^26 bytes).
 
-toka's runtime (`memmove`, `memset`) is Cranelift IR built by toka and compiled with the rest, so the image holds no code toka did not emit.
+toka's runtime (`memmove`, `memset`) is Cranelift IR built by toka and compiled with the rest, so the image holds no code toka did not emit, but one native stub of nine instructions (ten under BTI): `syscall`, Cranelift having no `svc`.
+
+## Intrinsics
+
+Functions imported from "ferros" are toka's, not linked from anywhere:
+- `syscall(n, a0, a1, a2, a3, a4, a5: i64) -> i64`: the kernel's call `n` (process.rs, ferros_sys `nr`), thru the stub (`mov x8, x0`, the arguments down a register, `svc #0`, back).
+- `arc_offset(p) -> i64`: memory 0's address `p` (i32, or i64 for a 64-bit memory 0) as an offset into the arc, inline (`adrp` memory 0, less x28, plus `p`): every syscall takes buffers as arc offsets and masks them.
+- The console, for example, is grant slot 0: its token at the grants offset + G#204, a write `syscall(1, token, arc_offset(text), len, arc_offset(reply), reply_len, 0)` (tests/wat/hello.wat).
+ferros_sys for wasm32 (its `svc` and `off` over these two) is the next step, so Rust payloads build for toka unchanged.
 
 ## Status
 
 - **M0, built 2026-11-26:** the fork masks at emission and toka compiles modules end to end, checker-clean.
   A hand-written module touching every path (loads and stores at every offset class, globals, `call_indirect`, `br_table`, loops, f64 and v128 constants, shuffles, bulk memory, `memory.grow`, atomics, tail calls, division) and a Rust crate built for wasm32 by rustc (BLAKE3, `core::fmt`, sorting, `dyn` calls, i128): every instruction accepted in ring, fixed, BTI and exact mode (the Rust crate 45 functions, 14,057 instructions in ring mode, 18,185 in exact).
   Nothing has run yet.
-- **M1, next:** the image runs on the device.
-  The entry stub and the image header (ferros_rt's), the intrinsic imports (`svc` and the arc's grants, ferros_sys's syscall shim compiled for wasm), where the memories sit in the arc, and the zeroed tail in place of the image carrying a memory's zeroes.
-  The arc layout and how a toka process reaches its grants are a design for the owner first.
+- **M1, built 2026-11-26, not yet run:** the header, the entry, the `syscall` and `arc_offset` intrinsics, the zeroed tail for memory 0's reserve; tests/wat/hello.wat (a console line) builds checker-clean with and without BTI (`toka tests/wat/hello.wat -o hello.bin --reserve 20`, then `bridge capsule hello.bin hello.vsf --masked --text-len N`, seal and spawn). `--lib` compiles a module with no entry for checking alone.
 - **Then:** threads (the kernel's wait and wake on a word), the capsule section for toka bytecode and stow-time compiling on the device (toka as a std process, the seal over the bytecode's and the compiler's hashes, KERNEL.md "Stow, compile, seal, go"), std for wasm through ferros's own target, Photon; and toka's extensions to WebAssembly in CPU-FEATURES.md's order (AES and PMULL, SHA, CRC, dot product and I8MM, FP16 and BF16, 128-bit atomics, then SVE2; spirix's types when hardware runs them).
 
 ## Open for the owner

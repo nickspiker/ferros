@@ -1,7 +1,8 @@
 //! toka's runtime: the few functions translated code calls (memory.copy, memory.fill, memory.init), built here as Cranelift IR and compiled and masked like any other function, so the image holds no code toka did not emit.
 //! Byte loops for now; 16-byte NEON strides when they are measured worth it.
 
-use crate::environ::{NS_RUNTIME, RUNTIME_MEMMOVE, RUNTIME_MEMSET};
+use crate::environ::{NS_FUNC, NS_RUNTIME, RUNTIME_ENTRY, RUNTIME_MEMMOVE, RUNTIME_MEMSET};
+use crate::module::Module;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::immediates::Offset32;
 use cranelift_codegen::ir::types::*;
@@ -107,6 +108,80 @@ fn memset(config: TargetFrontendConfig) -> ir::Function {
     b.seal_all_blocks();
     b.finalize(config);
     func
+}
+
+/// The one native stub, `syscall(n, a0..a5)` called as AAPCS64 (n in x0, the arguments in x1 to x6): moved to the kernel's registers (the number in x8, the arguments in x0 to x5), `svc #0`, the answer in x0; under BTI a `bti c` before it (it is reached by `bl`) and `br x30` for its return. Written as words because Cranelift has no `svc`; every one of them is a form the checker accepts (moves into x0 to x8, `svc #0`).
+pub fn syscall_stub(bti: bool) -> Vec<u8> {
+    let mut w: Vec<u32> = vec![];
+    if bti {
+        w.push(0xD503_245F); // bti c
+    }
+    w.extend([
+        0xAA00_03E8, // mov x8, x0
+        0xAA01_03E0, // mov x0, x1
+        0xAA02_03E1, // mov x1, x2
+        0xAA03_03E2, // mov x2, x3
+        0xAA04_03E3, // mov x3, x4
+        0xAA05_03E4, // mov x4, x5
+        0xAA06_03E5, // mov x5, x6
+        0xD400_0001, // svc #0
+    ]);
+    w.push(if bti { 0xD61F_03C0 } else { 0xD65F_03C0 }); // br x30 / ret
+    w.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// The image's entry, reached from the header's branch with the kernel's x0 to x2 (the grants offset, the input's offset and length): the module's start function, then its `_ferros_main(grants, input, length: i64)` if it exports one, else its `_start()`, then exit (syscall 0) with 0.
+pub fn entry(module: &Module<'_>, config: TargetFrontendConfig) -> Result<ir::Function, String> {
+    let name = ir::UserExternalName::new(NS_RUNTIME, RUNTIME_ENTRY);
+    let mut sig = ir::Signature::new(CallConv::SystemV);
+    sig.params.extend((0..3).map(|_| AbiParam::new(I64)));
+    let mut func = ir::Function::with_name_signature(ir::UserFuncName::User(name), sig);
+    let mut ctx = FunctionBuilderContext::new();
+    let mut b = FunctionBuilder::new(&mut func, &mut ctx);
+    let entry = b.create_block();
+    b.append_block_params_for_function_params(entry);
+    b.switch_to_block(entry);
+    let p: Vec<ir::Value> = b.block_params(entry).to_vec();
+    let mut call_wasm = |b: &mut FunctionBuilder, f: u32, args: &[ir::Value]| {
+        let t = module.func_type(crate::types::FuncIndex::from_u32(f));
+        let sig = b.func.import_signature(crate::environ::signature(t));
+        let fname = b.func.declare_imported_user_function(ir::UserExternalName::new(NS_FUNC, f));
+        let fr = b.func.import_function(ir::ExtFuncData { name: ir::ExternalName::user(fname), signature: sig, colocated: true, patchable: false });
+        b.ins().call(fr, args);
+    };
+    if let Some(s) = module.start {
+        call_wasm(&mut b, s.as_u32(), &[]);
+    }
+    let find = |n: &str| module.exports.iter().find(|(e, _)| e == n).map(|(_, f)| *f);
+    use crate::types::WasmValType::I64 as W64;
+    if let Some(m) = find("_ferros_main") {
+        let t = module.func_type(m);
+        if t.params != [W64, W64, W64] || !t.results.is_empty() {
+            return Err(format!("_ferros_main has type {t:?}, not (i64 grants, i64 input, i64 length) -> ()"));
+        }
+        call_wasm(&mut b, m.as_u32(), &p);
+    } else if let Some(m) = find("_start") {
+        let t = module.func_type(m);
+        if !t.params.is_empty() || !t.results.is_empty() {
+            return Err(format!("_start has type {t:?}, not () -> ()"));
+        }
+        call_wasm(&mut b, m.as_u32(), &[]);
+    } else {
+        return Err("the module exports neither _ferros_main nor _start: an image needs one to run".into());
+    }
+    // exit(0): syscall 0 thru the stub, which never returns; a trap after it, should it.
+    let mut ssig = ir::Signature::new(CallConv::SystemV);
+    ssig.params.extend((0..7).map(|_| AbiParam::new(I64)));
+    ssig.returns.push(AbiParam::new(I64));
+    let ssig = b.func.import_signature(ssig);
+    let sname = b.func.declare_imported_user_function(ir::UserExternalName::new(NS_RUNTIME, crate::environ::RUNTIME_SYSCALL));
+    let sf = b.func.import_function(ir::ExtFuncData { name: ir::ExternalName::user(sname), signature: ssig, colocated: true, patchable: false });
+    let zero = b.ins().iconst(I64, 0);
+    b.ins().call(sf, &[zero; 7]);
+    b.ins().trap(crate::environ::TRAP_UNREACHABLE);
+    b.seal_all_blocks();
+    b.finalize(config);
+    Ok(func)
 }
 
 /// Every runtime function, each named in `NS_RUNTIME`.

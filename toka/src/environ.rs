@@ -31,6 +31,10 @@ pub const DATA_SEGMENT: u32 = 4 << 16;
 /// toka's runtime functions, compiled by toka itself (runtime.rs).
 pub const RUNTIME_MEMMOVE: u32 = 0;
 pub const RUNTIME_MEMSET: u32 = 1;
+/// The one native stub: `syscall(n, a0..a5)` as AAPCS64 (runtime.rs `syscall_stub`): the arguments moved to the kernel's registers, `svc #0`, back.
+pub const RUNTIME_SYSCALL: u32 = 2;
+/// The image's entry (runtime.rs `entry`): the kernel's x0 to x2 (grants, input, input's length) to the module's start function and `_ferros_main`, then exit.
+pub const RUNTIME_ENTRY: u32 = 3;
 
 /// Each global's slot in the globals area (a v128 needs 16).
 pub const GLOBAL_SLOT: u32 = 16;
@@ -520,11 +524,73 @@ impl<'a> FuncEnvironment<'a> {
         })
     }
     pub fn translate_call(&mut self, builder: &mut FunctionBuilder, _srcloc: ir::SourceLoc, callee: FuncIndex, sig: ir::SigRef, args: &[ir::Value]) -> WasmResult<crate::Reachability<Vec<ir::Value>>> {
+        if let Some(results) = self.intrinsic(builder, callee, args)? {
+            return Ok(crate::Reachability::Reachable(results));
+        }
         let f = self.func_ref(builder.func, callee, sig);
         let call = builder.ins().call(f, args);
         Ok(crate::Reachability::Reachable(builder.inst_results(call).to_vec()))
     }
+    /// A call of a function imported from "ferros" (docs/TOKA.md "Intrinsics"), its results; None for any other callee.
+    /// - `syscall(n, a0, a1, a2, a3, a4, a5: i64) -> i64`: the kernel's call `n` (process.rs's numbers, ferros_sys `nr`), thru the image's one native stub.
+    /// - `arc_offset(p: i32 or i64) -> i64`: memory 0's address `p` as an offset into the process's arc, what every syscall takes for a buffer (the kernel masks it).
+    fn intrinsic(&mut self, builder: &mut FunctionBuilder, callee: FuncIndex, args: &[ir::Value]) -> WasmResult<Option<Vec<ir::Value>>> {
+        let k = callee.as_u32() as usize;
+        if k >= self.module.num_imported_funcs() || self.module.imports[k].module != "ferros" {
+            return Ok(None);
+        }
+        let name = self.module.imports[k].name.clone();
+        let t = self.module.func_type(callee).clone();
+        let want = |params: &[WasmValType], results: &[WasmValType]| -> WasmResult<()> {
+            if t.params == params && t.results == results {
+                Ok(())
+            } else {
+                Err(wasm_unsupported!("intrinsic ferros.{name} with type {t:?} (it is {params:?} -> {results:?})"))
+            }
+        };
+        let w64 = WasmValType::I64;
+        match name.as_str() {
+            "syscall" => {
+                want(&[w64; 7], &[w64])?;
+                let mut sig = ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+                sig.params.extend((0..7).map(|_| ir::AbiParam::new(I64)));
+                sig.returns.push(ir::AbiParam::new(I64));
+                let sig = builder.func.import_signature(sig);
+                let fname = builder.func.declare_imported_user_function(ir::UserExternalName::new(NS_RUNTIME, RUNTIME_SYSCALL));
+                let f = builder.func.import_function(ir::ExtFuncData {
+                    name: ir::ExternalName::user(fname),
+                    signature: sig,
+                    colocated: true,
+                    patchable: false,
+                });
+                let call = builder.ins().call(f, args);
+                Ok(Some(builder.inst_results(call).to_vec()))
+            }
+            "arc_offset" => {
+                let memory = MemoryIndex::from_u32(0);
+                if self.module.memories.first().is_none_or(|m| m.handle.is_some()) {
+                    return Err(wasm_unsupported!("ferros.arc_offset without a memory 0 of the module's own"));
+                }
+                let p = if self.memory_index_type(memory) == I32 {
+                    want(&[WasmValType::I32], &[WasmValType::I64])?;
+                    builder.ins().uextend(I64, args[0])
+                } else {
+                    want(&[WasmValType::I64], &[WasmValType::I64])?;
+                    args[0]
+                };
+                let base = self.memory_base(builder, memory);
+                let arc = builder.ins().get_pinned_reg(I64);
+                let from_arc = builder.ins().isub(base, arc);
+                Ok(Some(vec![builder.ins().iadd(from_arc, p)]))
+            }
+            other => Err(wasm_unsupported!("no intrinsic ferros.{other} (toka has syscall and arc_offset)")),
+        }
+    }
+
     pub fn translate_return_call(&mut self, builder: &mut FunctionBuilder, _srcloc: ir::SourceLoc, callee: FuncIndex, sig: ir::SigRef, args: &[ir::Value]) -> WasmResult<()> {
+        if (callee.as_u32() as usize) < self.module.num_imported_funcs() && self.module.imports[callee.as_u32() as usize].module == "ferros" {
+            return Err(wasm_unsupported!("a tail call of an intrinsic (call it, then return)"));
+        }
         let f = self.func_ref(builder.func, callee, sig);
         builder.ins().return_call(f, args);
         Ok(())
