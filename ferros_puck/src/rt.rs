@@ -353,7 +353,9 @@ pub mod place {
                 }
             }
             // Until the circle's view changes or the place grows stale; with no place yet and the circle hidden, until it is shown.
-            let deadline = current().map(|(_, when)| when + STALE_S * crate::OSC);
+            // A place already stale (the circle hidden, or a fix that failed) arms no deadline: one in the past returns the wait at once, and the thread spun a core (2026-11-26: Tide and Compass each held an A715 busy with the screen off, 2 W on the Pro); the next view change asks again.
+            let now = super::eagle_now();
+            let deadline = current().map(|(_, when)| when + STALE_S * crate::OSC).filter(|&d| now.is_some_and(|t| d > t));
             seen = super::wait(seen, deadline);
         }
     }
