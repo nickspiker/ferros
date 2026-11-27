@@ -10586,9 +10586,10 @@ fn kist_request(p: &Process, req: &[u8], replace: bool, stop: bool) -> u64 {
         return refuse("nobody is present: a kist runs only for an attested person");
     }
     // A stop (the person's Stop on the kist's card, owner 2026-11-12; docs/KISTS.md "The deck and the card"): the running kist killed, one shot dead, and nothing launched. No record is kept, as for a relaunch's kill: the person's own act, so its circle goes to not running, not stopped. Ahead of the launch slot, so a launch still streaming never holds a stop back.
-    // Only the process `kill_locked` would find by that name, and only when it is that kist (by its capsule): a kist named as a system process stops nothing of the system's.
+    // Only the process `kill_locked` would find by that name, and only when it is a kist: a kist named as a system process stops nothing of the system's.
+    // Any kist of that name, the launch's own test (`alive` below), not only one from this capsule: after an update the card names the new capsule while the old one may still run, and Stop must end it (owner, 2026-11-27: "The entire design needs to be killswitch ready, kists and pucks included").
     if stop {
-        let theirs = kk.procs.iter().flatten().find(|q| q.name == name && !q.dying).is_some_and(|q| q.kist && q.capsule.as_ref().map(|c| &c[..]) == Some(&capsule[..]));
+        let theirs = kk.procs.iter().flatten().find(|q| q.name == name && !q.dying).is_some_and(|q| q.kist);
         if !theirs {
             return NOTHING;
         }

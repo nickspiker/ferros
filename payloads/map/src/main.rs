@@ -2193,8 +2193,18 @@ impl Map {
                         f.0 = now.capsule;
                     }
                 }
+                // An update (the same kist, its developer and option, under a new capsule), stowed here or come from the person's other devices: its running copy killed and the new one launched, no warning (owner, 2026-11-27: "No warning, kill it, then launch it again. The entire design needs to be killswitch ready, kists and pucks included"). Init's OP_RELAUNCH with the new capsule: the kernel kills the live process of its name and launches the list's entry, and does nothing for a kist not running.
+                let updated: Vec<[u8; 32]> = k.kists.iter().filter(|n| self.kists.kists.iter().any(|o| o.developer == n.developer && o.option == n.option && o.capsule != n.capsule)).map(|n| n.capsule).collect();
                 self.kists = k;
                 self.icons = read_icons(self.grants);
+                for c in updated {
+                    let mut m = [0u8; 33];
+                    m[0] = ferros_kist::launch::OP_RELAUNCH;
+                    m[1..].copy_from_slice(&c);
+                    let mut r = [0u8; 1];
+                    call(cap(self.grants, S_LAUNCH), &m, &mut r);
+                    console(self.grants, b"map: a kist updated: init asked to relaunch it on the new capsule (nothing when it was not running)\n");
+                }
                 true
             }
             None => false,
