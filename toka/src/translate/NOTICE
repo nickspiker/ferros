@@ -1,0 +1,11 @@
+The files in this directory are derived from Wasmtime's Cranelift translator,
+crates/cranelift/src/translate in https://github.com/bytecodealliance/wasmtime at
+tag v51.0.0, licensed under the Apache License, Version 2.0, with the LLVM
+exception (Apache-2.0 WITH LLVM-exception). Copyright the Bytecode Alliance
+and Wasmtime contributors.
+
+ferros changed them: operators toka does not take were removed (garbage
+collection, exceptions, stack switching, reference types and table operators
+other than call_indirect), wasmtime's runtime environment was replaced by
+toka's (environ.rs), and memory accesses take no bounds checks (the Cranelift
+fork's ferros masking makes every access safe at emission).

@@ -319,9 +319,8 @@ The process ABI (`ferros_kernel/src/process.rs`):
 ### Bring-up order
 
 1. EL0 entry and the base/mask register ABI: the existing RUN payload path becomes a real process.
-2. The toka VM as ferros's first process (safe by construction) while the backend is written.
-3. The toka → aarch64 backend, sealing, go.
-4. wasm → toka lowering and the WASI-shaped host calls; then Photon, then Lumis.
+2. toka, the compiler (TOKA.md; the owner, 2026-11-26: Cranelift, forked, as the back end, with the masking at emission): built and checker-clean on the developer's machine (M0); next the image running on the device (M1), then toka on the device at stow, sealing, go.
+3. WebAssembly's host calls as capability handles, std through ferros's own target; then Photon, then Lumis.
 
 ### Data caches: one static map at boot (decided and built 2026-10-14)
 

@@ -1,0 +1,26 @@
+[package]
+name = "toka"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "toka: ferros's compiler, WebAssembly (forked and extended) to masked aarch64 on Cranelift (docs/TOKA.md)"
+
+# Its own workspace and lock (as tools/transcribe): Cranelift's tree stays out of the ferros workspace's lock, and toka builds for the host now and for the ferros std target later.
+[workspace]
+
+[[bin]]
+name = "toka"
+path = "src/main.rs"
+
+[dependencies]
+# The Cranelift fork (/mnt/Harbor/Code/wasmtime, line `main`: the ferros masking at emission, settings::FerrosMask).
+cranelift-codegen = { path = "../../wasmtime/cranelift/codegen", default-features = false, features = ["std", "arm64"] }
+cranelift-frontend = { path = "../../wasmtime/cranelift/frontend", default-features = false, features = ["std"] }
+cranelift-entity = { path = "../../wasmtime/cranelift/entity" }
+wasmparser = { version = "0.263.0", default-features = false, features = ["std", "validate", "simd", "features"] }
+target-lexicon = "0.13.5"
+smallvec = { version = "1.15.1", features = ["union"] }
+itertools = "0.14.0"
+log = { version = "0.4.28", default-features = false }
+# The checker every function's code is held to (docs/SANDBOX.md).
+ferros_sandbox = { path = "../ferros_sandbox" }
