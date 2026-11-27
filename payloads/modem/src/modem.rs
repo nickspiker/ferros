@@ -2665,6 +2665,34 @@ impl Online {
         if t == u64::MAX { 0 } else { t }
     }
 
+    /// Which of `next_deadline`'s sources are due by `now` (2026-11-27, measuring the Pro's loop: A#61000 passes and as many waits a second, so the wait returns at once): bit 0 the link down after the wakeup line fell, 1 the registration ask, 2 the call's retry, 3 the signal ask, 4 the re-registration, 5 the tracks.
+    fn deadlines_due(&self, now: u64) -> u32 {
+        let f = crate::hw::freq();
+        let at = |us: u64| self.t0 + us * f / 1_000_000 + 1;
+        let home = matches!(self.reg_last[1], Some([1 | 5, ..]));
+        let dark = ferros_sys::pref(ferros_sys::PREF_SCREEN_OFF) == 1;
+        let mut due = 0;
+        if let (Some(t1), false, true) = (self.idle_since, LINK_DOWN.load(core::sync::atomic::Ordering::Relaxed), self.probe == SERVICE) {
+            due |= ((t1 + 30_000 * f / 1_000_000 + 1 <= now) as u32) << 0;
+        }
+        if self.probe >= 3 {
+            due |= ((at(self.next_reg) <= now) as u32) << 1;
+        }
+        if self.probe >= 8 && !self.call_sent && home {
+            due |= ((at(self.call_retry) <= now) as u32) << 2;
+        }
+        if self.probe >= 3 && self.screen_sent == 1 && home {
+            due |= ((at(self.sig_ask) <= now) as u32) << 3;
+        }
+        if let Some(r) = self.rereg_on {
+            due |= ((at(r) <= now) as u32) << 4;
+        }
+        if self.probe == SERVICE && !dark {
+            due |= ((at(self.tracks_at + 2_000_000) <= now) as u32) << 5;
+        }
+        due
+    }
+
     /// The service's own part of a pass (docs/RADIO-CONTROLS.md): the tracks every two seconds while the screen is on (none in the dark: nobody sees them), the detail when the call comes or goes, and the control block at every pass (a knob set wakes the service loop, kernel SYS_CONTROL; until 2026-11-13 it was looked at four times a second).
     #[inline(never)]
     fn service_extras(&mut self, rep: &mut Vec<u8>) {
@@ -3584,6 +3612,16 @@ pub fn down(rep: &mut Vec<u8>) {
 pub static RUNG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The service loop's wait: until `RUNG` moves from `seen` or the next timed action is due.
+/// The service's deadline sources due now (`deadlines_due`), and whether a GNSS command's wait is due: for the loop's report.
+pub fn deadlines_due() -> (u32, bool) {
+    let now = ferros_sys::now();
+    crate::hw::locked(|| {
+        let s = unsafe { (*(&raw const ONLINE)).as_ref().map_or(0, |o| o.deadlines_due(now)) };
+        let g = gnss_due();
+        (s, g != 0 && g <= now)
+    })
+}
+
 pub fn ring_wait(seen: u64) {
     ferros_sys::wait_world(&RUNG, seen, next_deadline());
 }

@@ -158,7 +158,8 @@ pub extern "C" fn modem_main(grants: u64, input: u64, input_len: u64) -> ! {
             passes += 1;
             // The loop's wakes, said at the first pass 64 s or more after the last line (no timer brings one): passes, and waits on the lines.
             if ferros_sys::now().wrapping_sub(said_at) >= ferros_sys::freq() << 6 {
-                hw::log(&alloc::format!("modem: A#{passes} passes, A#{waits} waits in the last A#{} ms", (ferros_sys::now() - said_at) * 1000 / ferros_sys::freq()));
+                let (due, gnss) = modem::deadlines_due();
+                hw::log(&alloc::format!("modem: A#{passes} passes, A#{waits} waits in the last A#{} ms; deadlines due now G#{due:02X} (0 link down, 1 registration, 2 call retry, 3 signal, 4 re-registration, 5 tracks), GNSS wait due {gnss}", (ferros_sys::now() - said_at) * 1000 / ferros_sys::freq()));
                 (passes, waits, said_at) = (0, 0, ferros_sys::now());
             }
             let Some((m, w)) = irq else {
