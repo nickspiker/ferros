@@ -22,7 +22,7 @@ vsf = { path = "../../../vsf" }
 # fgtw itself, the same copy Photon builds against (`../../../fgtw`, Photon's `../fgtw`): the alias's keys (fgtw::alias), the binding (fgtw::binding) and the people (fgtw::people) of the facets (docs/FACETS.md). fgtw main since 47ed633.
 fgtw = { path = "../../../fgtw", default-features = false, features = ["sign", "profile"] }
 # The CPU's SHA-256 for every sha2 0.10 in the graph (fips205's SPHINCS+ above all), by feature unification: on aarch64 sha2 0.10 takes its own intrinsic backend only with `asm`, and without it every SHA-256 here ran in software (2026-11-17, the Pro's X3: SPHINCS+ keygen 208 ms to 36, a signature 1841 to 313; Photon's device and alias keys were each about 98 % SPHINCS+ keygen).
-# `asm` also builds sha2-asm's sha256_aarch64.S with the cross gcc (std processes may link C and assembly); that file uses none of x24 to x28 and is never referenced, since sha2 0.10's aarch64 path is its Rust intrinsics.
+# `asm` would also build sha2-asm's sha256_aarch64.S, never referenced (sha2 0.10's aarch64 path is its Rust intrinsics); the patch below takes the workspace's pure-Rust sha2-asm instead, so no assembly is built (2026-11-26).
 sha2 = { version = "0.10", default-features = false, features = ["asm"] }
 
 [patch.crates-io]
@@ -32,6 +32,8 @@ libc = { path = "/mnt/Harbor/Code/ferros-libc" }
 audiopus_sys = { git = "https://github.com/nickspiker/audiopus_sys", rev = "a0002f15c94d0b29d2b03e48f5ac252eaa980c1c" }
 # OpenH264 for ferros (Photon's beams): the openh264-sys2 0.9.8 fork beside this crate builds Cisco's codec for aarch64-unknown-ferros and links ferros_rt's C++ shims, so no C++ runtime library (docs/STD-TARGET.md "C++ through ferros_rt"; the Photon session asked for it, 2026-11-26).
 openh264-sys2 = { path = "../openh264-sys2" }
+# sha2-asm in pure Rust, as the workspace patches it (sha2_asm/Cargo.toml says why): sha2's `asm` feature above still gives the CPU's SHA-256 thru sha2 0.10's own intrinsics, and no hand assembly is built (the Photon session, 2026-11-26: one file fewer for the masking assembler's audit).
+sha2-asm = { path = "../../sha2_asm" }
 
 [profile.dev]
 panic = "abort"
