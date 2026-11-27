@@ -2,8 +2,8 @@
 //!
 //! The kernel starts it at the first call on `audio` (process.rs `ON_DEMAND`, service.rs `audio_grants`), and it ends itself once every stream has closed and played out: silence holds no arc, and the amplifiers go back to reset (the `amp` switch is off when the process that held it ends). The next call starts another.
 //!
-//! Spawn by hand (development; the kernel's own start is the same grants): ferros-bridge spawn audio.bin --name audio --serve audio --dma aoc-ipc --hw aoc-mbox --irq aoc-mbox-f1 --hw usi1-spi --hw gpio-gpn0 --power amp --entropy --dma aoc-play-lo --dma aoc-capture --dma aoc-play-hi
-//! Grant slots, in that order: 0 console, 1 the `audio` endpoint (serve), 2 the AoC's IPC block, 3 its mailboxes, 4 mailbox block f1's AoC-to-AP line, 5 the amplifiers' SPI port, 6 gpio-gpn0 (the right amplifier's select), 7 the `amp` switch, 8 entropy (the streams' handles), 9 and 11 the playback ring's windows (`aoc-play-lo`, `aoc-play-hi`), 10 the capture ring's (`aoc-capture`).
+//! Spawn by hand (development; the kernel's own start is the same grants): ferros-bridge spawn audio.bin --name audio --serve audio --dma aoc-ipc --hw aoc-mbox --irq aoc-mbox-f1 --hw usi1-spi --hw gpio-gpn0 --power amp --entropy --dma aoc-play-lo --dma aoc-capture --dma aoc-play-hi --dma aoc-heaps --serve mic --dma mic-mailbox
+//! Grant slots, in that order: 0 console, 1 the `audio` endpoint (serve), 2 the AoC's IPC block, 3 its mailboxes, 4 mailbox block f1's AoC-to-AP line, 5 the amplifiers' SPI port, 6 gpio-gpn0 (the right amplifier's select), 7 the `amp` switch, 8 entropy (the streams' handles), 9 and 11 the playback ring's windows (`aoc-play-lo`, `aoc-play-hi`), 10 the capture ring's (`aoc-capture`), 12 the AAudio heaps (`aoc-heaps`), 13 the `mic` endpoint (serve: the capture ops, behind the mic right), 14 the microphone mailbox's writer region (`mic-mailbox`); a sweep's hand spawn adds 15, `--dma test-mailbox`.
 //!
 //! The endpoint's protocol is ferros_sys `audio` (its ops, the format, the ring). The AoC must be up (the sensors process asks the kernel to start it at every boot); without it an open is refused.
 //!
@@ -37,8 +37,12 @@ pub const S_CAPTURE: u64 = 10;
 pub const S_PLAY_HI: u64 = 11;
 /// The AoC's AAudio heaps (kernel cachemap.rs AOC_HEAPS, since 2026-11-24): the MMAP streams' buffers.
 pub const S_HEAPS: u64 = 12;
-/// A hand spawn's dump for the bench's sweep (`--dma test-mailbox`): the capture and its anchors, read by the host from the frame `diag arcs` names (development only; the kernel's own start grants nothing here).
-pub const S_DUMP: u64 = 13;
+/// The `mic` endpoint (serve, 2026-11-26): the microphones behind a right of their own (ferros_kist `mic`), its calls the only way to the capture ops; `audio`, every kist's, refuses them.
+pub const S_MIC: u64 = 13;
+/// The microphone mailbox's writer region (`mic-mailbox`, ferros_mailbox `MIC`), for the capture's publishing to the holders of its view.
+pub const S_MIC_BOX: u64 = 14;
+/// A hand spawn's dump for the bench's sweep (`--dma test-mailbox`, after `--serve mic --dma mic-mailbox`; slot 13 until 2026-11-26): the capture and its anchors, read by the host from the frame`diag arcs` names (development only; the kernel's own start grants nothing here).
+pub const S_DUMP: u64 = 15;
 
 /// The spawn input (a hand spawn's `--input-file`s, each a u32 length and its bytes: the bench's mono feed as i16, then the speaker's tuning, then its second part), its address and length in bytes; 0 for none.
 static INPUT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -143,6 +147,8 @@ pub struct State {
     last_rx: u32,
     /// A sweep's dump waits to be read: the process stays (a mailbox's payload is zeroed by the kernel when its writer ends) until the next call, which the host sends once it has read the frame.
     dump_held: bool,
+    /// Calls taken off an endpoint and not yet acted on (the `audio` and `mic` threads, 2026-11-26): while one is, the process is not idle, so neither thread ends it under the other's call.
+    receiving: u8,
     /// Ending after an amplifier's fault: opens are refused from here, the process ends once the next call has been told.
     closing: bool,
     /// The sound being brought up (`ensure_up`) or down after its tail (`clock`): a second start waits for neither, it is refused.
@@ -177,7 +183,7 @@ pub struct State {
     watch_failed: u32,
 }
 
-static mut STATE: State = State { cursor: 0, last_rx: 0, dump_held: false, up: false, siggen: false, closing: false, starting: false, stopping: false, services: None, play: Play::DEFAULT, clicks: mix::Clicks::NONE, feed: mix::Feed::NONE, bench: Bench::NONE, streams: [const { mix::Stream::EMPTY }; mix::STREAMS], tone: mix::Tone::NONE, clip: mix::Clip::NONE, mic: mic::Mic::NONE, generation: [0; mix::STREAMS], periods: 0, underruns: 0, starved: 0, irqs: 0, quiet: 0, amps: [(0, 0); 2], fault: false, watch_failed: 0 };
+static mut STATE: State = State { cursor: 0, last_rx: 0, dump_held: false, receiving: 0, up: false, siggen: false, closing: false, starting: false, stopping: false, services: None, play: Play::DEFAULT, clicks: mix::Clicks::NONE, feed: mix::Feed::NONE, bench: Bench::NONE, streams: [const { mix::Stream::EMPTY }; mix::STREAMS], tone: mix::Tone::NONE, clip: mix::Clip::NONE, mic: mic::Mic::NONE, generation: [0; mix::STREAMS], periods: 0, underruns: 0, starved: 0, irqs: 0, quiet: 0, amps: [(0, 0); 2], fault: false, watch_failed: 0 };
 
 /// The amplifiers' port (spi_19): since the watch has a thread of its own (2026-11-24), it and the clock thread's bring-up and power-down both drive the port, one at a time under this lock (0 free, 1 held, 2 held with a waiter).
 static AMP_LOCK: AtomicU64 = AtomicU64::new(0);
@@ -313,7 +319,7 @@ pub fn end_if_idle() {
 }
 
 fn idle(st: &State) -> bool {
-    !st.dump_held && !st.bench.on && !st.bench.holding && !st.up && !st.siggen && !st.starting && !st.stopping && !st.mic.busy() && st.streams.iter().all(|x| !x.live)
+    st.receiving == 0 && !st.dump_held && !st.bench.on && !st.bench.holding && !st.up && !st.siggen && !st.starting && !st.stopping && !st.mic.busy() && st.streams.iter().all(|x| !x.live)
 }
 
 /// The clock: the AoC rang (a period taken, or the microphones' ring written), so the microphones' samples are taken (mic.rs `turn`), the playback ring topped up to the lead's periods (`Play`), each a period mixed, and held writes that now fit answered.
@@ -625,6 +631,9 @@ static mut CLOCK_STACK: [u8; 1 << 14] = [0; 1 << 14];
 static mut POLL_STACK: [u8; 1 << 13] = [0; 1 << 13];
 static mut WATCH_STACK: [u8; 1 << 14] = [0; 1 << 14];
 static mut MSG: [u8; 4096] = [0; 4096];
+/// The `mic` endpoint's thread (`mic_server`): its stack and its message; its ops are a few bytes.
+static mut MIC_STACK: [u8; 1 << 13] = [0; 1 << 13];
+static mut MIC_MSG: [u8; 1 << 6] = [0; 1 << 6];
 
 /// Bring the sound up if it is not: true when playing. Called without the lock (the AoC and the amplifiers take tens of milliseconds); one start at a time (`starting`), from the receiving thread, or from the clock thread for a recording's playback (mic.rs `recorded`): a second caller meanwhile is refused, as one is while the sound is brought down.
 pub fn ensure_up(p: Play) -> bool {
@@ -679,12 +688,20 @@ pub extern "C" fn audio_main(grants: u64, _input: u64, _input_len: u64) -> ! {
     ferros_sys::thread_spawn(clock, unsafe { &mut *(&raw mut CLOCK_STACK) }, 0);
     ferros_sys::thread_spawn(mic::poller, unsafe { &mut *(&raw mut POLL_STACK) }, 0);
     ferros_sys::thread_spawn(watcher, unsafe { &mut *(&raw mut WATCH_STACK) }, 0);
+    ferros_sys::thread_spawn(mic_server, unsafe { &mut *(&raw mut MIC_STACK) }, 0);
     let ep = cap(grants, S_AUDIO);
     let msg = unsafe { &mut *(&raw mut MSG) };
     let mut token = [0u8; 32];
     // From the second message on: a service with nothing to play (a STATE, a refused start, a stale handle) ends before it waits again, so an arc is held only while there is sound. The first is the call that started it.
     let mut served = false;
+    let mut taken = false;
     loop {
+        // The call before acted on: no longer counted against the idle check (`receiving`).
+        if taken {
+            lock().receiving -= 1;
+            unlock();
+            taken = false;
+        }
         if served {
             exit_if_idle();
         }
@@ -698,7 +715,9 @@ pub extern "C" fn audio_main(grants: u64, _input: u64, _input_len: u64) -> ! {
         {
             let st = lock();
             st.dump_held = false;
+            st.receiving += 1;
             unlock();
+            taken = true;
         }
         match m[0] {
             audio::OPEN if n == 2 => {
@@ -855,16 +874,49 @@ pub extern "C" fn audio_main(grants: u64, _input: u64, _input_len: u64) -> ! {
                     }
                 }
             }
-            audio::MIC_LEVELS if n == 1 => mic::levels(token, aoc::Shape::LINUX),
-            // The capture's shape asked with it (2026-11-24): its period in whole milliseconds and its width's code.
-            // WHY the bounds: the caller's bytes; the AoC's field is a u8 of milliseconds (a period of 0 is none), its widths 1 to 3 (aoc.rs `WIDTH_16`..`WIDTH_32`); a period past 10 ms is longer than Linux's own and buys nothing here.
-            audio::MIC_LEVELS if n == 3 && (1..=10).contains(&m[1]) && (aoc::WIDTH_16..=aoc::WIDTH_32).contains(&m[2]) => mic::levels(token, aoc::Shape { ms: m[1], width: m[2], gain: None, kind: aoc::REC_NORMAL }),
+            // The capture ops are the microphones', on `mic` alone (`mic_server`, 2026-11-26): every kist holds `audio`, so here they fall to the refusal below.
             audio::BENCH if (14..=16).contains(&n) => bench(token, m),
-            audio::RECORD if n == 3 => mic::record(token, m[1], m[2]),
             audio::SIGGEN if n == 8 => {
                 let amplitude = u32::from_le_bytes([m[4], m[5], m[6], m[7]]);
                 reply(&token, &[siggen(m[1], u16::from_le_bytes([m[2], m[3]]), amplitude) as u8 ^ 1]);
             }
+            _ => {
+                reply(&token, &[1]);
+            }
+        }
+    }
+}
+
+/// The `mic` endpoint's receiving thread (2026-11-26): the capture ops for a caller the person granted the microphones (the kernel hands `mic`'s send right only with the mic right, and to Settings), every other op refused.
+/// The kernel marks a microphone mailbox view in use for the privacy indicator; these held calls are Settings' meter and test recording.
+extern "C" fn mic_server(_: u64) -> ! {
+    let ep = cap(grants(), S_MIC);
+    let msg = unsafe { &mut *(&raw mut MIC_MSG) };
+    let mut token = [0u8; 32];
+    let mut taken = false;
+    loop {
+        // As the `audio` thread: the call before acted on, then an idle service ends (a capture started from here ends with its call's answer, and a service started by a call on `mic` ends once nothing is left).
+        // A call the other thread takes in the instant before it counts it is answered as any call whose server ended, and its next call starts a fresh service.
+        if taken {
+            lock().receiving -= 1;
+            unlock();
+            taken = false;
+            exit_if_idle();
+        }
+        let n = recv(ep, msg, &mut token, false) as usize;
+        if n as u64 == ERR || n == 0 {
+            continue;
+        }
+        lock().receiving += 1;
+        unlock();
+        taken = true;
+        let m = &msg[..n];
+        match m[0] {
+            audio::MIC_LEVELS if n == 1 => mic::levels(token, aoc::Shape::LINUX),
+            // The capture's shape asked with it (2026-11-24): its period in whole milliseconds and its width's code.
+            // WHY the bounds: the caller's bytes; the AoC's field is a u8 of milliseconds (a period of 0 is none), its widths 1 to 3 (aoc.rs `WIDTH_16`..`WIDTH_32`); a period past 10 ms is longer than Linux's own and buys nothing here.
+            audio::MIC_LEVELS if n == 3 && (1..=10).contains(&m[1]) && (aoc::WIDTH_16..=aoc::WIDTH_32).contains(&m[2]) => mic::levels(token, aoc::Shape { ms: m[1], width: m[2], gain: None, kind: aoc::REC_NORMAL }),
+            audio::RECORD if n == 3 => mic::record(token, m[1], m[2]),
             _ => {
                 reply(&token, &[1]);
             }

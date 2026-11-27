@@ -30,10 +30,10 @@ use vsf::file_format::{VsfHeader, VsfSection};
 use vsf::types::EtType;
 use vsf::VsfType;
 
-/// The rights, by code (the index): the screen (`use display`), touch (`use touch`), a surface of its own, a key derived from the device's ira, its own vault domain, randomness, the GPS fix (`use gps`), the network (`use udp`), sound out (`use audio`, docs/AUDIO.md; 2026-11-11, appended so every code before it keeps its meaning), the cameras (`use camera`, docs/CAMERA.md: frames from the camera driver, asked; 2026-11-12 for Lumis, appended the same way), be you and the person's people (`use facets`, the identity service's endpoint, docs/FACETS.md "Be you" and "People": a binding of the kist's alias to the person's identity, and their people, all or chosen; 2026-11-13, appended the same way), Bluetooth (`use bt`, docs/BT.md "The client ops": scans, connections and credit-based channels as an LE central; 2026-11-24 for Lumis's accessories, appended the same way).
-pub const RIGHTS: [&str; 15] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio", "camera", "be_you", "people", "puck", "items", "bluetooth"];
+/// The rights, by code (the index): the screen (`use display`), touch (`use touch`), a surface of its own, a key derived from the device's ira, its own vault domain, randomness, the GPS fix (`use gps`), the network (`use udp`), sound out (`use audio`, docs/AUDIO.md; 2026-11-11, appended so every code before it keeps its meaning), the cameras (`use camera`, docs/CAMERA.md: frames from the camera driver, asked; 2026-11-12 for Lumis, appended the same way), be you and the person's people (`use facets`, the identity service's endpoint, docs/FACETS.md "Be you" and "People": a binding of the kist's alias to the person's identity, and their people, all or chosen; 2026-11-13, appended the same way), Bluetooth (`use bt`, docs/BT.md "The client ops": scans, connections and credit-based channels as an LE central; 2026-11-24 for Lumis's accessories, appended the same way), the microphones (`use mic`, the audio service's second endpoint, docs/AUDIO.md "The mic right": the microphone mailbox and the capture ops, asked, and a privacy indicator while held; the owner, 2026-11-26: "mic will need wired up with a permission grant and an indication when being used", appended the same way).
+pub const RIGHTS: [&str; 16] = ["display", "touch", "surface", "ira", "domain", "entropy", "gps", "udp", "audio", "camera", "be_you", "people", "puck", "items", "bluetooth", "mic"];
 /// What each right is, in a person's words, for the settings pages and the first-launch question.
-pub const MEANS: [&str; 15] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound", "the cameras", "be you", "your people", "a circle on the deck", "your things", "Bluetooth"];
+pub const MEANS: [&str; 16] = ["the screen", "touch", "a window of its own", "a key of this device", "its own storage", "randomness", "where you are", "the network", "sound", "the cameras", "be you", "your people", "a circle on the deck", "your things", "Bluetooth", "the microphones"];
 /// A want the person said no to: an empty slot in the launch (process.rs `Object::Empty`).
 pub const EMPTY: u8 = 0xFF;
 /// Be you (docs/FACETS.md "Be you"): its code in [`RIGHTS`].
@@ -50,6 +50,41 @@ pub const SURFACE: u8 = 2;
 pub const ITEMS: u8 = 13;
 /// Bluetooth (KISTS.md, the asked rights; docs/BT.md "The client ops", 2026-11-24): a send right on the Bluetooth driver's `bt` endpoint, so the kist scans, connects to devices near the person and opens credit-based channels to them as an LE central, from the device's static random address. The driver refuses a kist its own ops (the pairing beacon and the pairing scan). Asked once, as every right outside the implicit set; appended, so every code before it keeps its meaning.
 pub const BLUETOOTH: u8 = 14;
+/// GPS, where you are: its code in [`RIGHTS`].
+pub const GPS: u8 = 6;
+/// The cameras: their code in [`RIGHTS`].
+pub const CAMERA: u8 = 9;
+
+/// The privacy indicators (the owner, 2026-11-26; docs/KERNEL.md "Rights in use"), by their bit in the kernel's fact 90: the beads round the camera hole and the quick row's permissions circle. ferros_sys::uses decodes the word by the same numbers.
+pub mod indicator {
+    /// A camera open: the disc behind the hole.
+    pub const CAMERA: u32 = 0;
+    pub const MIC: u32 = 1;
+    /// Fine location (GPS).
+    pub const LOCATION: u32 = 2;
+    /// Nearby scanning (Bluetooth's scans; WiFi's and UWB's when a kist may ask for them).
+    pub const NEARBY: u32 = 3;
+    /// Motion (the accelerometer, gyroscope, magnetometers and barometer), once motion is an asked right.
+    pub const MOTION: u32 = 4;
+    /// A kist seeing the screen, once that is a right.
+    pub const SCREEN: u32 = 5;
+    /// How many there are.
+    pub const COUNT: u32 = 6;
+
+    /// The indicator a use of right `right` lights, if any: a Bluetooth use is one only while it scans (the kernel marks no other).
+    pub fn of_right(right: u8) -> Option<u32> {
+        match right {
+            super::CAMERA => Some(CAMERA),
+            super::MIC => Some(MIC),
+            super::GPS => Some(LOCATION),
+            super::BLUETOOTH => Some(NEARBY),
+            _ => None,
+        }
+    }
+}
+
+/// The microphones (2026-11-26): a send right on the audio service's `mic` endpoint, the proof that opens the microphone mailbox and the only door to the capture ops; asked, never implicit, as `audio` (sound out) is. The kernel marks it in use for as long as the kist holds the mailbox's view (docs/KERNEL.md "Rights in use").
+pub const MIC: u8 = 15;
 
 /// A capsule's `items` section (STORE.md "Kinds, and the question asked"): each kind it makes and each it opens, with the developer's reason, signed with the rest of the capsule. A field `make` or `open` per kind: the kind (an idea, `hi`) and its reason (`a`), told apart by their types.
 #[derive(Clone, PartialEq, Debug, Default)]

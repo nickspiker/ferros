@@ -504,6 +504,26 @@ Why: a call per reader (a held WATCH, a FIX asked at each ring) caps the readers
 **The cost**: a frame (2 MiB) per mailbox in use; a publish is the stores and one syscall, whose wake scans the threads once (as every SYS_WAKE); a reader's wait is SYS_WAIT. Measured on the Pro (b1005, this kernel RAM-reloaded, payloads/mbtest): a writer at 2^7 a second, 1024 publishes of 64 words. With one reader each publish cost the writer 12.6 us on average (93 us at most) and the reader woke 19 us after the publish on average (105 us at most). With 64 readers (four processes of 16 threads) every wake made all 64 runnable, the publish cost 122 us on average (208 us at most: the wake's enqueue, about 1.7 us a reader, the writer's only per-reader cost), the readers woke 184 to 461 us late on average per process (1.5 ms at most; most between 128 us and 1 ms, the A715s queueing 64 threads), none skipped a publish, none read a torn one; each saw the writer's end as dead. The motion mailbox (gravity, the field, the accelerometer, some 300 publishes a second) under 64 readers: 1024 reads each, 0 torn, 10 to 14 looks a process caught a publish under way and read again, woke 176 to 345 us late on average; readers that slept thru a publish read the next (latest-value semantics).
 **Not built**: a "someone waits" word the writer reads to skip the wake when nobody waits (a Dekker pair of fences on both sides); a ring layout for streams (the microphones': SENSORS.md "The microphones").
 
+### Rights in use (2026-11-26, built, not yet run on a device)
+
+The owner, on the privacy indicators: camera, microphone and location lit beside the camera hole, "be classy about it", and "easily see what is holding the permission open".
+The indicators are drawn from what the kernel sees, never from what a kist says it does.
+
+- **One table.** The claims (`CLAIMS`, SYS_CLAIM: GPS's, a process's own word, proved) and the kernel's own marks share it; a mark is `by_kernel`, with the Eagle time it began.
+- **The marks**, each read off a call the kernel already handles:
+  - a camera OPEN on `camera` marks the cameras until the caller's CLOSE, its end, or the camera driver's end (an OPEN the driver refused ends with the driver or the caller); a PROBE powers a module for a moment and is logged;
+  - opening the microphone mailbox's view marks the microphones until the view is given back (SYS_MAILBOX op 1) or the holder ends;
+  - a Bluetooth OP_SCAN on `bt` marks nearby scanning until its OP_SCAN_STOP or OP_CLOSE, the caller's end or the Bluetooth driver's;
+  - a call on `gps` by a kist holding no GPS claim of its own is logged, so reading a fix that another's claim keeps flowing shows too.
+- **A kist cannot turn its own indicator off**: SYS_CLAIM op 1 releases only a claim the process made.
+- **The log**: a use that ends is kept under its (right, kist), the first start and the last end, so it is as long as the distinct uses since the person last looked and no longer; SYS_CLAIM op 7 (Settings, the permissions page shown) clears it, never a timer.
+- **Fact 90** (`USES`, ferros_sys::uses): bits 0-7 an indicator lit now (camera, microphones, fine location, nearby, motion, screen; ferros_kist::indicator maps a right to its bit), bits 8-15 one used since the person last looked and not lit now, a change count above.
+- **For Settings**: SYS_CLAIM op 5 every right in use (who, since when), op 6 the log, newest first, op 7 seen; the claims' doorbell (op 4) rings at every change.
+- **The microphones' right** (ferros_kist `mic`, asked): a send right on the audio service's `mic` endpoint, served beside `audio` (`served_by`: a call on `mic` starts the audio service on demand), the proof that opens the microphone mailbox and the only door to the capture ops (docs/AUDIO.md "The mic right").
+
+**Not marked yet**: motion and screen (no right exists for either; their bits stay dark); WiFi scans (no kist may ask for one).
+A refused camera OPEN by a second caller stays marked until that caller closes or ends: the light is right (the camera is in use), the list may name one too many.
+
 ### Shared regions (2026-11-24, built, not yet run on a device)
 
 The owner, on waves and beams: "q removal. Less q's the better and smaller the buckets without getting stupid", "Like I want this creepy fast".

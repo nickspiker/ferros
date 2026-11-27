@@ -12,6 +12,8 @@ use ferros_sys::audio;
 
 /// Grant slot 12: send on `audio`, the kernel's, the slot after the torch's (process.rs, since 2026-11-22). A kernel from before leaves it empty, and the page says the kernel needs updating.
 pub const S_AUDIO: u64 = 12;
+/// Grant slot 13: send on `mic`, the kernel's, the slot after the audio service's (process.rs, since 2026-11-26): the microphones behind the mic right, where the capture ops moved; the meter and the test recording call it. A kernel from before leaves it empty, and the calls fail as with no microphones.
+pub const S_MIC: u64 = 13;
 
 /// Whether this map was handed `audio`: its grants page counts 13 slots or more (the console, init's ten, the kernel's torch and audio after them).
 pub fn granted(grants: u64) -> bool {
@@ -305,7 +307,7 @@ pub extern "C" fn worker(grants: u64) -> ! {
                 (Rec::NoRight, 0)
             } else {
                 let mut r = [0u8; 4 + audio::REPORT];
-                let got = call(audio_cap, &[audio::RECORD, (w >> 8) as u8 & 3, w as u8], &mut r);
+                let got = call(cap(grants, S_MIC), &[audio::RECORD, (w >> 8) as u8 & 3, w as u8], &mut r);
                 if got == ferros_sys::ERR || got == 0 {
                     (Rec::NoAnswer, 0)
                 } else {
@@ -325,7 +327,7 @@ pub extern "C" fn worker(grants: u64) -> ! {
 
 /// The meter, on a thread of its own: asleep while nobody listens; listening, `MIC_LEVELS` called again as soon as it answers (the service holds each call until the microphones have sent the next 80 ms), the peaks published. A call that fails ends the listening (`pass` unchecks it); nothing is asked again on a timer.
 pub extern "C" fn meter(grants: u64) -> ! {
-    let audio_cap = cap(grants, S_AUDIO);
+    let mic_cap = cap(grants, S_MIC);
     loop {
         let w = LISTEN.load(Ordering::Acquire);
         if w == 0 || !granted(grants) {
@@ -339,7 +341,7 @@ pub extern "C" fn meter(grants: u64) -> ! {
             continue;
         }
         let mut r = [0u8; 1 + 2 * audio::MICS + 8];
-        let got = call(audio_cap, &[audio::MIC_LEVELS], &mut r);
+        let got = call(mic_cap, &[audio::MIC_LEVELS], &mut r);
         // The listening stopped (or started again) while the call was held: this answer is not that showing's.
         if LISTEN.load(Ordering::Acquire) != w {
             continue;

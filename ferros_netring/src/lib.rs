@@ -14,6 +14,7 @@
 use core::sync::atomic::{fence, Ordering};
 
 /// The run's first word, written by ip when it lays the run out: "fnetrng" and the layout's version, 0.
+/// The version byte moves on ANY change to the layout or the waiting words (offsets, a word added or split, what a word means): an application that restates this crate (Photon's ferros_net, 2026-11-26) opens a ring only when the word is exactly the version it was written for, so a stale copy refuses cleanly instead of misreading the run. Version 0 is the layout as of 050846ea (W_APP_WAITS the reader's alone).
 pub const MAGIC: u64 = u64::from_le_bytes(*b"fnetrng\x00");
 
 /// The header's bytes, before the send ring: four cache lines, each side's words on a line of its own so neither side's stores take the other's line.

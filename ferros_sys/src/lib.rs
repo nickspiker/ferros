@@ -1453,9 +1453,62 @@ pub mod claim {
         let n = svc(nr::CLAIM, 3, 3 | (seen as u64) << 8, settings, off(r.as_mut_ptr()), r.len() as u64);
         (n == 4).then(|| u32::from_le_bytes(r))
     }
-    /// The claims' doorbell (kernel op 4), given Settings: the kernel writes GPS's claims (`FACT`'s word: the count, and a change count above bit 16) into `word` now and whenever they change, waking whatever waits on it (`wait_world`). False without the capability.
+    /// Bluetooth's code in ferros_kist::RIGHTS: the kernel marks it in use while the holder scans (its OP_SCAN to its OP_SCAN_STOP or OP_CLOSE), the nearby indicator.
+    pub const BLUETOOTH: u64 = 14;
+    /// The cameras' code: in use from the holder's OPEN on `camera` to its CLOSE, or the camera driver's end.
+    pub const CAMERA: u64 = 9;
+    /// The microphones' code: in use while the holder holds the microphone mailbox's view.
+    pub const MIC: u64 = 15;
+    /// A record of `live` (kernel op 5): the right's code, the kind (0 a system process, 1 a kist), the kist's capsule address (zeros for a system process), and the Eagle time (oscillations) it began, i64 LE.
+    pub const LIVE_REC: usize = 42;
+    /// A record of `log` (kernel op 6): as `LIVE_REC`, then the Eagle time it ended, i64 LE.
+    pub const LOG_REC: usize = 50;
+
+    /// Every right in use now and who holds it, given Settings: records of `LIVE_REC` bytes into `buf` (whole ones, as many as fit), and how many there are; None without the capability. The kernel's own marks (the cameras, the microphones, Bluetooth's scans) and the claims (GPS) alike.
+    pub fn live(settings: u64, buf: &mut [u8]) -> Option<usize> {
+        let r = svc(nr::CLAIM, 5, 0, settings, off(buf.as_mut_ptr()), buf.len() as u64);
+        (r != ERR).then_some(r as usize)
+    }
+    /// The uses that ended, newest first, given Settings: records of `LOG_REC` bytes into `buf` (whole ones, as many as fit), and how many the kernel keeps; None without the capability. A GPS fix read by a kist holding no claim of its own is logged too, its end its start.
+    pub fn log(settings: u64, buf: &mut [u8]) -> Option<usize> {
+        let r = svc(nr::CLAIM, 6, 0, settings, off(buf.as_mut_ptr()), buf.len() as u64);
+        (r != ERR).then_some(r as usize)
+    }
+    /// The person has seen the uses (the permissions page shown), given Settings: the "used since you last looked" bits of fact 90 clear, never on a timer. False without the capability.
+    pub fn seen(settings: u64) -> bool {
+        svc(nr::CLAIM, 7, 0, settings, 0, 0) == 0
+    }
+    /// The claims' doorbell (kernel op 4), given Settings: the kernel writes GPS's claims (`FACT`'s word: the count, and a change count above bit 16) into `word` now and whenever they change, waking whatever waitson it (`wait_world`). False without the capability.
     pub fn doorbell(settings: u64, word: &core::sync::atomic::AtomicU64) -> bool {
         svc(nr::CLAIM, 4, off(word as *const _ as *const u8), settings, 0, 0) == 0
+    }
+}
+
+/// The rights in use as the privacy indicators show them (fact 90, the kernel's uses table, docs/KERNEL.md "Rights in use"; the owner, 2026-11-26): bits 0-7 an indicator lit now, bits 8-15 one used since the person last looked and not lit now, bits 16 and up a count of every change.
+/// Written by the kernel alone, from what it sees: a kist never says what it uses.
+pub mod uses {
+    /// The fact's number.
+    pub const FACT: usize = 90;
+    /// The indicators, by bit, the numbers of ferros_kist::indicator (which maps a right to its bit for the kernel): a camera open (the disc behind the hole), the microphones, fine location (GPS), nearby scanning (Bluetooth), motion and screen (each kept for its right, none marked yet).
+    pub const CAMERA: u32 = 0;
+    pub const MIC: u32 = 1;
+    pub const LOCATION: u32 = 2;
+    pub const NEARBY: u32 = 3;
+    pub const MOTION: u32 = 4;
+    pub const SCREEN: u32 = 5;
+    /// How many indicators there are.
+    pub const COUNT: u32 = 6;
+    /// The indicators lit now, a bit each.
+    pub fn live(word: u64) -> u8 {
+        word as u8
+    }
+    /// The indicators used since the person last looked and not lit now, a bit each.
+    pub fn missed(word: u64) -> u8 {
+        (word >> 8) as u8
+    }
+    /// A count of every change, so a reader knows the set moved without comparing it.
+    pub fn changes(word: u64) -> u64 {
+        word >> 16
     }
 }
 
@@ -1522,6 +1575,12 @@ pub mod mailbox {
 
     /// SYS_MAILBOX's op: open a view with a proof.
     const OPEN: u64 = 0;
+    const CLOSE: u64 = 1;
+
+    /// Give back mailbox `id`'s view opened with `open` (2026-11-26): the capability and its handle gone, so a masked reader reads it no more, and for the microphones the kernel's in-use mark with it (the privacy indicator goes dark when the view does, never on the reader's word). Nothing when this process holds no view of it.
+    pub fn close(id: usize) {
+        svc(nr::MAILBOX, CLOSE, id as u64, 0, 0, 0);
+    }
 
     /// The mailbox's words at `base` (its region's address, from SYS_DMA or the open).
     fn words(base: u64) -> &'static [AtomicU64] {
@@ -1826,7 +1885,7 @@ pub fn pet() {
 }
 
 /// The device's plain facts, for its dashboard (kernel SYS_FACTS); `None` where a fact is not known.
-pub struct Facts(pub [u64; 90]);
+pub struct Facts(pub [u64; 91]);
 
 /// The bootloader's lock state (`Facts::boot_lock`; FLASHER.md step 7: re-locking ends setup, leaving it unlocked is the person's known choice).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2279,8 +2338,8 @@ pub fn light(buf: &mut [i32]) -> (u64, u32, u32, usize) {
 
 /// Read the facts now.
 pub fn facts() -> Facts {
-    // Unknown (all ones) where a kernel from before writes fewer facts than this build reads (88 before 2026-11-17).
-    let mut b = [0xFFu8; 720];
+    // Unknown (all ones) where a kernel from before writes fewer facts than this build reads (88 before 2026-11-17, 90 before 2026-11-26).
+    let mut b = [0xFFu8; 728];
     // Thru a mutable pointer: the kernel writes the buffer, and an immutable one may be read as the constant it was made.
     svc(nr::FACTS, off(b.as_mut_ptr()), b.len() as u64, 0, 0, 0);
     Facts(core::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())))

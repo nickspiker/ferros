@@ -131,6 +131,17 @@ husky has three built-in microphones, ids 0, 1 and 2 (mixer_paths.xml:750-753; t
 
 The protocol (ferros_sys `audio`): `MIC_LEVELS`, held until the next 80 ms of samples (eight periods) have come in, then each microphone's peak; `RECORD` + microphone + level, held while 2^17 frames (2.7 s) of that microphone are captured into the service's memory, then played back once on both speakers, scaled so the recording's loudest sample comes out at the level (never louder than the speaker test can be). The recording is never written anywhere and is gone with the process. A capture nobody asks for again within 64 periods (640 ms) is stopped, and the process ends once nothing else holds it.
 
+### The mic right (2026-11-26, built, not yet run on a device)
+
+The owner: "mic will need wired up with a permission grant and an indication when being used".
+Until this, `MIC_LEVELS` and `RECORD` answered any caller of `audio`, which every kist holds, so any kist could start the microphones.
+
+- **`mic`**, the service's second endpoint (grant slot 13; slot 14 the microphone mailbox's writer region; a hand spawn's sweep dump moved to 15): the capture ops are served on it alone, by a thread of its own (`mic_server`), and `audio` refuses them.
+- **Who holds it**: a kist the person granted the microphones (ferros_kist `mic`, asked, never implicit), and Settings (the Developer page's meter and test recording, map devtest.rs slot 13).
+- **The indicator**: the kernel marks the microphones in use while a process holds the microphone mailbox's view (docs/KERNEL.md "Rights in use").
+- **Idle**: either receiving thread ends an idle service; a call taken and not yet acted on keeps it (`receiving`).
+- **Not built yet**: the capture published into the microphone mailbox for the holders of its view (Photon's waves, photon docs/ferros-media.md step 2).
+
 ## The rings' windows (measured on the Pro 2026-11-22; approved that night by the coordinator for the owner)
 
 The first PROBE on the Pro (forge 516d7559, kernel 07f922ca) found both audio rings past the 2 MiB `aoc-ipc` window the kernel grants (G#95C0_0000 to G#95E0_0000), as "Verification" below foresaw. The service's dump of their headers, offsets from the IPC block's start (G#95C0_0000):

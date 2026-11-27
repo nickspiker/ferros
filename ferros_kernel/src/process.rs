@@ -2079,9 +2079,14 @@ fn endpoint(name: &[u8]) -> usize {
     if let Some(i) = kk.endpoints.iter().position(|e| e.name == name) {
         return i;
     }
-    let on_demand = ON_DEMAND.iter().position(|n| *n == name).map_or(0, |i| i as u8 + 1);
+    let on_demand = ON_DEMAND.iter().position(|n| *n == served_by(name)).map_or(0, |i| i as u8 + 1);
     kk.endpoints.push(Endpoint { name: name.to_vec(), queue: alloc::collections::VecDeque::new(), poller: None, server: 0, on_demand });
     kk.endpoints.len() - 1
+}
+
+/// The process that serves endpoint `name`: its own name, but for an endpoint a server keeps beside its first, which a call starts that server for (the audio service's `mic`, 2026-11-26: the microphones behind a right of their own, `audio` being every kist's).
+fn served_by(name: &[u8]) -> &[u8] {
+    if name == b"mic" { b"audio" } else { name }
 }
 
 /// Endpoints whose server the kernel starts when a call finds none (docs/TORCH.md "Who starts it"; owner, 2026-11-11: the quick settings' torch). init's grants page is full, and a server that runs only while its device is in use holds no arc the rest of the time: the torch process ends itself once the LED is dark and nothing waits. Each name is a process the service loop knows how to start (service.rs `shell_grants`); its index is its bit in `ON_DEMAND_WANT`. The audio service the same way (docs/AUDIO.md, 2026-11-11): started by a kist's first call on `audio`, ended by itself once every stream has played out.
@@ -2107,17 +2112,22 @@ pub fn on_demand_take() -> u32 {
 /// An on-demand server that could not be started (no capsule in the vault, no arc free): every call waiting on its endpoint gets ERR now rather than waiting for a server that is not coming. How many were answered. Under the kernel lock.
 pub fn on_demand_refuse_locked(name: &[u8]) -> usize {
     let kk = k();
-    let Some(ep) = kk.endpoints.iter().position(|e| e.name == name) else { return 0 };
-    let queued: Vec<usize> = kk.endpoints[ep].queue.iter().map(|q| q.0).filter(|&c| c != KERNEL_CALLER).collect();
-    for &caller in queued.iter() {
-        if let Some(ct) = th(caller) {
-            ct.frame.x[0] = ERR;
-            ct.state = State::Runnable;
-            enqueue_back(caller);
+    let mut n = 0;
+    // Every endpoint the server serves (`served_by`): the audio service not coming answers the calls on `mic` too.
+    let served: Vec<usize> = (0..kk.endpoints.len()).filter(|&e| served_by(&kk.endpoints[e].name) == name).collect();
+    for ep in served {
+        let queued: Vec<usize> = kk.endpoints[ep].queue.iter().map(|q| q.0).filter(|&c| c != KERNEL_CALLER).collect();
+        for &caller in queued.iter() {
+            if let Some(ct) = th(caller) {
+                ct.frame.x[0] = ERR;
+                ct.state = State::Runnable;
+                enqueue_back(caller);
+            }
         }
+        kk.endpoints[ep].queue.retain(|q| q.0 == KERNEL_CALLER);
+        n += queued.len();
     }
-    kk.endpoints[ep].queue.retain(|q| q.0 == KERNEL_CALLER);
-    queued.len()
+    n
 }
 
 /// The system processes the kernel starts again at their death by a panic or a fault (owner, 2026-11-21, after the deck panicked on the Pro and the device sat frozen with nothing to answer a touch: "keyboard, speaker, whatever you think needs to be on the restart list"; docs/KERNEL.md "Restarts"). Each a name service.rs `shell_grants` knows; its index is its bit in `KEPT_WANT`, and the order is the order the service loop starts them when several died at once: the display before the deck (the deck hands a fresh display its scene), the identity service before the deck, init last (it starts only what is missing).
@@ -2274,7 +2284,7 @@ const SYS_SET_PREF: u64 = 11;
 const PREF_LIVE: u64 = 1 << 8;
 /// The device's plain facts for its dashboard (SHELL.md: the device circle's front): x0/x1 a buffer in the caller's arc and its length; up to FACT_COUNT u64 words, little-endian, `FACT_UNKNOWN` where a fact is not known. No capability: these are what the device shows whoever holds it, and none is a key, a handle or a serial. Returns the bytes written.
 const SYS_FACTS: u64 = 12;
-pub const FACT_COUNT: usize = 90;
+pub const FACT_COUNT: usize = 91;
 pub const FACT_UNKNOWN: u64 = u64::MAX;
 /// A scope of the device vault: x0 the Store capability's token offset, x1 the operation (bit 0: 0 get, 1 set) with the buffer's length in bits 8 and up, x2/x3 the key's offset and length (relative to the scope's prefix, at most 64 bytes of printable ASCII), x4 the buffer. A get copies at most the buffer's length and returns the value's whole length, NOTHING if the key is absent; a set stores the buffer (at most STORE_MAX) and returns 0. ERR otherwise.
 const SYS_STORE: u64 = 13;
@@ -2324,7 +2334,7 @@ const SYS_DETAIL: u64 = 34;
 const SYS_ZONE: u64 = 35;
 /// lang(op, …): the language the shell speaks (lang.rs, SETTINGS.md), a packed ISO 639-3 code (vsf `wl`'s letters; 0 none, English). Op 0, Settings at x1: this device's own language, x2 the code. Op 1, Settings at x1: x2 1 this device keeps its own, 0 it follows the identity's. Op 2, the identity service (by its name, fgtw, as SYS_ZONE op 4): the identity's language, x1 the code (0: it has none). Each keeps the settings document, put back as it was when the vault refuses. The state is read from the preferences block (PREF_LANG…), not here. → 0 or ERR.
 const SYS_LANG: u64 = 36;
-/// claim(op, …): the rights in use (`CLAIMS`; owner, 2026-11-10: GPS "stays green but no visuals for satellites since we're not rx'ing ... until something like mahere calls it or I open the GPS screen ... or Photon a friend pings for my location", and "we need to be able to see what kists are using each permission"). A right by its code (ferros_kist::RIGHTS); only GPS is claimed today. Op 0: claim x1 the right, x2 the token offset of what proves the caller may use it (for GPS: Settings, the settings page's, the `gps` endpoint's send right, a kist's granted want, or a GPS mailbox view) → 0 (also when it held one already), ERR refused (no such right or proof, nobody present, GPS switched off). Op 1: release x1 the right → 0. Op 2: who claims x1 the right, x2 the Settings token, x3/x4 a buffer and its length → how many claims (all of them; records past the buffer are not written), each `CLAIM_REC` bytes: 0 a system process or 1 a kist, then the kist's capsule address (32 bytes, zeros for a system process); ERR without Settings. Op 3: the GPS driver asked thru the kernel for a Settings holder that holds a GPS claim (the map's page: init's grants page has no slot left for its own `use gps`): x1 the driver's op (0 FIX, 2 SATS, payloads/gps), x2 the Settings token, x3/x4 the reply's buffer and its length with CALL_LIVE set, the call the caller's own as SYS_CALL makes it → the reply's length, ERR at once when no driver is receiving yet; or x1 = 3 | the change count last seen << 8, the driver's WATCH, its length bare (no CALL_LIVE): held until the driver's fixes or fix messages move, taken by a driver that starts later, → 4 bytes, the count now. The position passes thru, never kept. Op 4: the claims' doorbell, x1 a word in the caller's arc, x2 the Settings token: GPS_CLAIMS written there now and at every change, its waiters woken → 0.
+/// claim(op, …): the rights in use (`CLAIMS`; owner, 2026-11-10: GPS "stays green but no visuals for satellites since we're not rx'ing ... until something like mahere calls it or I open the GPS screen ... or Photon a friend pings for my location", and "we need to be able to see what kists are using each permission"). A right by its code (ferros_kist::RIGHTS); only GPS is claimed today. Op 0: claim x1 the right, x2 the token offset of what proves the caller may use it (for GPS: Settings, the settings page's, the `gps` endpoint's send right, a kist's granted want, or a GPS mailbox view) → 0 (also when it held one already), ERR refused (no such right or proof, nobody present, GPS switched off). Op 1: release x1 the right → 0. Op 2: who claims x1 the right, x2 the Settings token, x3/x4 a buffer and its length → how many claims (all of them; records past the buffer are not written), each `CLAIM_REC` bytes: 0 a system process or 1 a kist, then the kist's capsule address (32 bytes, zeros for a system process); ERR without Settings. Op 3: the GPS driver asked thru the kernel for a Settings holder that holds a GPS claim (the map's page: init's grants page has no slot left for its own `use gps`): x1 the driver's op (0 FIX, 2 SATS, payloads/gps), x2 the Settings token, x3/x4 the reply's buffer and its length with CALL_LIVE set, the call the caller's own as SYS_CALL makes it → the reply's length, ERR at once when no driver is receiving yet; or x1 = 3 | the change count last seen << 8, the driver's WATCH, its length bare (no CALL_LIVE): held until the driver's fixes or fix messages move, taken by a driver that starts later, → 4 bytes, the count now. The position passes thru, never kept. Op 4: the claims' doorbell, x1 a word in the caller's arc, x2 the Settings token: GPS_CLAIMS written there now and at every change, its waiters woken → 0. Beside the claims the kernel keeps marks of its own (2026-11-26, the privacy indicators, docs/KERNEL.md "Rights in use"): a camera OPEN to its CLOSE, a microphone mailbox view held, a Bluetooth scan, each ended by what it marks or the holder's or the driver's end, never by op 1. Op 5: every right in use, x2 the Settings token, x3/x4 a buffer → how many, each `LIVE_REC` bytes (the right, the kind, the capsule, the Eagle time it began). Op 6: the uses that ended since the person last looked, newest first, the same arguments → how many, each `LOG_REC` bytes (op 5's and the last end). Op 7: the person looked, x2 the Settings token: the log cleared → 0.
 const SYS_CLAIM: u64 = 37;
 /// bell(source, word): a doorbell on what the settings pages show (owner, 2026-11-10: "Needs a doorbell on the driver's fix counter, for sure. 1s poll can desync too, that needs fixd."). x0 the source: 0-5 a link in the facts' order (its eight measures, its tracks and its detail document: counted when its driver sets one to a value other than the one it held, and when the driver ends and they empty), `BELL_FACTS` the device's facts a settings page shows (`bell_facts`). `BELL_SURFACES` (9), for the holder of the `surfaces` region alone (the display server): the windows' owners in their old form, the word not a count but slots 0 to 3's live generations, byte k slot k's (its preference byte 8 + k while the process it was given to is alive, 0 otherwise) and a change count above bit 32 (`surfaces_ring`; 2026-11-11, Mahere killed from outside and its window kept the glass); kept for a display from before 2026-11-12. `BELL_SLOTS` (12), for the same holder: every slot's, bits 4k to 4k + 3 slot k's generation (1 to 15) while its owner lives, no count. `BELL_IDENTITY` (13, 2026-11-17), for anyone: the identity's lock epoch (`LOCK_EPOCH`), no count. x1 a word in the caller's arc, 8-aligned as SYS_WAIT takes one: the kernel writes the source's change count there now and at every change, waking whatever of the process waits on it (`bell_ring`). One word a source a process; a second registration moves it. No capability: the measures, tracks and facts are what SYS_FACTS and SYS_TRACKS give anyone, and a detail's count says when it changed, never what it says. → 0, ERR for no such source (or the surfaces' or the slots' without the region).
 const SYS_BELL: u64 = 38;
@@ -2346,6 +2356,7 @@ const SYS_IRQ_ARM: u64 = 45;
 /// panic(message, length, file, length, line | column << 32): the calling process is panicking (ferros_sys `panic_tell`, from a payload's panic handler or std's hook thru ferros_rt). The kernel keeps the message's first 2^9 bytes and the file's first 2^8 (UTF-8, as the compiler and the panic made them), the line and column, the calling thread's name and the call chain from this call (`frames`), and the process's end carries them to the flash log, the console and the glass (`death_line`). It does not end the process: the exit that follows does. A second report replaces the first. No capability: a process tells only of itself. → 0. A kernel from before answers ERR, and the exit says what it always said.
 const SYS_PANIC: u64 = 46;
 /// mailbox(op, …) (2026-11-19, docs/KERNEL.md "Mailboxes"; owner: "a capability based public read only mailbox so you could have an unlimited number of items accessing it"). Op 0, open: x1 the mailbox (ferros_mailbox `GPS`, `MOTION`, ...), x2 the token offset of the proof (`mbox_open`), x3 an arc offset for the view's token (32 bytes) → the view's base, or ERR.
+/// Op 1, close (2026-11-26): x1 the mailbox, its view given back (`mbox_close`) → 0, nothing held is 0 too; the microphones' view closed is the microphones no longer in use (docs/KERNEL.md "Rights in use").
 /// Everything else is a syscall that was there: SYS_DMA on a mailbox's region maps it (the writer's making the caller its writer), SYS_WAIT on its sequence word waits for a publish, and SYS_WAKE on it by the writer wakes every reader waiting.
 const SYS_MAILBOX: u64 = 47;
 /// base(op, …): the number base the device draws in (base.rs, SETTINGS.md "The number base"; 2026-11-22, as SYS_LANG the language), tatau's code (10 arabic, 12 DMS, 16 hex, G#8C DLS). Op 0, Settings at x1: this device's own base, x2 the code. Op 1, Settings at x1: x2 1 this device keeps its own, 0 it follows the identity's. Op 2, the identity service (by its name, fgtw, as SYS_LANG op 2): the identity's base, x1 the code (0: it has none). Op 3, no capability (the base is what every screen shows whoever holds the device): `base::word`, the base in effect, this device's, the identity's and whether it keeps its own, a byte each. Ops 0-2 keep the settings document, put back as it was when the vault refuses. The base in effect is also preference 0 (PREF_BASE), which every process reads. A Settings holder's SYS_SET_PREF of preference 0 is op 0. → 0 or ERR, op 3 the word.
@@ -2380,6 +2391,10 @@ pub const ARC_WHY_OP: u64 = 6;
 pub const ARC_WHY_PAGE: u64 = 7;
 /// A record of SYS_CLAIM op 2: the kind, then a capsule address.
 pub const CLAIM_REC: usize = 33;
+/// A record of SYS_CLAIM op 5: the right's code, the kind, the capsule address, the Eagle time it began (ferros_sys::claim::LIVE_REC).
+const LIVE_REC: usize = 42;
+/// A record of SYS_CLAIM op 6: op 5's, then the Eagle time it last ended (ferros_sys::claim::LOG_REC).
+const LOG_REC: usize = 50;
 /// Each link's control block: words 1 to CONTROLS - 1 (word 0 is the generation, `CONTROL_GEN`), all ones until set.
 pub const CONTROLS: usize = 1 << 4;
 /// The links with a control block: the six of the facts, the clock and the battery.
@@ -3278,6 +3293,13 @@ fn mbox_open(p: &mut Process, id: u64, proof: u64, out: u64) -> u64 {
         ferros_mailbox::FRAME => true,
         // The IR thermometer (owner, 2026-11-20: open, no permission necessary, an implicit right as the display or the GPU).
         ferros_mailbox::THERMO => true,
+        // The microphones (2026-11-26, the mic right): Settings, the `mic` endpoint's send right (a kist the person granted the microphones), or a view of it already held.
+        ferros_mailbox::MIC => match held(proof) {
+            Some(Object::Settings) => true,
+            Some(Object::Endpoint(e)) => k().endpoints[e].name == b"mic",
+            Some(Object::Dma(i)) => DMA[i].name == ferros_mailbox::VIEW_NAMES[ferros_mailbox::MIC],
+            _ => false,
+        },
         _ => false,
     };
     if !proved {
@@ -3311,7 +3333,39 @@ fn mbox_open(p: &mut Process, id: u64, proof: u64, out: u64) -> u64 {
         }
     };
     p.write(out, &token);
+    // Holding the microphones' view is using the microphones: marked from the open until the view is given back (`mbox_close`) or the holder ends, the privacy indicator lit all that while.
+    if n == ferros_mailbox::MIC {
+        use_begin(p, ferros_kist::MIC);
+    }
     base
+}
+
+/// SYS_MAILBOX op 1 (2026-11-26): mailbox `id`'s view given back by the process that opened it: its handle in the grants page's table zeroed, so masked code reaches the region no more, and the capability gone; for the microphones the kernel's in-use mark with it. Nothing when the process holds no view of it.
+/// Native code shares one translation table and reads a view by its address without the capability (docs/CAMERA.md), which is why production refuses native kists; the handle is what a masked kist's reads go thru.
+fn mbox_close(p: &mut Process, id: u64) -> u64 {
+    // WHY the bound: the number is the caller's, an index into the mailboxes.
+    if id >= MBOXES as u64 {
+        return ERR;
+    }
+    let n = id as usize;
+    let vi = mbox0() + MBOXES + n;
+    if !p.cspace.iter().any(|c| c.object == Object::Dma(vi)) {
+        return 0;
+    }
+    let (b, m) = handle_of(Object::Dma(vi));
+    // SAFETY: the grants page is the arc's first page, the kernel's to read at its own address; the pairs are words the kernel wrote.
+    let slot = (0..(TOKENS - HANDLES) / 16).find(|&s| unsafe { core::ptr::read_volatile((p.arc.base + HANDLES + 16 * s) as *const u64) == b && core::ptr::read_volatile((p.arc.base + HANDLES + 16 * s + 8) as *const u64) == m });
+    if let Some(s) = slot {
+        crate::cachemap::grants_page(p.arc.base, true);
+        p.write_grants((HANDLES + 16 * s) as u64, &0u64.to_le_bytes());
+        p.write_grants((HANDLES + 16 * s + 8) as u64, &0u64.to_le_bytes());
+        crate::cachemap::grants_page(p.arc.base, false);
+    }
+    p.cspace.retain(|c| c.object != Object::Dma(vi));
+    if n == ferros_mailbox::MIC {
+        use_end(p.epoch, ferros_kist::MIC);
+    }
+    0
 }
 
 /// The process with `epoch` is gone, every thread of it (its arc is freed next): each mailbox it wrote is marked dead and its payload zeroed (ferros_mailbox `kill`, thru the frame's own address, the kernel's), and every reader waiting on it woken to see so. Called where the arc is freed (`end_process`, `kill_locked`, `drain_dying`'s last thread), never before: a thread of it still on another core could otherwise finish a publish over the mark. Under the lock.
@@ -5101,6 +5155,26 @@ fn call_endpoint(f: &mut Frame, cur: usize, ep: usize, msg: Vec<u8>, roff: u64, 
     let msg = if kk.endpoints[ep].name == b"facets" { facets_stamp(p, msg) } else { msg };
     // A call on the pucks' endpoint goes in behind the caller's kist identity (`puck_stamp`): the display keys a puck's circle by it, never by anything the puck says.
     let msg = if kk.endpoints[ep].name == b"puck" { puck_stamp(p, msg) } else { msg };
+    // The privacy indicators' marks (2026-11-26, docs/KERNEL.md "Rights in use"), read off the call itself, never the caller's word about it.
+    // A camera OPEN marks the cameras in use until the caller's CLOSE, its end or the driver's (`claims_orphaned`); a PROBE powers a module for a moment and is logged.
+    // A Bluetooth OP_SCAN marks nearby scanning until its OP_SCAN_STOP or OP_CLOSE; a GPS call by a kist that holds no claim of its own is logged, so reading a fix another's claim keeps flowing shows too.
+    match (kk.endpoints[ep].name.as_slice(), msg.first()) {
+        (b"camera", Some(&1)) => use_begin(p, ferros_kist::CAMERA),
+        (b"camera", Some(&4)) => use_end(p.epoch, ferros_kist::CAMERA),
+        (b"camera", Some(&7)) => {
+            if use_logged(ferros_kist::CAMERA, p.capsule, crate::settings::eagle_now()) {
+                claims_publish();
+            }
+        }
+        (b"bt", Some(&8)) => use_begin(p, ferros_kist::BLUETOOTH),
+        (b"bt", Some(&9) | Some(&15)) => use_end(p.epoch, ferros_kist::BLUETOOTH),
+        (b"gps", _) if p.kist && !unsafe { (*(&raw const CLAIMS)).iter() }.any(|c| c.epoch == p.epoch && c.right == ferros_kist::GPS) => {
+            if use_logged(ferros_kist::GPS, p.capsule, crate::settings::eagle_now()) {
+                claims_publish();
+            }
+        }
+        _ => {}
+    }
     kk.endpoints[ep].queue.push_back((cur, msg));
     wake_server(ep, true);
     if switch_to_next(f) { 0 } else { f.x[0] = PARKED; 1 }
@@ -7709,18 +7783,56 @@ fn el0_trap(f: &mut Frame) -> u64 {
                         ERR
                     } else {
                         if !claims.iter().any(|c| c.epoch == p.epoch && c.right == f.x[1] as u8) {
-                            claims.push(Claim { epoch: p.epoch, right: f.x[1] as u8, capsule: p.capsule });
+                            claims.push(Claim { epoch: p.epoch, right: f.x[1] as u8, capsule: p.capsule, by_kernel: false, since: crate::settings::eagle_now() });
                             claims_publish();
                         }
                         0
                     }
                 }
+                // Release: only a claim the process made; the kernel's own marks (a camera, a microphone view, a scan) end with what they mark, never on the holder's word.
                 1 => {
-                    let before = claims.len();
-                    claims.retain(|c| !(c.epoch == p.epoch && c.right as u64 == f.x[1]));
-                    if claims.len() != before {
+                    if let Some(i) = claims.iter().position(|c| c.epoch == p.epoch && c.right as u64 == f.x[1] && !c.by_kernel) {
+                        let c = claims.remove(i);
+                        use_logged(c.right, c.capsule, c.since);
                         claims_publish();
                     }
+                    0
+                }
+                // Every right in use now (the permissions page's "open now"), for Settings: [right][kind][capsule 32][since i64 LE] each, whole records as fit, the count how many there are.
+                5 if matches!(held(f.x[2]), Some(Object::Settings)) => {
+                    // WHY the bound: the buffer is the caller's; whole records only, and the count says how many there are.
+                    let fit = (f.x[4] as usize / LIVE_REC).min(claims.len());
+                    let mut out = Vec::with_capacity(fit * LIVE_REC);
+                    for c in &claims[..fit] {
+                        out.push(c.right);
+                        out.push(c.capsule.is_some() as u8);
+                        out.extend_from_slice(&c.capsule.unwrap_or([0; 32]));
+                        out.extend_from_slice(&c.since.to_le_bytes());
+                    }
+                    p.write(f.x[3], &out);
+                    claims.len() as u64
+                }
+                // The uses that ended since the person last looked, newest first, for Settings: as op 5's records, then the last end, i64 LE.
+                6 if matches!(held(f.x[2]), Some(Object::Settings)) => {
+                    let log = unsafe { &mut *(&raw mut USED) };
+                    log.sort_unstable_by_key(|u| core::cmp::Reverse(u.last));
+                    // WHY the bound: as op 5's.
+                    let fit = (f.x[4] as usize / LOG_REC).min(log.len());
+                    let mut out = Vec::with_capacity(fit * LOG_REC);
+                    for u in &log[..fit] {
+                        out.push(u.right);
+                        out.push(u.capsule.is_some() as u8);
+                        out.extend_from_slice(&u.capsule.unwrap_or([0; 32]));
+                        out.extend_from_slice(&u.first.to_le_bytes());
+                        out.extend_from_slice(&u.last.to_le_bytes());
+                    }
+                    p.write(f.x[3], &out);
+                    log.len() as u64
+                }
+                // The person looked (the permissions page shown), for Settings: the log cleared, so fact 90's "used since you last looked" bits go dark; never on a timer.
+                7 if matches!(held(f.x[2]), Some(Object::Settings)) => {
+                    unsafe { (*(&raw mut USED)).clear() };
+                    claims_publish();
                     0
                 }
                 2 if matches!(held(f.x[2]), Some(Object::Settings)) => {
@@ -7862,6 +7974,7 @@ fn el0_trap(f: &mut Frame) -> u64 {
         SYS_MAILBOX => {
             f.x[0] = match f.x[0] {
                 0 => mbox_open(p, f.x[1], f.x[2], f.x[3]),
+                1 => mbox_close(p, f.x[1]),
                 _ => ERR,
             };
             0
@@ -8221,6 +8334,8 @@ fn el0_trap(f: &mut Frame) -> u64 {
                 objects.push((Object::Endpoint(endpoint(b"torch")), RIGHT_SEND));
                 // And the audio service's, the slot after the torch's (2026-11-22, the Developer page's speaker and microphone tests; owner: "Just throw a mic and speaker test in the ferros settings"): the same reasons, init's page full and the server the kernel's to start (`ON_DEMAND`). Who may set the device's settings may test its speaker.
                 objects.push((Object::Endpoint(endpoint(b"audio")), RIGHT_SEND));
+                // And the microphones', the slot after the audio service's (2026-11-26): the Developer page's microphone test, behind the mic right since the capture ops moved to `mic`.
+                objects.push((Object::Endpoint(endpoint(b"mic")), RIGHT_SEND));
             }
             // The server of `fgtw`, the identity service, gets the receive right on `facets` the same way, as the slot after its last (docs/FACETS.md, 2026-11-13): init's page is full, and the facets are its to serve, to every kist the person granted be you or people.
             if !bad && objects.iter().any(|o| matches!(o, (Object::Endpoint(e), r) if *e == endpoint(b"fgtw") && r & RIGHT_RECV != 0)) {
@@ -8767,7 +8882,23 @@ struct Claim {
     epoch: u64,
     right: u8,
     capsule: Option<[u8; 32]>,
+    /// The kernel's own mark (2026-11-26, the privacy indicators): a camera opened, a microphone view held, a Bluetooth scan, each seen by the kernel itself; never a claim the process made, so SYS_CLAIM op 1 cannot release it and a kist cannot turn its own indicator off.
+    by_kernel: bool,
+    /// The Eagle time it began (oscillations; `settings::eagle_now`).
+    since: i64,
 }
+
+/// One holder's uses of one right since the person last looked (SYS_CLAIM op 6, the permissions page's "since you last looked"): the first began, the last ended. One record a (right, kist), however often it opened and closed, so the log is as long as the distinct uses and no longer; cleared when the person looks (op 7).
+struct Used {
+    right: u8,
+    capsule: Option<[u8; 32]>,
+    first: i64,
+    last: i64,
+}
+/// The uses that ended since the person last looked (`Used`). Under the kernel lock.
+static mut USED: Vec<Used> = Vec::new();
+/// The rights in use as the indicators show them (SYS_FACTS 90, ferros_sys::uses): bits 0-7 lit now, bits 8-15 used since the person last looked and not lit now, bits 16 and up a count of every change.
+pub static USES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The claims held now (`SYS_CLAIM`). A claim lasts until its process releases it or ends: both end paths drop it (`claims_orphaned`), so a kist that dies, is killed or is relaunched without the right holds nothing. Per right, so another right can say "using now" the same way once something marks its use; only GPS is claimed today. Under the kernel lock.
 static mut CLAIMS: Vec<Claim> = Vec::new();
 /// GPS's claims as the service loop and the pages see them (SYS_FACTS 85): bits 0-15 how many, bits 16 and up a count of every change, so a reader knows the set moved without asking for it.
@@ -9347,18 +9478,80 @@ fn claims_publish() {
     let v = (g + 1) << 16 | n;
     GPS_CLAIMS.store(v, core::sync::atomic::Ordering::Release);
     bell_ring(BELL_CLAIMS, v);
+    uses_publish();
     unsafe { core::arch::asm!("sev") };
 }
 
-/// A process ended (exit, fault, kill): its claims go with it.
+/// The indicators' word (`USES`, fact 90) from the claims and the log, its change count moved when either part moved; the display reads it with the facts.
+fn uses_publish() {
+    let live = unsafe { (*(&raw const CLAIMS)).iter() }.filter_map(|c| ferros_kist::indicator::of_right(c.right)).fold(0u64, |m, k| m | 1 << k);
+    let used = unsafe { (*(&raw const USED)).iter() }.filter_map(|u| ferros_kist::indicator::of_right(u.right)).fold(0u64, |m, k| m | 1 << k);
+    let bits = live | (used & !live) << 8;
+    let was = USES.load(core::sync::atomic::Ordering::Relaxed);
+    if was & ((1 << 16) - 1) != bits {
+        USES.store(((was >> 16) + 1) << 16 | bits, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A use ended, from `since` to now: kept in the log under its (right, kist), the first start and the last end (`Used`). True when the (right, kist) is new to the log, the one change a reader of the log is rung for: a kist reading GPS a fix at a time moves only the last end, and rings nothing.
+fn use_logged(right: u8, capsule: Option<[u8; 32]>, since: i64) -> bool {
+    let now = crate::settings::eagle_now();
+    let log = unsafe { &mut *(&raw mut USED) };
+    match log.iter_mut().find(|u| u.right == right && u.capsule == capsule) {
+        Some(u) => {
+            u.first = u.first.min(since);
+            u.last = now;
+            false
+        }
+        None => {
+            log.push(Used { right, capsule, first: since, last: now });
+            true
+        }
+    }
+}
+
+/// The kernel's own mark that process `p` uses right `right` from now (a camera opened, a microphone view held, a Bluetooth scan): one a (process, right), published at once.
+fn use_begin(p: &Process, right: u8) {
+    let claims = unsafe { &mut *(&raw mut CLAIMS) };
+    if !claims.iter().any(|c| c.epoch == p.epoch && c.right == right) {
+        claims.push(Claim { epoch: p.epoch, right, capsule: p.capsule, by_kernel: true, since: crate::settings::eagle_now() });
+        claims_publish();
+    }
+}
+
+/// The kernel's mark for (`epoch`, `right`) taken off (the camera closed, the view given back, the scan stopped), the use logged; nothing when there is none.
+fn use_end(epoch: u64, right: u8) {
+    let claims = unsafe { &mut *(&raw mut CLAIMS) };
+    if let Some(i) = claims.iter().position(|c| c.epoch == epoch && c.right == right && c.by_kernel) {
+        let c = claims.remove(i);
+        use_logged(c.right, c.capsule, c.since);
+        claims_publish();
+    }
+}
+
+/// A process ended (exit, fault, kill): its claims go with it, each use logged. A driver that ends takes every mark on its hardware with it (`ENDS_WITH`): a camera OPEN the driver refused, or a scan of a Bluetooth driver that died, lights nothing.
 fn claims_orphaned(epoch: u64) {
     let c = unsafe { &mut *(&raw mut CLAIMS) };
+    let driver = k().procs.iter().flatten().find(|q| q.epoch == epoch).and_then(|q| ENDS_WITH.iter().find(|(n, _)| q.name == *n)).map(|(_, r)| *r);
     let before = c.len();
-    c.retain(|x| x.epoch != epoch);
+    let mut ended = Vec::new();
+    c.retain(|x| {
+        let gone = x.epoch == epoch || (x.by_kernel && Some(x.right) == driver);
+        if gone {
+            ended.push((x.right, x.capsule, x.since));
+        }
+        !gone
+    });
+    for (r, cap, since) in ended {
+        use_logged(r, cap, since);
+    }
     if c.len() != before {
         claims_publish();
     }
 }
+
+/// The drivers whose end ends the kernel's marks on their hardware: the camera driver's (`camera`, the cameras' code) and the Bluetooth driver's (`bt`, Bluetooth's).
+const ENDS_WITH: [(&[u8], u8); 2] = [(b"camera", ferros_kist::CAMERA), (b"bt", ferros_kist::BLUETOOTH)];
 
 /// Every GPS claim dropped (the switch turned off, or nobody present: the service loop, under the lock). → how many there were.
 pub fn gps_claims_drop() -> usize {
@@ -10320,6 +10513,8 @@ fn kist_object(code: u8) -> Option<(Object, u32)> {
         "items" => (Object::Items, RIGHT_SEND),
         // Bluetooth (docs/BT.md "The client ops", 2026-11-24): a send right on the Bluetooth driver's `bt` endpoint. The driver tells a kist apart by the call (SYS_CALLER's CALLER_KIST) and refuses it the identity service's ops (the pairing beacon and the pairing scan); everything it does goes thru a session of its own, whose id only it holds.
         "bluetooth" => (Object::Endpoint(endpoint(b"bt")), RIGHT_SEND),
+        // The microphones (2026-11-26): a send right on the audio service's `mic` endpoint, asked of the person, the proof that opens the microphone mailbox and the only door to the capture ops; the kernel marks it in use while the kist holds the mailbox's view (`mbox_open`, `mbox_close`).
+        "mic" => (Object::Endpoint(endpoint(b"mic")), RIGHT_SEND),
         _ => return None,
     })
 }
