@@ -15,7 +15,7 @@ The stock `aarch64-unknown-none` spec with one field changed: `features` carries
 **Three copies, two naming domains.** The same feature set is written three times, and only two of them can be merged:
 - this target's `features` — rustc spelling, covers the payload and everything `build-std` rebuilds;
 - `.cargo/config.toml` `rustflags` — rustc spelling, still needed for the kernel and for plain (unmasked) builds on stock `aarch64-unknown-none`;
-- `ATTR` in `tools/ferros-masked-build.sh` — **LLVM** spelling, for `llvm-mc` when the masked assembly is assembled. LLVM and rustc disagree on several names (`+fullfp16` for `+fp16`, `+fp16fml` for `+fhm`, `+complxnum` for `+fcma`, `+fptoint` for `+frintts`), so this one is deliberately separate.
+- `ATTR` in `tools/ferros-masked-build.sh` — **LLVM** spelling, for ferros-as (LLVM's assembler) when the masked assembly is assembled. LLVM and rustc disagree on several names (`+fullfp16` for `+fp16`, `+fp16fml` for `+fhm`, `+complxnum` for `+fcma`, `+fptoint` for `+frintts`), so this one is deliberately separate.
 
 ## Caveats
 

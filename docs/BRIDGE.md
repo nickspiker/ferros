@@ -83,7 +83,7 @@ The newest n deaths (16 by default; panics and faults, plain exits too with `--e
 Each shows how it ended, the message and `file:line:column`, the thread, ESR and FAR, the exit value and the last console line, then every frame named from the ELF: the function, its file and line, the calls inlined into it.
 - The ELF is found by the process's name under the repository (`FERROS_REPO`, else the working directory): `target/el0/aarch64-unknown-none/release/<name>`, `target/masked/<name>/<name>.elf`, `std/*/target/aarch64-unknown-ferros/release/<name>`, lowercased and as `puck_<name>` too (the kist `Compass` is `puck_compass`), or as given by `--elf` and `--dir`. The kernel's own frames use `--kernel` (default `target/aarch64-unknown-none/release/ferros_kernel`).
 - A frame is an offset into the arc; the image starts at the death's `code` (G#1000) and payloads and std programs link at 0, so the ELF's address is the frame less G#1000, and a return address is named at its call (4 bytes before).
-- A masked capsule's ELF is the masked build's, linked after the masking: its addresses are the arc's, and its line tables come thru ferros-mask's assembly.
+- A masked capsule's ELF is the masked build's, linked after the masking: its addresses are the arc's, and its line tables come thru ferros-as (the assembly's .loc and .file directives).
 - Nothing on the device names the build that ran yet: the ELF used and its time are printed, and one built after the death is flagged.
 - `--raw` writes the answer's VSF documents; `--from` reads a saved one instead of the device.
 
