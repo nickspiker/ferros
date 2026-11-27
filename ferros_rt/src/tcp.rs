@@ -118,7 +118,7 @@ impl Until {
 /// The family a name is resolved for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Family {
-    /// The family the route will use: IPv6 where it has one, then IPv4 (owner, 2026-10-29: IPv6 preferred).
+    /// The family the route will use, in ip's order: IPv6 first on the same link, else the family on WiFi first (owner, 2026-10-29 and 2026-11-27).
     Any = 0,
     V4 = 4,
     V6 = 6,

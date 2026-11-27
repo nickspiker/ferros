@@ -400,7 +400,7 @@ impl Udp {
         (n >= 51 && n != ERR).then_some(out[50])
     }
     /// `host`'s address from ip's resolver (op 10 RESOLVE, the device's one cache; the call held until the lookup ends, 16 s at most), or None (nobody present, no route or server, no such name, no answer).
-    /// Family 0: the family the route will use, AAAA where IPv6 has a route, then A (owner, 2026-10-29: IPv6 preferred). Until 2026-11-13 this asked for IPv4 alone, and a network that gave no DHCPv4 lease but a working IPv6 left the identity service grey (the 8a: fgtw.org answered httptest over IPv6 while fgtw never saw a network).
+    /// Family 0: the family the route will use, in ip's order (IPv6 first on the same link, else the family on WiFi first: owner, 2026-10-29 and 2026-11-27). Until 2026-11-13 this asked for IPv4 alone, and a network that gave no DHCPv4 lease but a working IPv6 left the identity service grey (the 8a: fgtw.org answered httptest over IPv6 while fgtw never saw a network).
     fn resolve(&self, host: &[u8]) -> Option<SeedAddr> {
         let mut q = Vec::with_capacity(3 + host.len());
         q.extend_from_slice(&[10, 0, 1 << 4]);

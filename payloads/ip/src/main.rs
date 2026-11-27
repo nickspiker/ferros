@@ -24,7 +24,7 @@
 //! - 9 LINK: mode → [0]: 0 both links, WiFi preferred (the default); 1 cellular only; 2 WiFi only. A test can take the cellular path with WiFi up; existing connections keep their link.
 //! - 10 RESOLVE: family (0 either, 4, 6), wait (seconds), host name (dotted, up to 253 bytes) → status, family, address (16; IPv4 in the first 4), TTL left in seconds (u32 BE): 22 bytes. The device's one resolver (2026-11-12; httptest, the kist stower, fgtw and Mahere each carried a copy of their own, drifted apart), its pure parts in ferros_dns (tested on the host).
 //!   - Status: 0 found; 1 still asking (wait 0, or the wait ran out first: the lookup goes on and its answer is kept); 2 no such address (the name does not exist, or has no address of the families asked); 3 not a host name (or a family other than 0, 4, 6); 4 no way to ask (no route of the families asked, or no DNS server, or no entropy for the question's id); 5 no answer (the servers silent or failing, four tries a second apart); 6 busy (every cache record in a lookup).
-//!   - Family 0 asks for the family the route will use: AAAA where IPv6 has a route (IPv6 preferred: owner, 2026-10-29), then A where IPv4 has one. 4 or 6 asks for that type whatever the routes.
+//!   - Family 0 asks for each family that has a route: AAAA first when both families leave on the same link (IPv6 preferred: owner, 2026-10-29, on the same network only: 2026-11-27), else the family on WiFi first, so a cellular call's IPv6 never goes ahead of WiFi's IPv4. 4 or 6 asks for that type whatever the routes.
 //!   - Wait 1 to 255 holds the call until the lookup ends, that long at most; 0 answers at once from the cache (a lookup started when it holds nothing fresh, the last good address meanwhile, else "still asking"). Held RESOLVEs: sixteen (`RQN`), the oldest answered "still asking" when a seventeenth comes.
 //!   - The cache (`ferros_dns::Cache`): 32 records (a name and a type each), searched in order, the least recently asked giving way. An address holds for its TTL (the least along a chain of aliases), then is kept as the last good one: asked for, it is answered at once while a lookup for it runs, and a lookup that brings no answer keeps it for another TTL (Mahere's rules, 2026-11-11, now every client's). No such address is kept for the SOA's negative TTL (RFC 2308 5), at most 256 s (8 s without an SOA). A TCP connection that opens clears its address's failures; four failures in a row (resets, or what it sent unanswered) make the address stale, so its name is asked again.
 //!   - One lookup a name and type, however many ask: the calls hold on it. A question goes from the resolver's one port (random for the session) with a random id (the entropy grant, each question), to the DNS server of each family's link (INFO's, IPv6's first, turn about), four tries a second apart (the one timer: a lost datagram never comes back); a try ip cannot send yet for want of the next hop goes again 2^-6 s on. An answer counts only from port 53 of a server a try went to, with the id, repeating the question (`ferros_dns::read`); a SERVFAIL or REFUSED moves to the next try at once. Nothing an application sends may leave from the resolver's port (op 1 answers [3]).
@@ -2440,15 +2440,20 @@ impl Ip {
         let name = if m.len() >= 4 && (m[1] == 0 || m[1] == 4 || m[1] == 6) { ferros_dns::Name::from_host(&m[3..]) } else { None };
         let Some(name) = name else { return Some(res_put(out, res_answer(RES_BAD, 0, [0; 16], 0))) };
         let (want, wait) = (m[1], m[2]);
-        // The types to ask, in order: the family asked for; for either, IPv6 first where it has a route (owner, 2026-10-29: IPv6 preferred), then IPv4 where it has one.
+        // The types to ask, in order: the family asked for; for either, each family that has a route, IPv6 first when both leave on the same link (owner, 2026-10-29: IPv6 preferred; 2026-11-27: "given the same network, otherwise it's no longer apples to apples"), else the one on WiFi first.
+        // 2026-11-27: with IPv6 only on the cellular call and IPv4 on WiFi, every AAAA answer was dialed over the call (Mahere's cells at 10 KB/s, connections never opened) while WiFi stood idle at 864 Mbit/s.
         let mut r = Rq { used: true, tok: *tok, name, until: now + wait as u64 * self.freq, ..RQ_FREE };
-        if want == 6 || (want == 0 && self.pick6(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).is_some()) {
-            r.order[r.n] = ferros_dns::AAAA;
-            r.n += 1;
-        }
-        if want == 4 || (want == 0 && self.pick4(&[8, 8, 8, 8]).is_some()) {
-            r.order[r.n] = ferros_dns::A;
-            r.n += 1;
+        let route6 = self.pick6(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).map(|(cell, _)| cell);
+        let route4 = self.pick4(&[8, 8, 8, 8]).map(|(cell, _)| cell);
+        let ask6 = want == 6 || (want == 0 && route6.is_some());
+        let ask4 = want == 4 || (want == 0 && route4.is_some());
+        let six_first = !(route6 == Some(true) && route4 == Some(false));
+        let types = if six_first { [(ask6, ferros_dns::AAAA), (ask4, ferros_dns::A)] } else { [(ask4, ferros_dns::A), (ask6, ferros_dns::AAAA)] };
+        for (ask, qtype) in types {
+            if ask {
+                r.order[r.n] = qtype;
+                r.n += 1;
+            }
         }
         if let Some(a) = self.res_run(&mut r, now) {
             return Some(res_put(out, a));
