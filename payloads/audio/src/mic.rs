@@ -56,10 +56,29 @@ pub struct Mic {
     /// The meter's held call.
     pub meter: Option<[u8; 32]>,
     pub rec: Option<Rec>,
+    /// Publishing into the microphone mailbox for the holders of its view (`MIC_STREAM`, 2026-11-26), and the publishes since the kernel was last asked whether any process still holds one (`VIEW_CHECK`).
+    pub stream: bool,
+    since_check: u32,
+    /// Frames the AoC wrote over before they were read, since the stream began: the mailbox's `OVERRUN`.
+    overrun: u64,
+}
+
+/// The stream's shape (`MIC_STREAM`): 1 ms periods, 32-bit samples, the normal record path's three microphones (measured on the Pro 2026-11-24: whole milliseconds only, 1 ms and 32 bits both work).
+const STREAM_SHAPE: aoc::Shape = aoc::Shape { ms: 1, width: aoc::WIDTH_32, gain: None, kind: aoc::REC_NORMAL };
+/// Publishes between two looks at whether any process still holds the microphone mailbox's view (fact 90, the kernel's mark): 2^6, about 64 ms of 1 ms periods, counted on the capture's own clock, never a timer. Once none does, the stream stops: giving the view back is the stop, and a reader that ended takes its share with it.
+const VIEW_CHECK: u32 = 1 << 6;
+
+/// The microphone mailbox's writer, taken at the first stream (the `mic-mailbox` grant, slot 14). The clock thread's alone once taken.
+static mut MIC_BOX: Option<ferros_sys::mailbox::Writer> = None;
+
+/// Whether any process holds the microphone mailbox's view now: the kernel's own mark, fact 90's microphone bit (ferros_sys::uses).
+fn view_held() -> bool {
+    let word = ferros_sys::facts().0[ferros_sys::uses::FACT];
+    ferros_sys::uses::live(word) >> ferros_sys::uses::MIC & 1 == 1
 }
 
 impl Mic {
-    pub const NONE: Mic = Mic { cap: None, starting: false, stopping: false, shape: aoc::Shape::LINUX, bit: 0, phase: 0, frames: 0, total: 0, blocks: 0, idle: 0, reads: 0, read_min: u32::MAX, read_max: 0, raw_said: false, skipped: 0, peaks: [0; MICS], window: 0, meter: None, rec: None };
+    pub const NONE: Mic = Mic { cap: None, starting: false, stopping: false, shape: aoc::Shape::LINUX, bit: 0, phase: 0, frames: 0, total: 0, blocks: 0, idle: 0, reads: 0, read_min: u32::MAX, read_max: 0, raw_said: false, skipped: 0, peaks: [0; MICS], window: 0, meter: None, rec: None, stream: false, since_check: 0, overrun: 0 };
     /// Anything that keeps the process: a capture, its start or stop under way, a meter waiting, a recording.
     pub fn busy(&self) -> bool {
         // A bench holds the capture by its own flag (main.rs `Bench`), read with the rest of the state where this is called.
@@ -182,13 +201,29 @@ pub fn turn(rang: u16) {
     let m = &mut st.mic;
     let sb = m.shape.sample_bytes();
     let chans = m.shape.chans();
+    // The stream's publish begun before anything goes into the ring (the sequence odd until `finish_mic`). MIC_BOX under the state lock, which both the clock thread's and the poller's turns hold.
+    let writer = if m.stream { unsafe { (*(&raw const MIC_BOX)).as_ref() } } else { None };
+    let publish = writer.map(|w| w.begin());
     let skipped = c.skip_overrun();
     if skipped != 0 {
         m.skipped = m.skipped.wrapping_add(skipped);
         // The skipped bytes are whole samples of the interleaved stream: the next one read belongs that many microphones on, and the clock moves by the frames they held.
         let samples = skipped as usize / sb;
+        let was = m.total;
         m.total += ((m.phase + samples) / chans) as u64;
         m.phase = (m.phase + samples) % chans;
+        // The frames written over are silence in the ring, never the samples a ring ago left in their slots; a reader sees how many in `OVERRUN`.
+        if let Some(p) = publish.as_ref() {
+            m.overrun += m.total - was;
+            let ring = ferros_sys::mailbox::mic::RING_FRAMES as u64;
+            // WHY the max: more frames skipped than the ring holds need only the ring's worth zeroed, every slot being one of them.
+            // WHY the saturating subtract: in a capture's first ring of frames `m.total - ring` underflows a u64; PROOF: it would name a frame beyond every frame written, and the max would then zero nothing.
+            for f in was.max(m.total.saturating_sub(ring))..m.total {
+                for ch in 0..chans {
+                    ferros_sys::mailbox::mic::put(p, f, ch, 0);
+                }
+            }
+        }
     }
     // SAFETY: REC is this thread's alone while a recording is under way (mix.rs reads it only once the recording has ended).
     let rec = unsafe { &mut *(&raw mut mix::REC) };
@@ -204,6 +239,10 @@ pub fn turn(rang: u16) {
             raws += 1;
         }
         bench.sample(phase, x, total0 + frames as u64);
+        // The stream: every sample at its frame's position, full scale as an i32 whatever the width (a 32-bit capture's word as it came, a 16-bit one's sample in the top half).
+        if let Some(p) = publish.as_ref() {
+            ferros_sys::mailbox::mic::put(p, total0 + frames as u64, phase, if sb == 4 { w as i32 } else { (x as i32) << 16 });
+        }
         let a = x.unsigned_abs();
         // A running maximum, the meter's peak: the larger of two magnitudes, nothing held to a range.
         if a > peaks[phase] {
@@ -228,6 +267,16 @@ pub fn turn(rang: u16) {
     m.phase = phase;
     m.peaks = peaks;
     m.total += frames as u64;
+    // The stream's publish whole: the frames before the position in, the readers woken; the anchor is the position not yet arrived at the turn's start, its counter `t`.
+    if let (Some(w), Some(p)) = (writer, publish) {
+        let h = ferros_sys::mailbox::mic::Head { pos: m.total, rate: ferros_sys::audio::RATE, channels: chans as u8, anchor_pos: m.total, anchor_at: t, overrun: m.overrun };
+        w.finish_mic(p, &h);
+        m.since_check += 1;
+    }
+    let check = m.stream && m.since_check >= VIEW_CHECK;
+    if check {
+        m.since_check = 0;
+    }
     if n != 0 {
         m.reads = m.reads.wrapping_add(1);
         m.read_min = m.read_min.min(n);
@@ -264,7 +313,7 @@ pub fn turn(rang: u16) {
         }
         m.peaks = [0; MICS];
     }
-    if m.meter.is_none() && m.rec.is_none() && !bench.capturing() {
+    if m.meter.is_none() && m.rec.is_none() && !bench.capturing() && !m.stream {
         m.idle += frames;
     } else {
         m.idle = 0;
@@ -277,6 +326,13 @@ pub fn turn(rang: u16) {
         m.stopping = true;
     }
     unlock();
+    // No process holds the microphone mailbox's view any more (the kernel's mark): the stream stops, and the capture with it once nothing else wants it (`IDLE_FRAMES`). Asked with the lock let go.
+    if check && !view_held() {
+        let st = lock();
+        st.mic.stream = false;
+        unlock();
+        say!("audio: the microphone stream stopped: no process holds its view");
+    }
     if let Some(w) = wide {
         say!("audio: the capture's first words: G#{:X} G#{:X} G#{:X} G#{:X} G#{:X} G#{:X}", w[0], w[1], w[2], w[3], w[4], w[5]);
     }
@@ -347,6 +403,44 @@ pub fn record(token: [u8; 32], mic: u8, level: u8) {
     st.mic.rec = Some(Rec { mic, level, n: 0, peak: 0, token });
     unlock();
     say!("audio: recording microphone A#{mic}: A#{RECORD_FRAMES} frames");
+}
+
+/// `MIC_STREAM` (the `mic` thread, 2026-11-26): the capture published into the microphone mailbox for the holders of its view, started in the stream's shape if it is not running: [0] streaming, [1] refused (no process holds the view, the mailbox not ours to write, the microphones would not start, or they run in another shape for the meter).
+pub fn stream(token: [u8; 32]) {
+    if !view_held() {
+        reply(&token, &[1]);
+        return;
+    }
+    // The writer taken once, at the first stream (slot 14); the one writer of the mailbox from then on.
+    let taken = {
+        lock();
+        let t = unsafe { (*(&raw const MIC_BOX)).is_some() };
+        unlock();
+        t
+    };
+    if !taken {
+        let Some(w) = ferros_sys::mailbox::Writer::take(ferros_sys::cap(crate::grants(), crate::S_MIC_BOX)) else {
+            say!("audio: the microphone mailbox could not be taken (its grant, slot 14, or another writer): no stream");
+            reply(&token, &[1]);
+            return;
+        };
+        lock();
+        unsafe { *(&raw mut MIC_BOX) = Some(w) };
+        unlock();
+    }
+    if !ensure(STREAM_SHAPE) {
+        reply(&token, &[1]);
+        return;
+    }
+    let st = lock();
+    if !st.mic.stream {
+        st.mic.stream = true;
+        st.mic.since_check = 0;
+        st.mic.overrun = 0;
+        say!("audio: the microphones stream into their mailbox, 1 ms periods at 32 bits");
+    }
+    unlock();
+    reply(&token, &[0]);
 }
 
 /// `MIC_LEVELS` (the receiving thread): the capture running in `shape`, the call held until the meter's window ends (`turn`); a meter already held is answered [1], replaced.

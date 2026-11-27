@@ -179,3 +179,79 @@ fn thermo_round_trip() {
     assert_eq!(f32::from_bits((w[thermo::TEMPS] >> 32) as u32), 31.5);
     assert_eq!(thermo::decode(&w[..thermo::WORDS - 1]), None);
 }
+
+/// The microphones' ring: `n` frames from position `f0` published as one period, each sample `f * 8 + c` so a reader can check every one, the writer's position after them.
+fn mic_period(m: &[AtomicU64], f0: u64, n: u64, chans: u8) -> u64 {
+    let p = Publish::begin(m);
+    for f in f0..f0 + n {
+        for c in 0..chans as usize {
+            mic::put(&p, f, c, (f * 8 + c as u64) as i32);
+        }
+    }
+    let h = mic::Head { pos: f0 + n, rate: 48_000, channels: chans, anchor_pos: f0 + n - 1, anchor_at: 1000 + f0, overrun: 0 };
+    mic::finish(p, &h, 7);
+    f0 + n
+}
+
+#[test]
+fn mic_ring_reads_by_position_and_catches_up() {
+    let m = mailbox();
+    let mut out = std::vec![0i32; 1 << 12];
+    assert_eq!(mic::read_by(|i| m[i].load(Ordering::Relaxed), 0, &mut out), mic::Read::Never);
+    let mut pos = 0;
+    for _ in 0..3 {
+        pos = mic_period(&m, pos, 48, 3);
+    }
+    // From the start: every frame, interleaved, each sample where it was put.
+    match mic::read_by(|i| m[i].load(Ordering::Relaxed), 0, &mut out) {
+        mic::Read::Frames { head, start, frames } => {
+            assert_eq!((head.pos, head.channels, head.rate, start, frames), (144, 3, 48_000, 0, 144));
+            assert_eq!(head.anchor_pos, 143);
+            for f in 0..frames {
+                for c in 0..3 {
+                    assert_eq!(out[f * 3 + c], (f as u64 * 8 + c as u64) as i32);
+                }
+            }
+        }
+        r => panic!("{r:?}"),
+    }
+    // A reader that had taken up to 100 takes the rest.
+    assert!(matches!(mic::read_by(|i| m[i].load(Ordering::Relaxed), 100, &mut out), mic::Read::Frames { start: 100, frames: 44, .. }));
+    // A small buffer takes whole frames only.
+    let mut small = [0i32; 10];
+    assert!(matches!(mic::read_by(|i| m[i].load(Ordering::Relaxed), 0, &mut small), mic::Read::Frames { start: 0, frames: 3, .. }));
+}
+
+#[test]
+fn mic_ring_says_what_a_late_reader_lost() {
+    let m = mailbox();
+    let mut pos = 0;
+    while pos < mic::RING_FRAMES as u64 + 500 {
+        pos = mic_period(&m, pos, 48, 3);
+    }
+    let mut out = std::vec![0i32; mic::RING_FRAMES * 3];
+    match mic::read_by(|i| m[i].load(Ordering::Relaxed), 0, &mut out) {
+        mic::Read::Frames { head, start, frames } => {
+            // The oldest frame still held, a ring behind the newest: frames 0 to start were written over (the reader's loss), and those held read back right.
+            assert_eq!(start, head.pos - mic::RING_FRAMES as u64);
+            assert_eq!(frames, mic::RING_FRAMES);
+            assert_eq!(out[0], (start * 8) as i32);
+            assert_eq!(out[(frames - 1) * 3 + 2], ((head.pos - 1) * 8 + 2) as i32);
+        }
+        r => panic!("{r:?}"),
+    }
+}
+
+#[test]
+fn mic_ring_busy_dead_and_other() {
+    let m = mailbox();
+    let mut out = [0i32; 16];
+    mic_period(&m, 0, 4, 1);
+    let p = Publish::begin(&m);
+    assert!(matches!(mic::read_by(|i| m[i].load(Ordering::Relaxed), 0, &mut out), mic::Read::Busy { .. }));
+    p.finish(mic::KIND, mic::WORDS, 0);
+    kill(&m);
+    assert_eq!(mic::read_by(|i| m[i].load(Ordering::Relaxed), 0, &mut out), mic::Read::Dead);
+    publish(&m, thermo::KIND, 0, &[1, 2]);
+    assert_eq!(mic::read_by(|i| m[i].load(Ordering::Relaxed), 0, &mut out), mic::Read::Other);
+}

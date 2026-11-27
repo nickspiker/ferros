@@ -917,6 +917,7 @@ extern "C" fn mic_server(_: u64) -> ! {
             // WHY the bounds: the caller's bytes; the AoC's field is a u8 of milliseconds (a period of 0 is none), its widths 1 to 3 (aoc.rs `WIDTH_16`..`WIDTH_32`); a period past 10 ms is longer than Linux's own and buys nothing here.
             audio::MIC_LEVELS if n == 3 && (1..=10).contains(&m[1]) && (aoc::WIDTH_16..=aoc::WIDTH_32).contains(&m[2]) => mic::levels(token, aoc::Shape { ms: m[1], width: m[2], gain: None, kind: aoc::REC_NORMAL }),
             audio::RECORD if n == 3 => mic::record(token, m[1], m[2]),
+            audio::MIC_STREAM if n == 1 => mic::stream(token),
             _ => {
                 reply(&token, &[1]);
             }

@@ -1007,6 +1007,8 @@ pub mod audio {
     pub const RECORD: u8 = 9;
     /// The bench (2026-11-24, docs/AUDIO.md "The bench"): the sound in a shape of the caller's, a quiet click train or tone, every interrupt measured and, with the capture on, each click found in the microphones. [BENCH, lead, buffer, period's log2, level, count (u16), spacing's log2, flags (bit 0 clicks, bit 1 capture), capture ms, capture width]; held until it ends, the measures on the console.
     pub const BENCH: u8 = 10;
+    /// [MIC_STREAM] on `mic` (2026-11-26): the capture published into the microphone mailbox (ferros_mailbox `mic`, its 1 ms periods at 32 bits) for the holders of its view → [0] streaming, [1] refused (no view held, the microphones would not start, or they run in another shape for the meter). Ask it after opening the view; it stops by itself once no process holds a view (the kernel's mark, fact 90), so giving the view back is the stop, and a reader that ends takes its share with it.
+    pub const MIC_STREAM: u8 = 11;
 
     /// The built-in microphones the service captures (husky's three, ids 0-2), and the recording's length: 2^17 frames, 2.7 s, one microphone, kept in the service's memory only and gone once played.
     pub const MICS: usize = 3;
@@ -1569,7 +1571,7 @@ pub mod share {
 /// - A reader holds the `<name>-view` region, granted at its spawn (`Reader::map`) or opened with a proof (`Reader::open`: the GPS right, Settings); it waits for the next publish (`wait`) and reads a whole one (`read`), never calling the writer. Masked code reads thru the view's handle instead (`View`).
 /// - The kernel marks the mailbox dead when the writer's process ends and zeroes its payload (`Got::Dead`); a new writer's first publish brings it back.
 pub mod mailbox {
-    pub use ferros_mailbox::{frame, gps, motion, thermo, Got, Publish, AT, BOX_NAMES, DEAD, FRAME, GPS, HEADER, KIND, LEN, MIC, MOTION, NAMES, PAYLOAD_MAX, SEQ, TEST, THERMO, VIEW_NAMES, WORDS};
+    pub use ferros_mailbox::{frame, gps, mic, motion, thermo, Got, Publish, AT, BOX_NAMES, DEAD, FRAME, GPS, HEADER, KIND, LEN, MIC, MOTION, NAMES, PAYLOAD_MAX, SEQ, TEST, THERMO, VIEW_NAMES, WORDS};
     use super::{dma, now, nr, off, svc, wait, wait_world, wake, ERR};
     use core::sync::atomic::AtomicU64;
 
@@ -1611,6 +1613,11 @@ pub mod mailbox {
         /// The publish begun whole (`kind`, `len` words), and every reader waiting woken: the new sequence and how many threads woke.
         pub fn finish(&self, p: Publish<'static>, kind: u64, len: usize) -> (u64, u64) {
             let s = p.finish(kind, len, now());
+            (s, self.ring())
+        }
+        /// The microphones' ring publish ended with its header (ferros_mailbox `mic::finish`: the frames before `h.pos` whole), and every reader waiting woken: the new sequence and how many threads woke.
+        pub fn finish_mic(&self, p: Publish<'static>, h: &mic::Head) -> (u64, u64) {
+            let s = mic::finish(p, h, now());
             (s, self.ring())
         }
         /// The sequence word's waiters woken, in every process: the kernel's one scan of its threads (SYS_WAKE on a mailbox's sequence word by its writer), never a call per reader.
@@ -1711,6 +1718,10 @@ pub mod mailbox {
         /// One look (ferros_mailbox `try_read_by`).
         pub fn try_read(&self, out: &mut [u64]) -> Got {
             ferros_mailbox::try_read_by(Self::load, out)
+        }
+        /// The microphones' ring from position `from` up to the newest into `out` (ferros_mailbox `mic::read_by`), once: on `Busy`, wait on the sequence it names (`wait`) and look again.
+        pub fn read_mic(&self, from: u64, out: &mut [i32]) -> mic::Read {
+            mic::read_by(Self::load, from, out)
         }
         /// One whole publish into `out`, as `Reader::read`: never `Busy`.
         pub fn read(&self, out: &mut [u64]) -> Got {

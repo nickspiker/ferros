@@ -140,7 +140,9 @@ Until this, `MIC_LEVELS` and `RECORD` answered any caller of `audio`, which ever
 - **Who holds it**: a kist the person granted the microphones (ferros_kist `mic`, asked, never implicit), and Settings (the Developer page's meter and test recording, map devtest.rs slot 13).
 - **The indicator**: the kernel marks the microphones in use while a process holds the microphone mailbox's view (docs/KERNEL.md "Rights in use").
 - **Idle**: either receiving thread ends an idle service; a call taken and not yet acted on keeps it (`receiving`).
-- **Not built yet**: the capture published into the microphone mailbox for the holders of its view (Photon's waves, photon docs/ferros-media.md step 2).
+- **The stream** (`MIC_STREAM` on `mic`, for Photon's waves, photon docs/ferros-media.md step 2): a reader opens the microphone mailbox's view (its proof the `mic` send right), then asks for the stream; the capture runs in 1 ms periods at 32 bits on the normal path's three microphones and each turn publishes its frames into the mailbox (ferros_mailbox `mic`: a ring of the last 2^12 frames, about 85 ms, each sample an i32 at its frame's position, the newest position, the rate and channels, an anchor of a position and its counter, the frames the AoC overran, which are silence in the ring). A reader late by some periods reads from its last position and loses frames only past a ring behind.
+- **The stop**: every 2^6 publishes (about 64 ms, on the capture's own clock) the service asks the kernel whether any process still holds the view (fact 90's microphone bit); once none does, the stream stops, and the capture after `IDLE_FRAMES`. Giving the view back is the stop, and a reader that ends takes its share with it: the light and the capture end together.
+- **Not built yet**: one capture serves one shape, so the Developer page's meter (10 ms, 16 bits) is refused while a stream runs and the other way round; the meter's own captures light no indicator (Settings, the person's own page).
 
 ## The rings' windows (measured on the Pro 2026-11-22; approved that night by the coordinator for the owner)
 

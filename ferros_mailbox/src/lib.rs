@@ -9,7 +9,7 @@
 //! The header, eight words:
 //! - word 0, `SEQ`: the sequence, even while the words are whole and odd while a publish is under way, bit 63 (`DEAD`) set by the kernel when the writer's process has ended.
 //!   Readers wait on this word (SYS_WAIT), the writer's wake (SYS_WAKE) ends every wait on it.
-//! - word 1, `KIND`: the payload's layout, the writer's tag (`gps::KIND`, `motion::KIND`, `thermo::KIND`), so a reader never takes one layout for another.
+//! - word 1, `KIND`: the payload's layout, the writer's tag (`gps::KIND`, `motion::KIND`, `thermo::KIND`, `mic::KIND`), so a reader never takes one layout for another.
 //! - word 2, `LEN`: how many payload words the writer published.
 //! - word 3, `AT`: the counter (CNTVCT) at the publish, so a reader measures how late it woke.
 //! - words 4 to 7: not yet used, zero.
@@ -170,6 +170,126 @@ pub fn kill(words: &[AtomicU64]) -> u64 {
     words[LEN].store(0, Ordering::Relaxed);
     words[SEQ].store((seq + 2) | DEAD, Ordering::Release);
     (seq + 2) | DEAD
+}
+
+/// The microphones' mailbox (payloads/audio, docs/AUDIO.md "The mic right"; 2026-11-26): the capture as a ring of its last `RING_FRAMES` frames, each frame at its position (frames since the capture began), so a reader late by some periods catches up by position and loses samples only past a ring behind (the Photon session's ask: a single period a publish clicks).
+/// A reader holds `mic-view` only thru the mic right (the kernel's proof), and holding it is what lights the microphones' privacy indicator.
+/// One sample a word (an i32 in the low half, full scale whatever the capture's width), so the writer stores words and never reads its own back.
+pub mod mic {
+    use super::{fence, Ordering, Publish, DEAD, HEADER, KIND as KIND_WORD, LEN, PAYLOAD_MAX, SEQ};
+
+    /// The layout's tag: "MIC" and its version, 0.
+    pub const KIND: u64 = 0x4D49_4300_0000_0000;
+    /// The ring's frames: 2^12, 85 ms at 48 kHz.
+    pub const RING_LOG: u32 = 12;
+    pub const RING_FRAMES: usize = 1 << RING_LOG;
+    /// The most channels a frame holds: the Pro's normal record path has three microphones, the MMAP and raw paths one.
+    pub const CHANNELS_MAX: usize = 1 << 2;
+    /// Payload word 0: the position after the newest frame (frames written since the capture began).
+    pub const POS: usize = 0;
+    /// Word 1: the rate in Hz (bits 0-31) | the channels a frame (bits 32-39).
+    pub const FORMAT: usize = 1;
+    /// Words 2 and 3: the anchor, a frame's position and the counter (CNTVCT) when the writer took it in, so a reader turns a position into a time.
+    pub const ANCHOR_POS: usize = 2;
+    pub const ANCHOR_AT: usize = 3;
+    /// Word 4: frames the AoC wrote over before the writer read them, so far.
+    pub const OVERRUN: usize = 4;
+    /// The ring's first word: frame f's channel c at word `RING + (f mod RING_FRAMES) * CHANNELS_MAX + c`.
+    pub const RING: usize = 8;
+    /// The payload's words.
+    pub const WORDS: usize = RING + RING_FRAMES * CHANNELS_MAX;
+    const _: () = assert!(WORDS <= PAYLOAD_MAX);
+
+    /// The ring's word for frame `f`'s channel `c`.
+    pub fn slot(f: u64, c: usize) -> usize {
+        RING + (f as usize & (RING_FRAMES - 1)) * CHANNELS_MAX + c
+    }
+
+    /// The writer: frame `f`'s channel `c` (under `CHANNELS_MAX`) into the ring, inside a publish begun with `Publish::begin`.
+    pub fn put(p: &Publish, f: u64, c: usize, x: i32) {
+        p.put(slot(f, c), x as u32 as u64);
+    }
+
+    /// The format and the anchor as one publish ends them.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Head {
+        pub pos: u64,
+        pub rate: u32,
+        pub channels: u8,
+        pub anchor_pos: u64,
+        pub anchor_at: u64,
+        pub overrun: u64,
+    }
+
+    /// The writer: the publish ended with the header's words, the frames before `h.pos` whole; the new sequence, which the caller wakes the readers on.
+    pub fn finish(p: Publish, h: &Head, at: u64) -> u64 {
+        p.put(POS, h.pos);
+        p.put(FORMAT, h.rate as u64 | (h.channels as u64) << 32);
+        p.put(ANCHOR_POS, h.anchor_pos);
+        p.put(ANCHOR_AT, h.anchor_at);
+        p.put(OVERRUN, h.overrun);
+        p.finish(KIND, WORDS, at)
+    }
+
+    /// What one look at the ring found.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Read {
+        /// Frames copied: from `start` (the position asked, or the oldest still in the ring when that had fallen out of it, `start` less the asked being the frames lost), `frames` of them, `head.channels` samples each; the newest is `head.pos`.
+        Frames { head: Head, start: u64, frames: usize },
+        /// No writer: the process ended and the kernel zeroed the payload.
+        Dead,
+        /// Nothing published yet.
+        Never,
+        /// A publish under way, or one that landed during the copy: wait on the sequence word (`seq`) and look again.
+        Busy { seq: u64 },
+        /// A payload of another layout.
+        Other,
+    }
+
+    /// Copy the frames from position `from` up to the newest into `out` (interleaved, `channels` samples a frame, as many whole frames as fit), once, each word loaded by `load` (word `i` of the mailbox, header first, as `try_read_by`), under the mailbox's seqlock: `Frames` only when the sequence was even and the same before and after.
+    pub fn read_by(load: impl Fn(usize) -> u64, from: u64, out: &mut [i32]) -> Read {
+        let s0 = load(SEQ);
+        // The sequence is seen before any payload word is read (the acquire of Boehm's first load).
+        fence(Ordering::Acquire);
+        if s0 & 1 != 0 {
+            return Read::Busy { seq: s0 };
+        }
+        if s0 & DEAD != 0 {
+            return Read::Dead;
+        }
+        if s0 == 0 {
+            return Read::Never;
+        }
+        if load(KIND_WORD) != KIND || load(LEN) as usize != WORDS {
+            return Read::Other;
+        }
+        let p = |i: usize| load(HEADER + i);
+        let format = p(FORMAT);
+        // WHY the min: the channels are the writer's word, read under no lock; the copy's stride stays inside a frame's slots whatever it says (a torn word is caught by the sequence below).
+        let channels = ((format >> 32) as u8).min(CHANNELS_MAX as u8);
+        let head = Head { pos: p(POS), rate: format as u32, channels, anchor_pos: p(ANCHOR_POS), anchor_at: p(ANCHOR_AT), overrun: p(OVERRUN) };
+        // WHY the saturating subtract: positions count from zero at the capture's start, and until a ring's frames are in the oldest frame held is frame 0.
+        // PROOF: `head.pos - RING_FRAMES` with fewer frames written than a ring underflows a u64 and would name a frame beyond every frame ever written.
+        let oldest = head.pos.saturating_sub(RING_FRAMES as u64);
+        // A position past the newest is a reader ahead of a writer that started again (its count from zero): taken from the oldest the ring holds.
+        let start = if from < oldest || from > head.pos { oldest } else { from };
+        // WHY the guard: a capture of no channels has no frames to copy; channels comes off the writer's word.
+        let fit = if channels == 0 { 0 } else { out.len() / channels as usize };
+        // WHY the min: `out` is the caller's buffer; whole frames only, as many as fit, and the next read starts where this one stopped.
+        let frames = ((head.pos - start) as usize).min(fit);
+        for f in 0..frames {
+            for c in 0..channels as usize {
+                out[f * channels as usize + c] = p(slot(start + f as u64, c)) as u32 as i32;
+            }
+        }
+        // The copy's loads are done before the sequence is read again (Boehm's reader).
+        fence(Ordering::Acquire);
+        let s1 = load(SEQ);
+        if s1 != s0 {
+            return Read::Busy { seq: s1 };
+        }
+        Read::Frames { head, start, frames }
+    }
 }
 
 /// The GPS driver's mailbox (payloads/gps; docs/GPS.md "The mailbox"): the latest fix, what the chip has sent, and the tracks (every signal of the latest fix message, then each predicted bird no heard signal stands for), published whenever any of them moves.

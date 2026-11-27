@@ -36,7 +36,8 @@ FERROS_DEV_KEY="${FERROS_DEV_KEY:-/mnt/Harbor/Code/keys/photon-signing-key.vsf}"
     --want ira "to tie its keys to this device" \
     --want entropy "to make the keys your photons are sealed with" \
     --want be_you "so your contacts find and recognise you in Photon" \
-    --want people "to show your people as your contacts"
+    --want people "to show your people as your contacts" \
+    --want mic "to carry your voice in a wave"
 [ -n "$entry" ] || exit 0
 cargo run -q --release --manifest-path "$here/tools/kistcat/Cargo.toml" -- entry --key "${FERROS_DEV_KEY:-/mnt/Harbor/Code/keys/photon-signing-key.vsf}" --capsule "$2" \
     --about "Messages, voice and video between people, not numbers" --host http://kists.fgtw.org --out "$entry"
