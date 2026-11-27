@@ -542,6 +542,8 @@ Built for both the sound service (AUDIO.md, its playback and capture rings) and 
 - **Op 2 TAKE** (the server): x1 the id → 0: the view ended (below).
 - **Op 3 VIEW** (the holder): x1 the id, x2 an arc offset for 16 bytes, [the run's bytes u64 LE][its handle slot u64 LE, u64::MAX when no pair was free] → the run's address. ERR: not a view the caller holds.
 - **Op 4 ALIVE** (the server): x1 the id → 1 while held, 0 once ended (its holder gone, or taken back).
+- **Op 5 GIVE_VIEW** (the server): GIVE read-only (below, "Views"): x1 to x3 as GIVE → the view's id.
+- **Op 6 BIND** (the holder): x1 the id, x2 a slot of its handle table (free, past the build's) → 0: the view's pair moved there, the old slot cleared. ERR, said on the console: not a view the caller holds, the slot taken, the build's or past the table. toka binds a WebAssembly memory's slot this way, its accesses naming the slot in their instructions (TOKA.md "Memories").
 
 **The doorbell** is SYS_WAIT and SYS_WAKE on a word of a run either side holds, as on a word of the arc.
 - Waiters of every process are kept under the word's address, the same in both (one map for all, as the mailboxes' and the GPU blocks' windows), so one wake reaches whoever waits there, in the one scan of the threads a wake costs; the server never counts its holders.
@@ -555,6 +557,17 @@ Built for both the sound service (AUDIO.md, its playback and capture rings) and 
 **The isolation, said plainly**, as for the mailboxes: a masked holder reaches its run and nothing else of the pool; a native process could name the window by its address, as it could any region of the one shared table, and native code is trusted by its signature.
 
 **The cost**: a frame per pool at least, a run's bytes per view; a produce is stores and, when the other side waits, one SYS_WAKE.
+
+#### Views (2026-11-26, built, not yet run on a device)
+
+The owner: "sharing is caring but privacy is key", and, on whether a reader could be kept from writing without spending registers: "sounds super gooder", "Was honestly stressing on how to share the font stack among all the kists."
+A **view** is a run given read-only (the word the mailboxes and the camera already used for a reader's mapping): the reader looks, it does not touch.
+- **The mirror:** the shared window's upper half maps every pool's frames again, EL0 read-only (AP[2], which binds the kernel too in the VHE regime), never executable: pool j's mirror is the GiB at `SHARE_VA.0 + (j + SHARE_POOLS) * GiB`, mapped with each frame as the pool grows and blanked with it when the pool ends. The window holds 64 pools now (its lower half).
+- **The holder's pair** points into the mirror at the run, its mask the run's size, so masked code reads exactly its run and a store faults; no register is spent on it (the load-only pair considered first would have taken x18 to x20) and no instruction is added to an access.
+- **Its address** from VIEW is the mirror's. A word the holder waits on there is kept under the read-write address, so the writer's wake (and a read-write holder's) finds it; the holder may ring the server's bell as any holder does.
+- **What it is for:** one copy of read-only data for every process that reads it, a font set or an icon bundle held once and viewed by every kist (its server loads it into its pool and answers an open with GIVE_VIEW); a camera frame or a decoded image handed to a reader that must not change it; a sensor's mailbox is the same idea, built before.
+- **Not yet:** a view of a view (passing one on), shared code (frames of checked code in an executable mirror, every kist branching into one copy of std or fluor under its own arc), and the person's list of who holds what (the permissions page), each a step of its own.
+
 
 ### Cores
 

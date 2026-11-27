@@ -4,6 +4,8 @@
 //! - The doorbell is SYS_WAIT and SYS_WAKE on a word of a run either side holds: waiters are kept under the word's address, the same in every process, so the server's wake finds every view's waiter in the one scan of the threads a wake costs, without counting them.
 //! - The server's bell: a word of its own arc it names with its pool. A holder's wake on its run also counts that word up by one and wakes its waiters, so a server with many holders waits on one word for all of them (a futex word that moved, so a wake between its look at the rings and its wait is never lost) and looks at its rings when it rings.
 //! - A view ends at the server's TAKE, when its holder ends or when the server ends; a pool ends with its server. Every thread waiting on a word of what ended is woken, and finds it gone at its next wait (ERR).
+//! - A view is read-write (GIVE) or read-only (GIVE_VIEW, 2026-11-26, KERNEL.md "Views"; the owner: "sharing is caring but privacy is key"): a read-only holder's pair points into the pool's mirror, the same frames mapped EL0 read-only in the window's upper half (`cachemap::SHARE_POOLS`), so it reads the run and cannot write it; a word it waits on there is kept under the read-write address, so the writer's wake finds it.
+//! - BIND moves a holder's pair to the slot it names (toka binds a WebAssembly memory's slot this way: its accesses name the slot in their code, docs/TOKA.md "Memories").
 
 use super::*;
 
@@ -30,6 +32,8 @@ struct View {
     log: u32,
     holder: u64,
     slot: Option<usize>,
+    /// Given read-only: the holder's pair points into the pool's mirror.
+    read_only: bool,
 }
 
 /// The pools by window slot, and the views given: as many as are made, no table of fixed size (the window's GiBs bound the pools, `cachemap::SHARE_VA`). Under the kernel lock.
@@ -45,6 +49,10 @@ fn views() -> &'static mut Vec<View> {
 }
 fn pool_va(j: usize) -> usize {
     crate::cachemap::SHARE_VA.0 + j * crate::cachemap::SHARE_POOL_MOST
+}
+/// Pool j's read-only mirror: the same frames, a half-window up.
+fn mirror_va(j: usize) -> usize {
+    pool_va(j + crate::cachemap::SHARE_POOLS)
 }
 fn say(p: &Process, what: &str) {
     k_console(&alloc::format!("share: {}: {what}\n", core::str::from_utf8(&p.name).unwrap_or("?")));
@@ -93,7 +101,7 @@ fn pool(p: &Process, log: u64, slot: u64, bell: u64) -> u64 {
             }
             let j = match pools().iter().position(|x| x.owner == 0 && x.frames.is_empty()) {
                 Some(j) => j,
-                None if pool_va(pools().len()) < crate::cachemap::SHARE_VA.1 => {
+                None if pools().len() < crate::cachemap::SHARE_POOLS => {
                     pools().push(Pool { owner: 0, frames: Vec::new(), slot: 0, bell: 0 });
                     pools().len() - 1
                 }
@@ -119,7 +127,8 @@ fn pool(p: &Process, log: u64, slot: u64, bell: u64) -> u64 {
             say(p, "the frame pool has no frame for the pool's growth");
             return if n == had && had == 0 { pool_drop(j) } else { ERR };
         };
-        if !crate::cachemap::share_map(pool_va(j) + n * crate::frames::FRAME, crate::frames::pa(f)) {
+        // Mapped twice: read-write for the server and the read-write views, read-only in the mirror for the read-only views.
+        if !crate::cachemap::share_map(pool_va(j) + n * crate::frames::FRAME, crate::frames::pa(f)) || !crate::cachemap::share_view_map(mirror_va(j) + n * crate::frames::FRAME, crate::frames::pa(f)) {
             crate::frames::give(f);
             say(p, "the frame pool has no frame for the window's table");
             return if had == 0 && n == 0 { pool_drop(j) } else { ERR };
@@ -130,6 +139,7 @@ fn pool(p: &Process, log: u64, slot: u64, bell: u64) -> u64 {
     if n > had {
         // Blocks a pool given back mapped to the blank frame before: every core told to forget them.
         crate::cachemap::surface_unmapped(pool_va(j) + had * crate::frames::FRAME, (n - had) * crate::frames::FRAME);
+        crate::cachemap::surface_unmapped(mirror_va(j) + had * crate::frames::FRAME, (n - had) * crate::frames::FRAME);
     }
     // The handle covers what the pool holds, a power of two from its start (the frames are 2 MiB, the size a power of two of them).
     let size = n * crate::frames::FRAME;
@@ -144,8 +154,8 @@ fn pool_drop(j: usize) -> u64 {
     ERR
 }
 
-/// Op 1 GIVE: the run of 2^`log` bytes at `off` in the caller's pool given read-write to the process waiting on the reply token at arc offset `reply_off`. → the view's id (never 0). ERR, said on the console: no pool, the run outside what it holds or not aligned to its size, the token answering no other process.
-fn give(p: &Process, reply_off: u64, off: u64, log: u64) -> u64 {
+/// Op 1 GIVE (read-write) and op 5 GIVE_VIEW (`read_only`): the run of 2^`log` bytes at `off` in the caller's pool given to the process waiting on the reply token at arc offset `reply_off`. → the view's id (never 0). ERR, said on the console: no pool, the run outside what it holds or not aligned to its size, the token answering no other process.
+fn give(p: &Process, reply_off: u64, off: u64, log: u64, read_only: bool) -> u64 {
     let Some(j) = pools().iter().position(|x| x.owner == p.epoch) else {
         say(p, "GIVE without a pool");
         return ERR;
@@ -165,7 +175,7 @@ fn give(p: &Process, reply_off: u64, off: u64, log: u64) -> u64 {
         say(p, "the reply token answers no other process");
         return ERR;
     };
-    let base = pool_va(j) as u64 + off;
+    let base = if read_only { mirror_va(j) } else { pool_va(j) } as u64 + off;
     let slot = free_pair(q);
     if let Some(s) = slot {
         write_pair(q, s, base, (1 << log) - 1);
@@ -175,7 +185,7 @@ fn give(p: &Process, reply_off: u64, off: u64, log: u64) -> u64 {
         NEXT_ID += 1;
         id
     };
-    views().push(View { id, pool: j, off: off as usize, log: log as u32, holder: q.epoch, slot });
+    views().push(View { id, pool: j, off: off as usize, log: log as u32, holder: q.epoch, slot, read_only });
     id
 }
 
@@ -213,7 +223,27 @@ fn view(p: &Process, id: u64, out: u64) -> u64 {
     b[..8].copy_from_slice(&(1u64 << v.log).to_le_bytes());
     b[8..].copy_from_slice(&v.slot.map_or(u64::MAX, |s| s as u64).to_le_bytes());
     p.write(out, &b);
-    (pool_va(v.pool) + v.off) as u64
+    (if v.read_only { mirror_va(v.pool) } else { pool_va(v.pool) } + v.off) as u64
+}
+
+/// Op 6 BIND, the holder's: view `id`'s pair moved to slot `slot` of its handle table (free, past the slots its build wrote), the old one cleared. → 0. ERR, said on the console: not a view the caller holds, the slot taken or outside the table.
+fn bind(p: &Process, id: u64, slot: u64) -> u64 {
+    let Some(i) = views().iter().position(|v| v.id == id && v.holder == p.epoch) else { return ERR };
+    // WHY: `slot` is the caller's word; past the table it names no pair, and one in use (or the build's) is not the view's to take.
+    let built = unsafe { core::ptr::read_volatile((p.arc.base + p.fast.tokens) as *const u32) } as usize;
+    let s = slot as usize;
+    if slot >= ((TOKENS - HANDLES) / 16) as u64 || s < built || (views()[i].slot != Some(s) && unsafe { core::ptr::read_volatile((p.arc.base + HANDLES + 16 * s) as *const u64) } != 0) {
+        say(p, "BIND: the slot is taken, the build's, or past the table");
+        return ERR;
+    }
+    let v = views()[i];
+    if let Some(old) = v.slot.filter(|&o| o != s) {
+        write_pair(p, old, 0, 0);
+    }
+    let base = if v.read_only { mirror_va(v.pool) } else { pool_va(v.pool) } as u64 + v.off as u64;
+    write_pair(p, s, base, (1u64 << v.log) - 1);
+    views()[i].slot = Some(s);
+    0
 }
 
 /// Op 4 ALIVE, the server's: 1 while view `id` is held, 0 once it ended (its holder gone, or taken back). ERR: no pool.
@@ -228,10 +258,12 @@ fn alive(p: &Process, id: u64) -> u64 {
 pub(super) fn syscall(f: &mut Frame, p: &Process) {
     f.x[0] = match f.x[0] {
         0 => pool(p, f.x[1], f.x[2], f.x[3]),
-        1 => give(p, f.x[1], f.x[2], f.x[3]),
+        1 => give(p, f.x[1], f.x[2], f.x[3], false),
         2 => take(p, f.x[1]),
         3 => view(p, f.x[1], f.x[2]),
         4 => alive(p, f.x[1]),
+        5 => give(p, f.x[1], f.x[2], f.x[3], true),
+        6 => bind(p, f.x[1], f.x[2]),
         _ => ERR,
     };
 }
@@ -244,14 +276,17 @@ pub(super) fn word(p: &Process, off: u64) -> Option<usize> {
     if a < lo || a >= hi || a % 8 != 0 {
         return None;
     }
-    let j = (a - lo) / crate::cachemap::SHARE_POOL_MOST;
+    let slot = (a - lo) / crate::cachemap::SHARE_POOL_MOST;
+    // A word in a pool's mirror is a read-only view's: kept under its read-write address, where the writer's wake looks.
+    let (j, read_only) = if slot >= crate::cachemap::SHARE_POOLS { (slot - crate::cachemap::SHARE_POOLS, true) } else { (slot, false) };
+    let a = if read_only { a - (mirror_va(j) - pool_va(j)) } else { a };
     let at = a - pool_va(j);
     let x = pools().get(j)?;
     // WHY: only the frames a pool holds are mapped; past them the kernel's own read of the word would fault.
     if at >= x.frames.len() * crate::frames::FRAME {
         return None;
     }
-    let mine = x.owner == p.epoch || views().iter().any(|v| v.pool == j && v.holder == p.epoch && at >= v.off && at < v.off + (1 << v.log));
+    let mine = (!read_only && x.owner == p.epoch) || views().iter().any(|v| v.pool == j && v.holder == p.epoch && v.read_only == read_only && at >= v.off && at < v.off + (1 << v.log));
     mine.then_some(a)
 }
 
@@ -279,8 +314,10 @@ pub(super) fn gone(epoch: u64) {
     };
     for m in 0..n {
         crate::cachemap::share_map(va + m * crate::frames::FRAME, crate::frames::pa(blank));
+        crate::cachemap::share_view_map(mirror_va(j) + m * crate::frames::FRAME, crate::frames::pa(blank));
     }
     crate::cachemap::surface_unmapped(va, n * crate::frames::FRAME);
+    crate::cachemap::surface_unmapped(mirror_va(j), n * crate::frames::FRAME);
     for &f in &pools()[j].frames {
         crate::frames::give(f as usize);
     }
@@ -294,7 +331,8 @@ pub(super) fn report(s: &mut alloc::string::String) {
     for (j, x) in pools().iter().enumerate().filter(|(_, x)| x.owner != 0) {
         let name = k().procs.iter().flatten().find(|q| q.epoch == x.owner).map(|q| alloc::string::String::from_utf8_lossy(&q.name).into_owned()).unwrap_or_default();
         let nv = views().iter().filter(|v| v.pool == j).count();
-        let _ = core::fmt::Write::write_fmt(s, format_args!("share pool A#{j} of {name} at G#{:X}: A#{} MiB, A#{nv} views\n", pool_va(j), x.frames.len() * 2));
+        let ro = views().iter().filter(|v| v.pool == j && v.read_only).count();
+        let _ = core::fmt::Write::write_fmt(s, format_args!("share pool A#{j} of {name} at G#{:X}: A#{} MiB, A#{nv} views (A#{ro} read-only)\n", pool_va(j), x.frames.len() * 2));
     }
 }
 

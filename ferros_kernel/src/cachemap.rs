@@ -928,15 +928,27 @@ pub fn gpub_map(va: usize, pa: usize) {
     *e = pool(vhe(), pa, BLOCK) | UXN;
 }
 
-/// The shared regions' window (2026-11-24, docs/KERNEL.md "Shared regions"): each server's pool a GiB of addresses here, pool j at `SHARE_VA.0 + j * GIB`, its frames mapped from the GiB's start as it grows (process.rs share.rs `pool_grow`), Normal write-back, EL0 read/write, never executable, as a GPU block's.
+/// The shared regions' window (2026-11-24, docs/KERNEL.md "Shared regions"): each server's pool a GiB of addresses here, pool j at `SHARE_VA.0 + j * GIB`, its frames mapped from the GiB's start as it grows (share.rs `pool`), Normal write-back, EL0 read/write, never executable, as a GPU block's.
+/// Its upper half is the pools' views (2026-11-26, KERNEL.md "Views"): pool j's frames again at `SHARE_VA.0 + (j + SHARE_POOLS) * GIB`, EL0 read-only (AP[2], which binds EL2 too in the VHE regime), never executable, so a holder given a run read-only reaches it thru a pair into this mirror and cannot write it.
 /// The same address in every process (one map for all, as the surfaces' and the blocks' windows), so a word of a ring is one waiting address whoever waits on it, and a masked holder reaches its run thru a handle (a run of a power of two at an offset aligned to it, inside a GiB aligned to a GiB).
 /// Its level-2 tables are taken from the pool as a GiB is first used (`share_map`), so the window costs addresses until a pool holds a frame: 128 GiBs from G#60_0000_0000 to the top of the 39-bit space that TTBR0 walks, free of every other window.
 pub const SHARE_VA: (usize, usize) = (0x60_0000_0000, 0x80_0000_0000);
 pub const SHARE_POOL_MOST: usize = GIB;
+/// How many pools the window holds: its lower half (the upper is their read-only mirrors).
+pub const SHARE_POOLS: usize = (SHARE_VA.1 - SHARE_VA.0) / GIB / 2;
 const _: () = assert!(SHARE_VA.0 % GIB == 0 && SHARE_VA.0 >= GPUB_VA.1 && SHARE_VA.1 <= 0x80_0000_0000, "the shared regions' window: GiB-aligned, above the GPU blocks, inside the 39-bit space");
 
 /// Point the shared regions' window's 2 MiB block at `va` (inside `SHARE_VA`, 2 MiB aligned) at the frame at `pa`, Normal write-back, EL0 read/write, never executable; its GiB's level-2 table made first when it has none (`table_take`). False when the pool has no frame for that table: nothing is mapped then. Call `surface_unmapped` over the blocks once they are written.
 pub fn share_map(va: usize, pa: usize) -> bool {
+    share_map_as(va, pa, false)
+}
+
+/// `share_map` read-only: the block at `va` (in the window's upper half, a pool's mirror) maps frame `pa` EL0 read-only, never executable.
+pub fn share_view_map(va: usize, pa: usize) -> bool {
+    share_map_as(va, pa, true)
+}
+
+fn share_map_as(va: usize, pa: usize, read_only: bool) -> bool {
     let l1 = unsafe { &mut (*(&raw mut L1)).0 };
     let e1 = &mut l1[va / GIB];
     let t = match next_table(*e1) {
@@ -948,7 +960,7 @@ pub fn share_map(va: usize, pa: usize) -> bool {
             t
         }
     };
-    unsafe { (*(t as *mut [u64; 512]))[(va / MIB2) % 512] = pool(vhe(), pa, BLOCK) | UXN };
+    unsafe { (*(t as *mut [u64; 512]))[(va / MIB2) % 512] = pool(vhe(), pa, BLOCK) | UXN | if read_only { AP_RO } else { 0 } };
     true
 }
 

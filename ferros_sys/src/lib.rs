@@ -1540,6 +1540,17 @@ pub mod share {
         (r != ERR).then_some(r)
     }
 
+    /// `give` read-only (docs/KERNEL.md "Views", 2026-11-26): the holder's handle points into the pool's read-only mirror, so it reads the run (its address from `view` is the mirror's) and a store faults. What a font, an icon set or any data many kists read from one copy is handed out with. None as `give`, or a kernel from before (op 5 unknown).
+    pub fn give_view(reply: &[u8; 32], at: u64, log: u32) -> Option<u64> {
+        let r = svc(nr::SHARE, 5, off(reply.as_ptr()), at, log as u64, 0);
+        (r != ERR).then_some(r)
+    }
+
+    /// The holder's view `id` moved to handle slot `slot` (free, past the slots its build wrote), so masked code that names the slot in its instructions reaches it (toka's memories, docs/TOKA.md). False: not a view the caller holds, the slot taken or the build's, past the table, or a kernel from before.
+    pub fn bind(id: u64, slot: u64) -> bool {
+        svc(nr::SHARE, 6, id, slot, 0, 0) == 0
+    }
+
     /// The caller's view `id` taken back: its holder's handle cleared, its waiters woken. False when it is not one of the caller's (ended already).
     pub fn take(id: u64) -> bool {
         svc(nr::SHARE, 2, id, 0, 0, 0) == 0
