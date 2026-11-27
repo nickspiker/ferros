@@ -16,7 +16,7 @@ Owner: "I'm trying to figure out why we cannot scale on demand, that was the who
 | | The design (KERNEL.md, SANDBOX.md) | Built |
 |---|---|---|
 | Arcs per process | one or more; "fragments are just more arcs" | one |
-| Size | ring mode doubles in place (x27), exact grows by any amount (x27 a limit) | fixed at spawn: the image plus the heap the build declared |
+| Size | ring mode doubles in place (x27); exact grew by any amount (x27 a limit) until retired 2026-11-26 | fixed at spawn: the image plus the heap the build declared |
 | Where | anywhere in a wrapping address space | a physically contiguous power-of-two block from a buddy allocator |
 | The memory it comes from | the device's | two pools carved at boot: 16 MB (G#8300_0000) and 320 MB (G#A000_0000); the rest of the 12 GB (Pro) is in no pool |
 | Rotation | continuous | not built |
@@ -35,7 +35,7 @@ The boot carve-outs (kernel, the hv, the DMA area, gpu-mem, the modem's and the 
 - **Grow:** a process asks (a syscall; ferros_rt's allocator asks when its heap runs out, so a build declares at most a ceiling, never a reservation). If the frames right after the arc are free, they join it: ring mode's mask doubles, exact mode's limit moves. Nothing else changes.
 - **Move (owner, 2026-11-11: "memory speed is very fast so a simple move of application memory and change of address will be likely imperceptible on a large app launch"):** if the neighbours are taken but enough is free elsewhere, the kernel stops the process's threads, copies the arc to a place it fits with room to grow, and sets the new base.
   - Fixed and ring modes keep only the low bits of a pointer (`bfi`, `and` with x27), so every stored pointer is already an offset into the arc: the move is the copy plus the base register (x28, x26's high bits). No pointer is rewritten.
-  - Exact mode and native std processes (Mahere, Photon today) hold whole addresses: for them the arc is a window of virtual addresses the MMU maps (owner, 2026-11-03: pages allowed where equivalent and faster), and a move is the copy plus remapping the same window to the new frames; the process never sees an address change.
+  - Native std processes (Mahere, Photon today), and exact mode until its retirement (2026-11-26, SANDBOX.md "Modes"), hold whole addresses: for them the arc is a window of virtual addresses the MMU maps (owner, 2026-11-03: pages allowed where equivalent and faster), and a move is the copy plus remapping the same window to the new frames; the process never sees an address change.
   - **Measured on the Pro (2026-11-11, payloads/copybench, one Cortex-X3, 16 MiB copied 16 times):** memcpy best 19.4 GB/s, mean 16.1 GB/s; a 16-byte-word loop best 18.9, mean 16.8; read back the same. Mahere's whole 205 MB moves in about 11-13 ms, under one frame at 60 Hz; a few tens of MB in 1-3 ms. A move split across cores may come nearer LPDDR5X's ~50 GB/s peak: not measured yet.
 - **Shrink and give back:** the same call in reverse, and every end returns the whole arc (one shot dead, as now). ahau gives back its frames after attest.
 - **Compaction is the same move,** done when a spawn or a grow finds enough free memory but no single run of it.

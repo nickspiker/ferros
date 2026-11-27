@@ -17,22 +17,22 @@ Today it runs on the developer's machine; it is built to run on the device (pure
 ## The pieces
 
 - **The Cranelift fork:** /mnt/Harbor/Code/wasmtime, upstream v51.0.0 with ferros's commits on its one line, `main`.
-  A shared setting, `ferros_mask` (`none`, `ring`, `fixed` with `ferros_fixed_log2`, `exact`), turns on the ferros masking in the aarch64 back end, at emission (cranelift/codegen/src/isa/aarch64/inst/ferros.rs):
+  A shared setting, `ferros_mask` (`none`, `ring`, `fixed` with `ferros_fixed_log2`; `exact` until its retirement, SANDBOX.md "Modes"), turns on the ferros masking in the aarch64 back end, at emission (cranelift/codegen/src/isa/aarch64/inst/ferros.rs):
   - x21 to x28 are never allocated; `get_pinned_reg` reads x28.
   - Every load and store not off sp is emitted in the checker's forms, the same rules ferros-as applies to text, and every write of sp goes through x24 and the mode's one sp writer; writeback becomes an explicit adjustment.
   - No data in code: float and vector constants are built in registers (no literal pools), jump tables are tables of branches (`bti j; b target` under BTI), symbol addresses are ADRP and ADD.
   - Under BTI every return is `br x30` and every call is followed by `bti j`. Pointer authentication stays off (its keys hold shares of the ira and the wairua).
   - The atomic retry loops and CASP take fixed registers from x8 to x15, and a trap is `brk #G#C11F` (the checker refuses `udf`).
-  - Branches resolve after the masking is in, and Cranelift bridges a short branch the masking moved out of reach with a veneer, so exact mode has no reach problem here (it has through ferros-as, whose assembler relaxes nothing).
+  - Branches resolve after the masking is in, and Cranelift bridges a short branch the masking moved out of reach with a veneer (ferros-as's assembler relaxes nothing).
 - **toka** (toka/, its own workspace and lock, as tools/transcribe): the module reader and validator (wasmparser), wasmtime's operator translator (toka/src/translate, NOTICE beside it) over toka's own environment, toka's runtime functions, the linker, and the checker over every function.
-  `cargo build --manifest-path toka/Cargo.toml` (needs the fork beside the checkout, at ../wasmtime), then `toka/target/debug/toka <in.wasm|in.wat> -o <out.bin> [--fixed K | --exact --bti | --bti]`.
+  `cargo build --manifest-path toka/Cargo.toml` (needs the fork beside the checkout, at ../wasmtime), then `toka/target/debug/toka <in.wasm|in.wat> -o <out.bin> [--fixed K] [--bti]`.
 
 ## What toka takes
 
 The MVP, multi-value, sign extension, saturating conversions, bulk memory, SIMD and relaxed SIMD, threads' atomics, tail calls, 64-bit memories, multiple memories, extended constants, wide arithmetic.
 Refused, with the reason: garbage collection, reference types and every table operator but `call_indirect`, exceptions, stack switching, shared-everything threads, imports other than functions, and (until threads come) `memory.atomic.wait` and `notify`.
 
-WebAssembly's out-of-bounds trap is not kept: an access is masked, so in ring mode it wraps inside the arc and in exact mode it faults outside it.
+WebAssembly's out-of-bounds trap is not kept: an access is masked, so it wraps inside its arc's window, and the window's unbacked rest faults.
 Division by zero, an overflowing signed division, an unrepresentable float conversion, `unreachable`, a `call_indirect` out of its table or of the wrong type: those trap (`brk`), and the process ends.
 
 ## The image

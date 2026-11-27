@@ -1,6 +1,6 @@
 //! toka: compile a WebAssembly module (.wasm, or .wat text) into a masked ferros image the sandbox checker has passed (docs/TOKA.md).
 //!
-//! Usage: toka <in.wasm|in.wat> [-o <out.bin>] [--fixed K | --exact] [--bti] [--reserve LOG2]
+//! Usage: toka <in.wasm|in.wat> [-o <out.bin>] [--fixed K] [--bti] [--reserve LOG2]
 
 use std::process::exit;
 use toka::{Mask, Options};
@@ -22,7 +22,6 @@ fn main() {
                 let v: u32 = args.get(k).and_then(|v| v.parse().ok()).filter(|v| (16..=40).contains(v)).unwrap_or_else(|| usage("--fixed needs K, 16 to 40"));
                 opts.mask = Mask::Fixed(v);
             }
-            "--exact" => opts.mask = Mask::Exact,
             "--bti" => opts.bti = true,
             "--reserve" => {
                 k += 1;
@@ -32,9 +31,6 @@ fn main() {
             a => usage(&format!("unexpected argument {a}")),
         }
         k += 1;
-    }
-    if opts.mask == Mask::Exact && !opts.bti {
-        usage("--exact needs --bti");
     }
     let input = input.unwrap_or_else(|| usage("no input"));
     let raw = std::fs::read(&input).unwrap_or_else(|e| {
@@ -83,6 +79,6 @@ fn wat_to_wasm(path: &str) -> Vec<u8> {
 }
 
 fn usage(why: &str) -> ! {
-    eprintln!("toka: {why}\nusage: toka <in.wasm|in.wat> [-o <out.bin>] [--fixed K | --exact] [--bti] [--reserve LOG2]");
+    eprintln!("toka: {why}\nusage: toka <in.wasm|in.wat> [-o <out.bin>] [--fixed K] [--bti] [--reserve LOG2]");
     exit(2)
 }

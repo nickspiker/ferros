@@ -25,7 +25,7 @@ fn fail(msg: impl std::fmt::Display) -> ! {
 }
 
 fn usage() -> ! {
-    eprintln!("usage:\n  kistcat entry --key <developer key .vsf> --capsule <capsule.vsf> --about TEXT --host <http base URL>... --out <entry.vsf>\n  kistcat build (--key <secret .key.vsf> | --unsigned) --out <dir> [--web <web/index.html>] --entry <entry.vsf>...\n  kistcat publish <entry.vsf>... [--to <http URL>]\n  kistcat verify <kists.vsf> [--key <secret .key.vsf>]\n  kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--icon <icon .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf> [--entry <entry.vsf> --about TEXT --host <http base URL>...]\n  kistcat devkey new --secret <file> --label LABEL --name NAME [--contact C] [--web W] [--kind K] --record <file>\n  kistcat devkey show <record>\n  kistcat devkey convert --raw <old key file> --label LABEL --secret <new .key.vsf>   (the ferros key: --label FERROS_PROJECT)");
+    eprintln!("usage:\n  kistcat entry --key <developer key .vsf> --capsule <capsule.vsf> --about TEXT --host <http base URL>... --out <entry.vsf>\n  kistcat build (--key <secret .key.vsf> | --unsigned) --out <dir> [--web <web/index.html>] --entry <entry.vsf>...\n  kistcat publish <entry.vsf>... [--to <http URL>]\n  kistcat verify <kists.vsf> [--key <secret .key.vsf>]\n  kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--icon <icon .vsf>] [--fixed K] [--bti] --out <capsule.vsf> [--entry <entry.vsf> --about TEXT --host <http base URL>...]\n  kistcat devkey new --secret <file> --label LABEL --name NAME [--contact C] [--web W] [--kind K] --record <file>\n  kistcat devkey show <record>\n  kistcat devkey convert --raw <old key file> --label LABEL --secret <new .key.vsf>   (the ferros key: --label FERROS_PROJECT)");
     exit(2)
 }
 
@@ -647,7 +647,7 @@ mod tests {
     fn capsule(key: &SigningBundle, version: Option<Version>) -> Vec<u8> {
         let d = ferros_kist::Decl { name: "Clock".into(), wants: vec![] };
         let image = [7u8; 64];
-        let code = ferros_kist::capsule::Code { image: &image, masked: true, text: Some(64), fixed: None, bti: false, exact: false };
+        let code = ferros_kist::capsule::Code { image: &image, masked: true, text: Some(64), fixed: None, bti: false };
         fgtw::release::sign_release(ferros_kist::capsule::unsigned(&d, [5; 32], version.as_ref(), Some("Test Developer"), None, &key.public(), &code, 3).unwrap(), key).unwrap()
     }
 
@@ -685,7 +685,7 @@ mod tests {
 }
 
 
-/// `kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--icon <icon .vsf>] [--fixed K] [--bti] [--exact] --out <capsule.vsf>`: a kist signed by its developer's own key (owner, 2026-11-10: trust on first stow). `--want` is for the rights the person is asked for; the implicit set (ferros_kist::IMPLICIT, KISTS.md "The implicit set") every kist is handed without one.
+/// `kistcat kist --key <developer key .vsf> --masked <image.bin> --text-len N --name NAME --option HEX64 --version 0.1.0 [--want RIGHT REASON]... [--record <public record .vsf>] [--icon <icon .vsf>] [--fixed K] [--bti] --out <capsule.vsf>`: a kist signed by its developer's own key (owner, 2026-11-10: trust on first stow). `--want` is for the rights the person is asked for; the implicit set (ferros_kist::IMPLICIT, KISTS.md "The implicit set") every kist is handed without one.
 /// - The key is the developer's secret (`devkey new`: section `developer_key` { label a, seed kge }); the bundle is derived from it under its label, used here and dropped, and nothing of it is printed or copied.
 /// - The code is a sandboxed image from tools/ferros-masked-build.sh (its flat .bin, and its text length: the .textlen file beside it), as the bridge's `capsule --masked --text-len` takes them; the network stower refuses native code.
 /// - `--record`: the developer's public record (`devkey new --record`), checked with every egg and that it names this key; its name goes into the declaration as `developer`, which the directory lists and the person's pin keeps.
@@ -702,7 +702,7 @@ fn kist(args: &[String]) {
     let mut icon_path: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut fixed: Option<u32> = None;
-    let (mut bti, mut exact) = (false, false);
+    let mut bti = false;
     let mut wants: Vec<(u8, String)> = Vec::new();
     // `--entry <out> --about TEXT --host <base>...`: the developer's signed entry written beside the capsule, with the same key, in the same run (KIST-DISTRIBUTION.md 1.0).
     let (mut entry_out, mut about, mut hosts) = (None::<PathBuf>, None::<String>, Vec::<String>::new());
@@ -721,7 +721,6 @@ fn kist(args: &[String]) {
             "--out" => out = Some(val().into()),
             "--fixed" => fixed = Some(val().parse().unwrap_or_else(|_| fail("--fixed takes K, the arc's size 2^K"))),
             "--bti" => bti = true,
-            "--exact" => exact = true,
             "--want" => {
                 let right = val();
                 let reason = val();
@@ -775,7 +774,7 @@ fn kist(args: &[String]) {
         ferros_kist::icon_document(&doc).unwrap_or_else(|e| fail(format!("{}: {e}", p.display())))
     });
     let decl = ferros_kist::Decl { name, wants };
-    let c = ferros_kist::capsule::Code { image: &code, masked: true, text: Some(text), fixed, bti, exact };
+    let c = ferros_kist::capsule::Code { image: &code, masked: true, text: Some(text), fixed, bti };
     let unsigned = ferros_kist::capsule::unsigned(&decl, option, Some(&version), developer.as_deref(), icon.as_ref(), &public, &c, vsf::eagle_time_oscillations()).unwrap_or_else(|e| fail(e));
     let capsule = fgtw::release::sign_release(unsigned, &signer).unwrap_or_else(|e| fail(e));
     // The entry with the same key, before it is dropped; checked against the capsule just built.

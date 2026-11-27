@@ -36,7 +36,7 @@ So the order is forced: the address space first, then the ceilings can go.
 - **The count:** 8176 process windows on the Pro, 16352 on the 8a, against a few dozen processes today. That is a REAL bound (the address bits); past it the refusal says "no addresses left" by name. Per-process tables would lift it.
 - **Masked arcs:** x27 covers the whole window from spawn (mask 2P - 1 in ring mode; exact mode's limit the window less its guard) and never changes. A grow is then only frames mapped: no thread is held for it (process.rs:8270, the hold stays for moves), and a wild pointer lands in its own window, mapped or not, never in another's. Unmapped slots fault as `ARC_RELEASE`'s holes do today. The 64 KiB guard above a masked arc (process.rs:884) becomes the window's top 64 KiB, unmapped.
 - **What changes for ring mode:** a pointer past the arc's size no longer wraps into the arc; it faults in the window's unmapped part. Louder, and the same isolation (decision 2).
-- **Exact mode** then buys nothing for an arc that ring does not (its point was a non-power-of-two size; a window costs no frames past what is mapped), at +24 to 36% code (SANDBOX.md "Modes"). It stays for handles to odd-sized MMIO (decision 2).
+- **Exact mode** then buys nothing for an arc that ring does not (its point was a non-power-of-two size; a window costs no frames past what is mapped), at +24 to 36% code (SANDBOX.md "Modes"). It stays for handles to odd-sized MMIO (decision 2). Retired 2026-11-26 (SANDBOX.md "Modes").
 - **Fixed mode** is unchanged: the arc is the sealed 2^K its `bfi` encodes, and never grows. The size is the code, chosen by the capsule's build (decision 3).
 - **Native arcs** (std apps, the native payloads) get the same window. Their pointers are whole addresses, so nothing in them changes but where the stack lies (0.4).
 - **The start-size word** (built, step 2): bits 8 to 13 of the header's word at offset 4 give the log2 of the heap the kernel maps at spawn, 0 for its 4 MiB (process.rs `image_start`; `ferros_sys::entry!(main, grows C, starts K)`). A kernel from before reads bit 0 alone.
@@ -243,7 +243,7 @@ The owner's order holds (memory, the kernel, slot tables). Stacks come after the
 The owner, 2026-11-23, relayed by the coordinator: "all yes". As recorded:
 - 0: 48-bit addresses, measured at step 2 before they are kept.
 - 1: the headroom measured from the system processes' peaks.
-- 2: faults over wraps in ring mode; exact mode for odd-sized handles.
+- 2: faults over wraps in ring mode; exact mode for odd-sized handles (exact retired 2026-11-26: odd sizes are a window's backed part, SANDBOX.md "Modes").
 - 3: fixed mode only for drivers whose needs are known.
 - 4: each thread its own growing stack window (the alternative below, not the halved reaches); 0.4 says it so.
 - 5: "too long", never a silent cut.

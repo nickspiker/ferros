@@ -15,7 +15,6 @@ pub struct Modes {
     pub text_len: usize,
     pub fixed: u32,
     pub bti: bool,
-    pub exact: bool,
 }
 
 /// The fields both forms cover, in the order the image form always had them.
@@ -31,9 +30,7 @@ fn fields(h: &mut blake3::Hasher, developer: &[u8; 32], option: &[u8; 32], maske
     if m.bti {
         h.update(b"bti");
     }
-    if m.exact {
-        h.update(b"exact");
-    }
+    // Exact mode (retired 2026-11-26) added `exact` here; no capsule made since carries it, and the seals of every other mode never had it.
     h.update(&(m.text_len as u64).to_le_bytes());
 }
 
@@ -143,7 +140,7 @@ mod tests {
     const KEY: [u8; 32] = [7; 32];
     const DEV: [u8; 32] = [1; 32];
     const OPT: [u8; 32] = [2; 32];
-    const M: Modes = Modes { text_len: 4096, fixed: 0, bti: true, exact: true };
+    const M: Modes = Modes { text_len: 4096, fixed: 0, bti: true };
 
     fn image() -> Vec<u8> {
         (0..10_000u32).map(|i| (i * 31) as u8).collect()
@@ -158,7 +155,6 @@ mod tests {
         h.update(&OPT);
         h.update(&[1]);
         h.update(b"bti");
-        h.update(b"exact");
         h.update(&4096u64.to_le_bytes());
         h.update(&code);
         assert_eq!(by_image(&KEY, &DEV, &OPT, true, &M, &code), *h.finalize().as_bytes());
@@ -176,8 +172,8 @@ mod tests {
         assert_ne!(s, by_address(&KEY, &OPT, &DEV, true, &M, &addr));
         assert_ne!(s, by_address(&KEY, &DEV, &OPT, false, &M, &addr));
         assert_ne!(s, by_address(&KEY, &DEV, &OPT, true, &Modes { text_len: 4092, ..M }, &addr));
-        assert_ne!(s, by_address(&KEY, &DEV, &OPT, true, &Modes { bti: false, exact: false, ..M }, &addr));
-        assert_ne!(s, by_address(&KEY, &DEV, &OPT, true, &Modes { fixed: 20, bti: true, exact: false, text_len: 4096 }, &addr));
+        assert_ne!(s, by_address(&KEY, &DEV, &OPT, true, &Modes { bti: false, ..M }, &addr));
+        assert_ne!(s, by_address(&KEY, &DEV, &OPT, true, &Modes { fixed: 20, bti: true, text_len: 4096 }, &addr));
     }
 
     #[test]
@@ -249,7 +245,7 @@ mod tests {
         let moved = by_address(&KEY, &DEV, &OPT, true, &M, &addr);
         let other_code: Vec<u8> = (0..4096u32).map(|i| (i * 13) as u8).collect();
         let unmoved = by_image(&KEY, &OPT, &DEV, true, &M, &other_code);
-        let third = by_address(&KEY, &[5; 32], &[6; 32], false, &Modes { text_len: 64, fixed: 20, bti: false, exact: false }, &[7; 32]);
+        let third = by_address(&KEY, &[5; 32], &[6; 32], false, &Modes { text_len: 64, fixed: 20, bti: false }, &[7; 32]);
         let old: Vec<u8> = [moved, unmoved, third].concat();
         let doc = list_document(&old, NOW).unwrap();
         let list = list_of(&doc).unwrap();
@@ -257,7 +253,7 @@ mod tests {
         assert_eq!(check(&list, &KEY, &DEV, &OPT, true, &M, &addr, || unreachable!()), Verdict::ByAddress);
         let other_addr = *blake3::hash(&other_code).as_bytes();
         assert!(matches!(check(&list, &KEY, &OPT, &DEV, true, &M, &other_addr, || unmoved), Verdict::ByImage(..)));
-        assert_eq!(check(&list, &KEY, &[5; 32], &[6; 32], false, &Modes { text_len: 64, fixed: 20, bti: false, exact: false }, &[7; 32], || [0; 32]), Verdict::ByAddress);
+        assert_eq!(check(&list, &KEY, &[5; 32], &[6; 32], false, &Modes { text_len: 64, fixed: 20, bti: false }, &[7; 32], || [0; 32]), Verdict::ByAddress);
         // Bare seals are not a list document: the reader never takes them for one, empty or not.
         assert_eq!(list_of(&old), None);
         assert_eq!(list_of(&[]), None);

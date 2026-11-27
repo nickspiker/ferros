@@ -168,7 +168,7 @@ mod tests {
 
     fn capsule(key: &SigningBundle, version: &[u64]) -> Vec<u8> {
         let d = Decl { name: String::from("Clock"), wants: alloc::vec![(PUCK, String::from("its circle on the deck"))] };
-        let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
+        let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false };
         fgtw::release::sign_release(capsule_unsigned(&d, [5; 32], Some(&Version(version.to_vec())), Some("Test Developer"), None, &key.public(), &code, 9).unwrap(), key).unwrap()
     }
 

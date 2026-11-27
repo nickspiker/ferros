@@ -3,10 +3,10 @@
 // The rewrite works on LLVM's decoded instruction (opcode, operands, register classes), never on the text, so every source goes through the same place: rustc's emitted assembly with its inline asm!, clang's -S for C and C++, and hand-written .S files.
 // The rules are SANDBOX.md's ("What the emitter rewrites"), the same tools/ferros-mask applied to the text until 2026-11-26, byte for byte; the checker stays the authority, and anything let through here is checked again at stow.
 //
-// Usage: ferros-as <in.s> -o <out.o> [-mattr=<features>] [--fixed K | --exact] [--bti]
+// Usage: ferros-as <in.s> -o <out.o> [-mattr=<features>] [--fixed K] [--bti]
 //        ferros-as --dump <in.s> [-mattr=<features>]   (each instruction's opcode, flags and operands, for working on the rules)
 //
-// Register roles (reserved in codegen): x28 arc base, x27 mask (exact: limit), x26 masked offset (fixed and exact: the address), x25 address in the arc, x24 scratch; x23 a handle's base, x22 its mask, x21 an offset masked by it (SANDBOX.md "Handles"; written by hand in ferros_sys and passed through).
+// Register roles (reserved in codegen): x28 arc base, x27 mask, x26 masked offset (fixed: the address), x25 address in the arc, x24 scratch; x23 a handle's base, x22 its mask, x21 an offset masked by it (SANDBOX.md "Handles"; written by hand in ferros_sys and passed through).
 
 #include "MCTargetDesc/AArch64TargetStreamer.h"
 #include "llvm/BinaryFormat/ELF.h"
@@ -50,12 +50,11 @@ extern "C" void LLVMInitializeAArch64AsmParser();
 
 namespace {
 
-/// The masking mode (SANDBOX.md "Modes"): ring `and x26, xN, x27` then `[x28, x26]` or x25; fixed(K) `bfi x26, xN, #0, #K` then `[x26, #imm]`; exact the four-instruction subtract and compare into x26, then `[x26, #imm]`.
+/// The masking mode (SANDBOX.md "Modes"): ring `and x26, xN, x27` then `[x28, x26]` or x25; fixed(K) `bfi x26, xN, #0, #K` then `[x26, #imm]`.
 struct Mode {
   std::optional<unsigned> fixed;
-  bool exact = false;
   bool bti = false;
-  bool direct() const { return fixed || exact; }
+  bool direct() const { return fixed.has_value(); }
 };
 
 /// LLVM's opcode and register numbers, looked up by name once at startup from the tables LLVM publishes (public headers only, no generated enums).
@@ -280,16 +279,8 @@ private:
       ins(N.op("SUBXri"), {R(dst), R(src), Im(-delta), Im(0)});
   }
 
-  /// `src` made safe: ring mode the masked offset in x26, fixed and exact the address itself in x26.
+  /// `src` made safe: ring mode the masked offset in x26, fixed the address itself in x26.
   void safe(MCRegister src) {
-    if (M.exact) {
-      // offset = addr - base; negative iff offset < limit; top bit set iff bad (below base, or at or past the limit); the address, or all ones.
-      ins(N.op("SUBXrs"), {R(X25), R(src), R(X28), Im(0)});
-      ins(N.op("SUBXrs"), {R(X26), R(X25), R(X27), Im(0)});
-      ins(N.op("ORNXrs"), {R(X26), R(X25), R(X26), Im(0)});
-      ins(N.op("ORRXrs"), {R(X26), R(src), R(X26), Im((2 << 6) | 63)}); // asr #63
-      return;
-    }
     if (M.fixed)
       ins(N.op("BFMXri"), {R(X26), R(X26), R(src), Im(0), Im(*M.fixed - 1)});
     else
@@ -433,7 +424,7 @@ private:
     out(I);
   }
 
-  /// The access from x26 as the mode wants it: fixed/exact `[x26]`, ring `[x28, x26]` where a register-offset form exists, else through x25.
+  /// The access from x26 as the mode wants it: fixed `[x26]`, ring `[x28, x26]` where a register-offset form exists, else through x25.
   void access_safe(const Access &a, std::optional<MCOperand> imm) {
     if (M.direct()) {
       access(a, X26, imm);
@@ -644,8 +635,6 @@ int main(int argc, char **argv) {
       dump = true;
     else if (a == "--bti")
       M.bti = true;
-    else if (a == "--exact")
-      M.exact = true;
     else if (a == "--fixed" && k + 1 < argc) {
       unsigned v = std::stoul(argv[++k]);
       if (v < 16 || v > 40)
@@ -661,9 +650,7 @@ int main(int argc, char **argv) {
       return fail("unexpected argument " + a);
   }
   if (in.empty() || (!dump && out.empty()))
-    return fail("usage: ferros-as <in.s> -o <out.o> [-mattr=...] [--fixed K | --exact] [--bti] | ferros-as --dump <in.s>");
-  if (M.exact && (!M.bti || M.fixed))
-    return fail("--exact needs --bti, and is not --fixed");
+    return fail("usage: ferros-as <in.s> -o <out.o> [-mattr=...] [--fixed K] [--bti] | ferros-as --dump <in.s>");
 
   LLVMInitializeAArch64TargetInfo();
   LLVMInitializeAArch64TargetMC();

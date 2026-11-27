@@ -28,7 +28,6 @@ pub const MAX_BR_TABLE_TARGETS: u32 = 65520;
 pub enum Mask {
     Ring,
     Fixed(u32),
-    Exact,
 }
 
 #[derive(Clone, Debug)]
@@ -62,7 +61,6 @@ pub fn isa(opts: &Options) -> Result<OwnedTargetIsa, String> {
     let (mask, k) = match opts.mask {
         Mask::Ring => ("ring", 24),
         Mask::Fixed(k) => ("fixed", k),
-        Mask::Exact => ("exact", 24),
     };
     set(&mut flags, "ferros_mask", mask)?;
     set(&mut flags, "ferros_fixed_log2", &k.to_string())?;

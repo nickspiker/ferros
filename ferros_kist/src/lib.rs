@@ -1804,8 +1804,6 @@ pub mod capsule {
         pub fixed: Option<u32>,
         /// BTI landing pads (masked only).
         pub bti: bool,
-        /// Exact mode (masked only; needs `bti`).
-        pub exact: bool,
     }
 
     /// The code's section: `masked` or `aarch64`, the image as `code` (`v` b), then the masked modes the kernel reads.
@@ -1820,9 +1818,6 @@ pub mod capsule {
         }
         if c.masked && c.bti {
             s.add_field("bti", VsfType::u(1, false));
-        }
-        if c.masked && c.exact {
-            s.add_field("exact", VsfType::u(1, false));
         }
         s
     }
@@ -1999,7 +1994,7 @@ pub mod capsule {
         }
 
         fn signed(key: &SigningBundle, name: Option<&str>) -> Vec<u8> {
-            let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
+            let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false };
             fgtw::release::sign_release(unsigned(&decl(), [5; 32], Some(&Version(alloc::vec![0, 1, 0])), name, None, &key.public(), &code, 9).unwrap(), key).unwrap()
         }
 
@@ -2032,7 +2027,7 @@ pub mod capsule {
             let doc = vsf::builders::compressed_image_encoded(av1.clone(), vsf::visual::Encoding::Gamma2Tanh).unwrap();
             let icon = crate::icon_document(&doc).unwrap();
             assert_eq!(icon, crate::Icon { av1: av1.clone(), encoding: vsf::visual::Encoding::Gamma2Tanh, primaries: None });
-            let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
+            let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false };
             let c = fgtw::release::sign_release(unsigned(&decl(), [5; 32], None, None, Some(&icon), &key.public(), &code, 9).unwrap(), &key).unwrap();
             fgtw::release::verify_signed_by(&c, &key.public().ed25519(), &key.public()).unwrap();
             assert_eq!(crate::icon_of(&c).unwrap(), Some(icon.clone()));
@@ -2078,7 +2073,7 @@ pub mod capsule {
         #[test]
         fn the_items_kinds_are_signed_with_the_capsule() {
             let key = SigningBundle::developer(&[3; 32], "TEST_DEVELOPER");
-            let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
+            let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false };
             let d = Decl { name: String::from("Lumis"), wants: alloc::vec![(ITEMS, String::from("to keep what you shoot"))] };
             let items = ItemsDecl { makes: alloc::vec![([1; 32], String::from("the stills and clips you take"))], opens: alloc::vec![([2; 32], String::from("your scans"))] };
             let c = fgtw::release::sign_release(unsigned_with_items(&d, &items, [5; 32], None, None, None, &key.public(), &code, 9).unwrap(), &key).unwrap();
@@ -2103,7 +2098,7 @@ pub mod capsule {
             assert!(fgtw::release::verify_signed_by(&t, &key.public().ed25519(), &key.public()).is_err());
             // Another developer's bundle put in whole (signed by them): its Ed25519 key is not the header's.
             let other = SigningBundle::developer(&[4; 32], "TEST_DEVELOPER");
-            let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false, exact: false };
+            let code = Code { image: &[7u8; 256], masked: true, text: Some(128), fixed: None, bti: false };
             let mut u = unsigned(&decl(), [5; 32], None, None, None, &other.public(), &code, 9).unwrap();
             // The header names this key, the bundle another: built by hand, as an attacker would.
             let ed_other = other.public().ed25519();
@@ -2117,7 +2112,7 @@ pub mod capsule {
         #[test]
         fn an_old_capsule_without_a_bundle_still_reads() {
             let (k, w) = declaration_sections(&decl(), Some([5; 32]));
-            let code = Code { image: &[1u8; 16], masked: false, text: None, fixed: None, bti: false, exact: false };
+            let code = Code { image: &[1u8; 16], masked: false, text: None, fixed: None, bti: false };
             let key = SigningBundle::release(&[6; 32]);
             let u = vsf::VsfBuilder::new().signed_only_eggs(VsfType::ke(key.keypair().public.to_bytes().to_vec()), &fgtw::release::release_slots()).add_section_direct(k).add_section_direct(w.unwrap()).add_section_direct(code_section(&code)).build().unwrap();
             let c = fgtw::release::sign_release(u, &key).unwrap();
@@ -2172,7 +2167,7 @@ pub mod capsule {
             assert!(matches!(stow(&mut list, &c), Err(Refused::OtherKey(_))));
             // Without the bundle the eggs cannot be checked: a capsule with no kb is not admitted (not the release key's).
             let (k, w) = declaration_sections(&decl(), Some([5; 32]));
-            let code = Code { image: &[1u8; 16], masked: true, text: Some(16), fixed: None, bti: false, exact: false };
+            let code = Code { image: &[1u8; 16], masked: true, text: Some(16), fixed: None, bti: false };
             let u = vsf::VsfBuilder::new().signed_only_eggs(VsfType::ke(key.public().ed25519().to_vec()), &fgtw::release::release_slots()).add_section_direct(k).add_section_direct(w.unwrap()).add_section_direct(code_section(&code)).build().unwrap();
             let bare = fgtw::release::sign_release(u, &key).unwrap();
             assert_eq!(stow(&mut Kists::default(), &bare), Err(Refused::NoBundle));

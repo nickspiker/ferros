@@ -36,8 +36,6 @@ pub struct Gated {
     pub fixed: u32,
     /// The image carries BTI landing pads (SANDBOX.md, "BTI"): its code runs on guarded pages and the checker refuses RET.
     pub bti: bool,
-    /// Exact mode (SANDBOX.md, "Modes"): the subtract and unsigned compare against a limit; needs `bti`.
-    pub exact: bool,
 }
 
 /// What the gate learned about a capsule whose code stays where it was staged (no copy): the developer's key and the provenance hash for the ihi.
@@ -201,11 +199,11 @@ pub fn gate(capsule: &[u8]) -> Result<Gated, &'static str> {
         return Err("gate: fixed mode size out of range");
     }
     let bti = masked && sections.iter().find(|s| s.name == "masked").and_then(|s| s.get_field("bti")).is_some();
-    let exact = masked && sections.iter().find(|s| s.name == "masked").and_then(|s| s.get_field("exact")).is_some();
-    if exact && (fixed != 0 || !bti) {
-        return Err("gate: exact mode needs BTI and is not fixed");
+    // Exact mode was retired 2026-11-26 (SANDBOX.md "Modes": a ring arc in its window does the same with one instruction); a capsule built for it is refused, not run in another mode.
+    if masked && sections.iter().find(|s| s.name == "masked").and_then(|s| s.get_field("exact")).is_some() {
+        return Err("gate: exact mode is retired (2026-11-26): rebuild the capsule in ring mode");
     }
-    Ok(Gated { code, developer_pubkey, hp, masked, text_len, fixed, bti, exact })
+    Ok(Gated { code, developer_pubkey, hp, masked, text_len, fixed, bti })
 }
 
 /// The OS-only key that seals installed images (SANDBOX.md): derived from the system persistent secret, so nothing outside this OS on this device can produce a seal.
@@ -216,7 +214,7 @@ pub fn seal_key() -> Option<[u8; 32]> {
 
 /// A gated capsule's modes, for its seal.
 pub fn modes_of(g: &Gated) -> Modes {
-    Modes { text_len: g.text_len, fixed: g.fixed, bti: g.bti, exact: g.exact }
+    Modes { text_len: g.text_len, fixed: g.fixed, bti: g.bti }
 }
 
 /// The address form of a seal (owner, 2026-11-17; ferros_kist::seal `by_address`): the same fields over the capsule's address, its BLAKE3, which the caller computed from the bytes it is about to run on this same launch. What every install writes from now on: the stower's seal, `bridge seal`.
@@ -227,7 +225,7 @@ pub fn seal_address(developer: &[u8; 32], hp: &[u8; 32], masked: bool, m: &Modes
 /// A masked image's span and modes, as its `masked` section gives them (`gate` reads the same fields from a copy).
 pub use ferros_kist::seal::Modes;
 
-/// The `masked` section's other fields read where the capsule lies, its code (`code_offset`, `code_len`, found by `process::locate_code`) never copied: a kist's image is tens of megabytes and the kernel heap holds 22 MiB. The code is the section's first field (its byte vector sits in the section's first bytes, where `locate_code` finds it), so the rest follow its closing bracket: `text` (the instruction span), `fixed`, `bti` and `exact`, refused as `gate` refuses them.
+/// The `masked` section's other fields read where the capsule lies, its code (`code_offset`, `code_len`, found by `process::locate_code`) never copied: a kist's image is tens of megabytes and the kernel heap holds 22 MiB. The code is the section's first field (its byte vector sits in the section's first bytes, where `locate_code` finds it), so the rest follow its closing bracket: `text` (the instruction span), `fixed` and `bti` (and a retired `exact`, refused), as `gate` reads them.
 pub fn masked_modes(capsule: &[u8], code_offset: usize, code_len: usize) -> Result<Modes, &'static str> {
     use vsf::types::VsfType;
     let mut p = code_offset + code_len;
@@ -235,7 +233,7 @@ pub fn masked_modes(capsule: &[u8], code_offset: usize, code_len: usize) -> Resu
         return Err("gate: the masked code is not the section's first field");
     }
     p += 1;
-    let (mut text, mut fixed, mut bti, mut exact) = (None, 0u32, false, false);
+    let (mut text, mut fixed, mut bti) = (None, 0u32, false);
     let n = |v: &VsfType| match v {
         VsfType::u(n, _) => Some(*n),
         VsfType::u3(n) => Some(*n as usize),
@@ -255,7 +253,7 @@ pub fn masked_modes(capsule: &[u8], code_offset: usize, code_len: usize) -> Resu
             "text" => text = Some(f.values.first().and_then(n).ok_or("gate: masked code without a text length")?),
             "fixed" => fixed = f.values.first().and_then(n).ok_or("gate: fixed mode without a size")? as u32,
             "bti" => bti = true,
-            "exact" => exact = true,
+            "exact" => return Err("gate: exact mode is retired (2026-11-26): rebuild the capsule in ring mode"),
             _ => {}
         }
     }
@@ -266,10 +264,7 @@ pub fn masked_modes(capsule: &[u8], code_offset: usize, code_len: usize) -> Resu
     if fixed != 0 && !(16..=40).contains(&fixed) {
         return Err("gate: fixed mode size out of range");
     }
-    if exact && (fixed != 0 || !bti) {
-        return Err("gate: exact mode needs BTI and is not fixed");
-    }
-    Ok(Modes { text_len, fixed, bti, exact })
+    Ok(Modes { text_len, fixed, bti })
 }
 
 /// The oracle. None until the system persistent secret exists (no ira, no ihi).

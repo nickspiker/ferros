@@ -2640,7 +2640,7 @@ fn translate_unreachable_operator(
 }
 
 /// The address of a memory access: the memory's base plus its index (zero-extended from a 32-bit memory), the static offset folded in.
-/// No bounds check: the ferros masking at emission makes the access safe (ring wraps inside the arc; exact faults outside it), so toka keeps no WebAssembly out-of-bounds trap.
+/// No bounds check: the ferros masking at emission makes the access safe (it wraps inside its arc's window, whose unbacked rest faults), so toka keeps no WebAssembly out-of-bounds trap.
 /// Returns the flags, the WebAssembly index and the address; the caller's access takes no further offset.
 fn prepare_addr(
     memarg: &MemArg,

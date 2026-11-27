@@ -34,7 +34,7 @@ AS=${FERROS_AS:-$REPO/target/ferros-as/ferros-as}
 OBJS=()
 for s in $SRCS; do
     b=$(basename "$s" .s)
-    "$AS" "$s" -o "$OUT/s/$b.o" -mattr=$ATTR ${FIXED:+--fixed $FIXED} ${BTI:+--bti} ${EXACT:+--exact}
+    "$AS" "$s" -o "$OUT/s/$b.o" -mattr=$ATTR ${FIXED:+--fixed $FIXED} ${BTI:+--bti}
     OBJS+=("$OUT/s/$b.o")
 done
 # Position-independent, as the payloads' build.rs links them: every absolute address in data becomes an R_AARCH64_RELATIVE entry for ferros_sys::relocate() (a static link baked link-time offsets into vtables and slice pointers, and the first masked process that formatted a number branched to an arc offset, 2026-11-03).
@@ -45,9 +45,8 @@ aarch64-linux-gnu-objcopy -O binary "$OUT/$BIN.elf" "$OUT/$BIN.bin"
 aarch64-linux-gnu-objcopy -O binary -j .text "$OUT/$BIN.elf" "$OUT/$BIN.text"
 # The capsule declares how much of the image is instructions (the kernel's checker covers exactly that; .text comes first, payload.ld).
 stat -c %s "$OUT/$BIN.text" > "$OUT/$BIN.textlen"
-( cd "$REPO" && cargo run -q --manifest-path "$REPO/Cargo.toml" -p ferros_sandbox --example scan -- "$OUT/$BIN.text" ${FIXED:+--fixed $FIXED} ${BTI:+--bti} ${EXACT:+--exact} ) | tee "$OUT/scan.txt"
+( cd "$REPO" && cargo run -q --manifest-path "$REPO/Cargo.toml" -p ferros_sandbox --example scan -- "$OUT/$BIN.text" ${FIXED:+--fixed $FIXED} ${BTI:+--bti} ) | tee "$OUT/scan.txt"
 if [ -n "${BTI:-}" ]; then touch "$OUT/$BIN.bti"; else rm -f "$OUT/$BIN.bti"; fi
-if [ -n "${EXACT:-}" ]; then touch "$OUT/$BIN.exact"; else rm -f "$OUT/$BIN.exact"; fi
 # Fixed mode: the arc is exactly 2^K, so the image, its zeroed tail, the grants page and the 64 KiB stack must fit (process.rs `build`: CODE + image + tail + STACK).
 if [ -n "$FIXED" ]; then
     TAIL=0

@@ -343,7 +343,6 @@ async fn main() {
                     "--text-len" => { i += 2; }
                     "--fixed" => { i += 2; }
                     "--bti" => { i += 1; }
-                    "--exact" => { i += 1; }
                     // --domain: its own vault domain (syscall 13 on its own data, KISTS.md); --kists: the right to launch kists (init's).
                     "--domain" => { grants.push((16, String::new())); i += 1; }
                     "--kists" => { grants.push((17, String::new())); i += 1; }
@@ -556,8 +555,8 @@ fn dev_key() -> (String, [u8; 32]) {
 
 fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8> {
     let (label, mut seed) = dev_key();
-    // The code's section, as kistcat writes it (ferros_kist::capsule): `--bti` (the image carries BTI landing pads; the kernel maps its code on guarded pages, SANDBOX.md "BTI") and `--exact` (exact mode, the subtract and unsigned compare; needs `--bti`).
-    let c = ferros_kist::capsule::Code { image: code, masked, text: text_len, fixed: fixed_arg(), bti: std::env::args().any(|a| a == "--bti"), exact: std::env::args().any(|a| a == "--exact") };
+    // The code's section, as kistcat writes it (ferros_kist::capsule): `--bti` (the image carries BTI landing pads; the kernel maps its code on guarded pages, SANDBOX.md "BTI").
+    let c = ferros_kist::capsule::Code { image: code, masked, text: text_len, fixed: fixed_arg(), bti: std::env::args().any(|a| a == "--bti") };
     // A kist: its declaration before its code (the kernel and the stower read it from the capsule's first bytes), its option in it (`kist`'s `option`), its developer's whole public bundle in it (`kb`), and an egg per scheme (owner, 2026-11-10: "no single eggs"; trust on first stow), built by the one builder kistcat's `kist` uses.
     if let Some(d) = kist_arg() {
         let Some(option) = option_arg() else {
@@ -602,7 +601,7 @@ fn signed_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8>
 fn plain_capsule(code: &[u8], masked: bool, text_len: Option<usize>) -> Vec<u8> {
     use ed25519_dalek::SigningKey;
     let (_label, mut seed) = dev_key();
-    let c = ferros_kist::capsule::Code { image: code, masked, text: text_len, fixed: fixed_arg(), bti: std::env::args().any(|a| a == "--bti"), exact: std::env::args().any(|a| a == "--exact") };
+    let c = ferros_kist::capsule::Code { image: code, masked, text: text_len, fixed: fixed_arg(), bti: std::env::args().any(|a| a == "--bti") };
     let pubkey = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
     let unsigned = vsf::VsfBuilder::new()
         .add_section_direct(ferros_kist::capsule::code_section(&c))

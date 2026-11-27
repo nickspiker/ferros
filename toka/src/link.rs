@@ -46,7 +46,6 @@ fn sandbox_mode(m: Mask) -> ferros_sandbox::Mode {
     match m {
         Mask::Ring => ferros_sandbox::Mode::Ring,
         Mask::Fixed(k) => ferros_sandbox::Mode::Fixed(k),
-        Mask::Exact => ferros_sandbox::Mode::Exact,
     }
 }
 

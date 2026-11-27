@@ -1001,8 +1001,6 @@ pub struct Arc {
     pub mapped: usize,
     /// A masked arc's guard above it (GUARD bytes at base + size that no process reaches), 0 for a native arc.
     pub guard: usize,
-    /// Exact mode's limit (SANDBOX.md, "Modes"): checked code reaches [base, base + limit); 0 in the other modes, whose x27 is the mask.
-    pub limit: usize,
     /// The most `size` may grow to (SYS_ARC): the image's whole declared heap counted (`image_tail_ceiling`), a power of two for a masked arc; `size` itself for one that never grows (fixed mode, an image without ferros_rt's growing heap).
     pub ceiling: usize,
     /// The window's whole span: the ceiling plus the guard, to a power of two. Unmapped past `mapped`.
@@ -1013,13 +1011,13 @@ pub struct Arc {
 const GUARD: usize = 64 << 10;
 
 impl Arc {
-    /// What a process's x27 holds: exact mode's limit, or the mask (a native arc's size less one: ferros_rt reads its top from it, `start.rs`).
+    /// What a process's x27 holds: the mask (a native arc's size less one: ferros_rt reads its top from it, `start.rs`).
     pub fn x27(&self) -> usize {
-        if self.limit != 0 { self.limit } else { self.size - 1 }
+        self.size - 1
     }
-    /// The top of what the process may use (its first stack is just under it): the limit in exact mode, the arc's end otherwise.
+    /// The top of what the process may use (its first stack is just under it): the arc's end.
     pub fn top(&self) -> usize {
-        self.base + if self.limit != 0 { self.limit } else { self.size }
+        self.base + self.size
     }
     /// The 8-byte word a syscall names at arc offset `off` (rounded down to 8), None when it is not inside the arc. Was `base + (off & mask)` while every arc was a power of two; a native arc is any number of frames now, where the mask would not keep an offset inside it.
     pub fn word(&self, off: u64) -> Option<usize> {
@@ -1059,7 +1057,7 @@ pub fn arc_alloc_room(bytes: usize, ceiling: usize, masked: bool) -> Option<Arc>
         return None;
     }
     let base = buddy_take(arcs(), window)?;
-    let mut arc = Arc { base, size: 0, mapped: 0, guard, limit: 0, ceiling, window };
+    let mut arc = Arc { base, size: 0, mapped: 0, guard, ceiling, window };
     // Counted free above, under the same lock: the frames are there, and the window goes back if they were not.
     if arc_resize(&mut arc, size).is_err() {
         buddy_give(base, window);
@@ -1424,7 +1422,7 @@ struct Process {
     capsule: Option<[u8; 32]>,
     /// The hold's right (`Object::Items`): the kinds it makes and opens, stamped on its every items call (`items_forward`). None without the right.
     items: Option<alloc::boxed::Box<ItemRight>>,
-    /// The arc's top at spawn (its size, exact mode's limit): a shrink (SYS_ARC) never goes under it, so the grants page, the code, the input and the first stack stay.
+    /// The arc's top at spawn (its size): a shrink (SYS_ARC) never goes under it, so the grants page, the code, the input and the first stack stay.
     floor: usize,
     /// SYS_ARC grows and shrinks granted so far (`diag arcs`).
     grows: u32,
@@ -8981,7 +8979,7 @@ fn arc_call(f: &mut Frame, cur: usize, pi: usize) -> u64 {
         arc_answer(pi, op, n, Err(ARC_WHY_BUSY), f);
         return 0;
     }
-    // A masked arc's mask (ring) or limit (exact) changes in every thread at once: one of its threads at EL0 on another core now would go on with the old one. It is held until they have all left; a native thread never reads x27 after its start, so a native arc changes under its running threads.
+    // A masked arc's mask changes in every thread at once: one of its threads at EL0 on another core now would go on with the old one. It is held until they have all left; a native thread never reads x27 after its start, so a native arc changes under its running threads.
     let elsewhere = kk.threads.iter().enumerate().any(|(i, x)| i != cur && matches!(x, Some(x) if x.proc == pi) && on_a_core(i));
     if p.arc.guard != 0 && elsewhere && (op == ARC_GROW || op == ARC_SHRINK) {
         if let Some(t) = th(cur) {
@@ -8996,7 +8994,7 @@ fn arc_call(f: &mut Frame, cur: usize, pi: usize) -> u64 {
     if op == ARC_RELEASE {
         let (off, len) = (f.x[1] as usize, f.x[2] as usize);
         let p = kk.procs.get_mut(pi).and_then(|x| x.as_mut()).unwrap();
-        let top = if p.arc.limit != 0 { p.arc.limit } else { p.arc.size };
+        let top = p.arc.size;
         // WHY: the range is the process's; an end that wraps or passes the arc names nothing to give back past it.
         let end = match off.checked_add(len) {
             Some(e) if e <= top => e,
@@ -9020,7 +9018,7 @@ fn arc_call(f: &mut Frame, cur: usize, pi: usize) -> u64 {
     if op == ARC_GUARD || op == ARC_UNGUARD {
         let off = f.x[1] as usize;
         let p = kk.procs.get_mut(pi).and_then(|x| x.as_mut()).unwrap();
-        let top = if p.arc.limit != 0 { p.arc.limit } else { p.arc.size };
+        let top = p.arc.size;
         let held = p.guards.iter().position(|&(g, _)| g == off);
         // WHY: the offset is the process's; one off a page boundary or with its page past the arc's top names no page of it (top - off cannot wrap once off < top).
         let page = off % 4096 == 0 && off < top && top - off >= 4096;
@@ -9080,9 +9078,8 @@ fn arc_op(pi: usize, op: u64, n: u64) -> Result<(u64, u64), u64> {
     use crate::frames::FRAME;
     let kk = k();
     let Some(p) = kk.procs.get_mut(pi).and_then(|x| x.as_mut()) else { return Err(ARC_WHY_OP) };
-    let (masked, exact) = (p.arc.guard != 0, p.arc.limit != 0);
-    // The top a mode reaches: exact mode's limit, the arc's size otherwise.
-    let old = if exact { p.arc.limit } else { p.arc.size };
+    let masked = p.arc.guard != 0;
+    let old = p.arc.size;
     if op == ARC_SIZE {
         return Ok((old as u64, p.arc.ceiling as u64));
     }
@@ -9098,8 +9095,8 @@ fn arc_op(pi: usize, op: u64, n: u64) -> Result<(u64, u64), u64> {
         return Err(ARC_WHY_CEILING);
     }
     let want = if op == ARC_GROW { old + n } else { n };
-    // The new top in the mode's shape: whole frames native, a power of two ring (its mask), 16 bytes exact (its stack pointer's alignment).
-    let top = if !masked { want.next_multiple_of(FRAME) } else if exact { want.next_multiple_of(16) } else { arc_shape(want, true) };
+    // The new top in the mode's shape: whole frames native, a power of two masked (its mask).
+    let top = if !masked { want.next_multiple_of(FRAME) } else { arc_shape(want, true) };
     if (op == ARC_GROW && top <= old) || (op == ARC_SHRINK && top >= old) {
         return Ok((old as u64, old as u64));
     }
@@ -9109,19 +9106,15 @@ fn arc_op(pi: usize, op: u64, n: u64) -> Result<(u64, u64), u64> {
     if top < p.floor {
         return Err(ARC_WHY_FLOOR);
     }
-    // Exact mode maps whole pages up to its limit (a grow inside what it maps already maps nothing); the others are their top.
-    let size = if !exact { top } else if op == ARC_GROW && top <= p.arc.size { p.arc.size } else { top.next_multiple_of(1 << 12) };
+    let size = top;
     if size < p.arc.size && held_in(pi, p.epoch, p.arc.base + size, usize::MAX) {
         return Err(ARC_WHY_HELD);
     }
-    // A grow over frames given back (exact mode's limit coming back over a released range) maps them again first.
+    // A grow over frames given back maps them again first.
     if op == ARC_GROW {
         arc_refill(p, old, top)?;
     }
     arc_resize(&mut p.arc, size)?;
-    if exact {
-        p.arc.limit = top;
-    }
     // A shrink takes the holes past the new end with it.
     let mapped = p.arc.mapped;
     p.holes.retain(|&(a, _)| a < mapped);
@@ -9297,7 +9290,7 @@ fn arc_release(pi: usize, p: &mut Process, lo: usize, hi: usize) -> Result<usize
     Ok(n)
 }
 
-/// A grow over process `pi`'s holes inside arc offsets [lo, hi): fresh zeroed frames mapped again where they were given back, and the holes trimmed to what is left outside the range (exact mode's limit can grow back over a range it released). Err(ARC_WHY_MEMORY) with nothing changed when the pool has too few frames. Under the kernel lock.
+/// A grow over process `pi`'s holes inside arc offsets [lo, hi): fresh zeroed frames mapped again where they were given back, and the holes trimmed to what is left outside the range. Err(ARC_WHY_MEMORY) with nothing changed when the pool has too few frames. Under the kernel lock.
 fn arc_refill(p: &mut Process, lo: usize, hi: usize) -> Result<(), u64> {
     use crate::frames::FRAME;
     let (lo, hi) = (lo / FRAME * FRAME, hi.next_multiple_of(FRAME));
@@ -10349,7 +10342,7 @@ pub fn spawn_capsule_as(name: &[u8], capsule: &[u8], input: &[u8], grants: &[Gra
         return Err("gate: production refuses unmasked native code");
     }
     let ihi = crate::oracle::ihi(&g.developer_pubkey, &g.hp).ok_or("no ira: no system secret, no ihi")?;
-    spawn_as(name, &g.code, input, grants, Some(ihi), g.masked, g.text_len, g.fixed | (g.bti as u32) << 8 | (g.exact as u32) << 9, once)
+    spawn_as(name, &g.code, input, grants, Some(ihi), g.masked, g.text_len, g.fixed | (g.bti as u32) << 8, once)
 }
 
 /// `spawn_capsule` over a capsule held outside the kernel heap (service.rs `restart`: a staging arc the vault's pieces were read into), its code never copied into the heap: the gate where it lies (`gate_located`: the signature over the whole file, the code found by its section's entry, `locate_code`, and held to be framed exactly so), masked code's modes read in place (`masked_modes`) and its seal found in `sealed`, then the process built from the code where it lies (`spawn` copies it into the process's own arc). The same checks as `spawn_capsule`'s gate, whose parse copied the code out of the capsule and then copied it again (2026-11-12: with the capsule itself, three blocks of 3 MB in the heap at once for the display's).
@@ -10361,7 +10354,7 @@ pub fn spawn_capsule_in_place(name: &[u8], capsule: &mut [u8], input: &[u8], gra
         // The address from the bytes in the staging arc, which the process is built from.
         let address = *blake3::hash(capsule).as_bytes();
         seal_ok(sealed, &g.developer_pubkey, &g.hp, &m, &address, &capsule[co..co + cl])?;
-        (m.text_len, m.fixed | (m.bti as u32) << 8 | (m.exact as u32) << 9)
+        (m.text_len, m.fixed | (m.bti as u32) << 8)
     } else {
         if cfg!(ferros_production) {
             return Err("gate: production refuses unmasked native code");
@@ -10378,7 +10371,7 @@ pub fn install_capsule(capsule: &[u8]) -> Result<[u8; 32], &'static str> {
     if !g.masked {
         return Err("install: only masked capsules are installed");
     }
-    let mode = if g.exact { ferros_sandbox::Mode::Exact } else if g.fixed != 0 { ferros_sandbox::Mode::Fixed(g.fixed) } else { ferros_sandbox::Mode::Ring };
+    let mode = if g.fixed != 0 { ferros_sandbox::Mode::Fixed(g.fixed) } else { ferros_sandbox::Mode::Ring };
     ferros_sandbox::check_image_with(&g.code[..g.text_len], mode, g.bti).map_err(|_| "install: masked code failed the sandbox checker")?;
     // The address form (2026-11-17): the address of the bytes just gated and checked.
     crate::oracle::seal_address(&g.developer_pubkey, &g.hp, true, &crate::oracle::modes_of(&g), blake3::hash(capsule).as_bytes()).ok_or("no system secret: cannot seal")
@@ -10780,11 +10773,6 @@ pub fn spawn_kist(l: &KistLaunch, arc: Arc, total: usize, sealed: &[u8], pre: Op
             return Err(e);
         }
     };
-    // Exact mode: the limit is what the image needs, as `build` sets it (the staged capsule's rest, past it, was zeroed above).
-    if modes.as_ref().is_some_and(|m| m.exact) {
-        let tail = image_tail(unsafe { core::slice::from_raw_parts((arc.base + CODE) as *const u8, cl) });
-        arc.limit = (CODE + cl + tail + STACK_GUARD + STACK + 15) & !15;
-    }
     let (masked, exec_len, bti) = match &modes {
         Some(m) => (true, m.text_len, m.bti),
         None => (false, cl, false),
@@ -11042,7 +11030,7 @@ pub fn stow_check(arc: &Arc, total: usize, addr: &[u8; 32]) -> Result<(crate::or
         say(e);
         STOW_WHY_MODES
     })?;
-    let mode = if m.exact { ferros_sandbox::Mode::Exact } else if m.fixed != 0 { ferros_sandbox::Mode::Fixed(m.fixed) } else { ferros_sandbox::Mode::Ring };
+    let mode = if m.fixed != 0 { ferros_sandbox::Mode::Fixed(m.fixed) } else { ferros_sandbox::Mode::Ring };
     if let Err(v) = ferros_sandbox::check_image_with(&capsule[co..co + m.text_len], mode, m.bti) {
         say(&alloc::format!("the checker refused its code at +G#{:X} (instruction G#{:08X})", v.offset, v.insn));
         return Err(STOW_WHY_CHECKER);
@@ -11220,8 +11208,8 @@ fn arc_for(code: &[u8], inline: usize, masked: bool, fixed: u32) -> Result<Arc, 
         return Err("spawn: the image has no header (ferros_sys::entry!), so its .bss is unknown");
     }
     let tail = image_tail(code);
-    // `fixed` carries the mode word: bits 0-7 fixed mode's K (0: not fixed), bit 8 BTI (guarded code pages, `build_from`'s), bit 9 exact mode.
-    let (fixed, exact) = (fixed & 0xFF, fixed >> 9 & 1 == 1);
+    // `fixed` carries the mode word: bits 0-7 fixed mode's K (0: not fixed), bit 8 BTI (guarded code pages, `build_from`'s). Bit 9 was exact mode, retired 2026-11-26 (SANDBOX.md "Modes").
+    let fixed = fixed & 0xFF;
     let need = CODE + code.len() + tail + inline + STACK_GUARD + STACK;
     // The most it may grow to (SYS_ARC): its whole declared heap; the same as `need` for an image whose heap does not grow.
     let ceiling = need - tail + image_tail_ceiling(code);
@@ -11230,12 +11218,8 @@ fn arc_for(code: &[u8], inline: usize, masked: bool, fixed: u32) -> Result<Arc, 
         return Err("spawn: the image does not fit its fixed arc");
     }
     spawn_step(7);
-    let mut arc = if fixed != 0 { arc_alloc(1 << fixed, masked) } else { arc_alloc_room(need, ceiling, masked) }.ok_or("arc pool exhausted")?;
+    let arc = if fixed != 0 { arc_alloc(1 << fixed, masked) } else { arc_alloc_room(need, ceiling, masked) }.ok_or("arc pool exhausted")?;
     spawn_step(8);
-    // Exact mode: the limit is what the image needs, rounded to the 16 bytes the stack pointer must keep; the arc around it is the power of two the pool hands out, its rest the room the limit can grow into.
-    if exact {
-        arc.limit = (need + 15) & !15;
-    }
     Ok(arc)
 }
 
@@ -11359,8 +11343,8 @@ fn build_from(name: &[u8], mut arc: Arc, code_len: usize, input: &[u8], objects:
     // In the grants page they end at PREFS_HI (G#FB0, the second preferences block, then the first at G#FC0 and the ihi at G#FE0): a 109th slot's token was once written over the preferences (2026-11-05), so one more goes to the pages, never over them.
     // The process finds its tokens by the grants offset it is entered with (x0): every reader adds 0x200 for the count and 0x204 + 32 * slot for a token (ferros_sys `cap`, ferros_rt `grants`), so the offset is the pages' start less 0x200, and no image changes. The handles and the preferences stay where they are, in the first page.
     let (tokens, code_at) = if TOKENS + 4 + 32 * cspace.len() <= PREFS_HI { (TOKENS, CODE) } else { (CODE, CODE + (4 + 32 * cspace.len()).next_multiple_of(1 << 12)) };
-    // The code moves with no change to it: every image is position-independent (ferros_rt `relocate`, ferros_sys `relocate`), and masked code reaches its arc by base and mask, not by the code's place. An arc that cannot grow keeps the first page's limit: fixed mode's sealed 2^K (every `bfi` assumes it), exact mode's limit, an image that declared no growing heap.
-    if code_at != CODE && masked && (arc.limit != 0 || arc.ceiling <= arc.size) {
+    // The code moves with no change to it: every image is position-independent (ferros_rt `relocate`, ferros_sys `relocate`), and masked code reaches its arc by base and mask, not by the code's place. An arc that cannot grow keeps the first page's limit: fixed mode's sealed 2^K (every `bfi` assumes it), an image that declared no growing heap.
+    if code_at != CODE && masked && arc.ceiling <= arc.size {
         surfaces_free(epoch);
         regions_free(epoch);
         pucks_free(epoch);
@@ -11559,7 +11543,7 @@ fn spawn_build(name: &[u8], g: &crate::oracle::Gated, ihi: [u8; 32], objects: &[
         return Ok(None);
     }
     cap_key().ok_or("no wairua: refusing to mint capabilities")?;
-    let arc = arc_for(&g.code, 0, g.masked, g.fixed | (g.exact as u32) << 9)?;
+    let arc = arc_for(&g.code, 0, g.masked, g.fixed)?;
     unlocked(|| {
         // SAFETY: the arc was just taken for this image (`arc_for` sized it past CODE plus the code's length) and is no process's until `build_from` below, so nothing else reads or writes it meanwhile.
         unsafe { core::ptr::copy_nonoverlapping(g.code.as_ptr(), (arc.base + CODE) as *mut u8, g.code.len()) };
@@ -11618,7 +11602,7 @@ pub fn spawn_capsule_no_ihi(name: &[u8], capsule: &[u8], input: &[u8], grants: &
     if cfg!(ferros_production) {
         return Err("gate: production refuses unmasked native code");
     }
-    spawn(name, &g.code, input, grants, None, false, g.text_len, g.fixed | (g.bti as u32) << 8 | (g.exact as u32) << 9)
+    spawn(name, &g.code, input, grants, None, false, g.text_len, g.fixed | (g.bti as u32) << 8)
 }
 
 /// Zero `count` blocks of the ferros partition from block `at` of it, a run at a time through the run bounce, the watchdogs fed at every run: the owner's fresh start (service.rs `vault fresh`).

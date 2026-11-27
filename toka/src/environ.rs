@@ -1,7 +1,7 @@
 //! toka's translation environment: how a WebAssembly function's memories, globals, table and calls become Cranelift IR (docs/TOKA.md "The image").
 //!
 //! There is no runtime context pointer. Everything a function reaches lies in its own image at a place the linker fixes, reached PC-relatively (ADRP and ADD): the globals, the table, each memory's size cell and each memory itself, which follows the image in the arc.
-//! Nothing is bounds-checked: the masking the Cranelift fork emits makes every access safe (ring: wraps inside the arc; exact: faults outside it), and WebAssembly's traps on an out-of-bounds access are not kept.
+//! Nothing is bounds-checked: the masking the Cranelift fork emits makes every access safe (an address wraps inside its arc's window, and the window's unbacked rest faults), and WebAssembly's traps on an out-of-bounds access are not kept.
 
 use crate::module::Module;
 use crate::translate::FuncTranslationStacks;
