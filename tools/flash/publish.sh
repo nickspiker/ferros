@@ -57,7 +57,7 @@ FILES=(--file tool - windows-x86_64 ferros-flash.exe "$OUT/ferros-flash-windows-
        --file tool - macos-arm64 ferros-flash-gui "$OUT/ferros-flash-gui-macos-arm64"
        --file board akita - akita "$OUT/akita.board.vsf"
        --file board husky - husky "$OUT/husky.board.vsf"
-       --file logo - - logo logo.vsf)
+       --file logo - - logo assets/logo.vsf)
 for b in akita husky; do
     v=FERROS_FLASH_BOOT_${b^^}
     [ -n "${!v:-}" ] && FILES+=(--file boot "$b" - boot "${!v}")
