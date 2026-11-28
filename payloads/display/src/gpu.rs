@@ -236,8 +236,8 @@ fn eligible(width: usize, height: usize) -> Option<([Wn; WINDOWS], usize)> {
     Some((out, i))
 }
 
-/// Rect `r` (clipped to the screen) of the phases `mask` names composed on the GPU, one job a phase, waited for; the hit map's rows with it on the CPU when `hits`. False when step 2 does not compose this frame (`eligible`, the switch, the view, a failed job): the caller publishes it on NEON as before.
-pub fn compose(r: draw::Rect, mask: u32, width: usize, height: usize, hits: bool) -> bool {
+/// Rect `r` (clipped to the screen) of the phases `mask` names composed on the GPU, one job a phase, waited for; the hit map's share of its rows with it on the CPU, as `hits` says (hit.rs `Write`). False when step 2 does not compose this frame (`eligible`, the switch, the view, a failed job): the caller publishes it on NEON as before.
+pub fn compose(r: draw::Rect, mask: u32, width: usize, height: usize, hits: hit::Write) -> bool {
     if !ON.load(Ordering::Acquire) || STATE.load(Ordering::Acquire) != READY || unsafe { crate::CAPTURE } != 0 || hit::view() {
         return false;
     }
@@ -336,9 +336,9 @@ pub fn compose(r: draw::Rect, mask: u32, width: usize, height: usize, hits: bool
     JOBS.fetch_add(nj as u64, Ordering::Relaxed);
     cost_add(1, px, ferros_sys::us_since(t0));
     let t_hits = ferros_sys::now();
-    if hits {
+    if hits != hit::Write::Nothing {
         for y in r.y0 as usize..r.y1 as usize {
-            hit::row(y, r.x0 as usize, r.x1 as usize, width, height, true);
+            hits.put(y, r.x0 as usize, r.x1 as usize, width, height);
         }
     }
     CPU_US.fetch_add((t_sub - t0 + ferros_sys::now() - t_hits) * 1_000_000 / ferros_sys::freq(), Ordering::Relaxed);
@@ -649,7 +649,7 @@ fn widen_base(b8: u32) -> u64 {
 }
 
 /// Window `k` (a layered one, the only window up) over rect `r` of the phases `mask` names, on the GPU: its pixel layers, the noise under them, the front, the present (gpu_layers.rs), one job a phase, waited for. False when it does not take this frame (the kernel not loaded, the view not yet naming its layers' surfaces, the crossover, a failed job): NEON's then.
-fn compose_layered(k: usize, r: draw::Rect, mask: u32, width: usize, height: usize, hits: bool) -> bool {
+fn compose_layered(k: usize, r: draw::Rect, mask: u32, width: usize, height: usize, hits: hit::Write) -> bool {
     let Some(s) = (unsafe { crate::layered::STACKS[k] }) else { return false };
     // Every layer's surface named by the view under its generation; else asked for, and this frame on NEON.
     let named = VIEW_NAMED.load(Ordering::Acquire);
@@ -757,9 +757,9 @@ fn compose_layered(k: usize, r: draw::Rect, mask: u32, width: usize, height: usi
     JOBS.fetch_add(nj as u64, Ordering::Relaxed);
     cost_add(2, px, ferros_sys::us_since(t0));
     let t_hits = ferros_sys::now();
-    if hits {
+    if hits != hit::Write::Nothing {
         for y in r.y0 as usize..r.y1 as usize {
-            hit::row(y, r.x0 as usize, r.x1 as usize, width, height, true);
+            hits.put(y, r.x0 as usize, r.x1 as usize, width, height);
         }
     }
     CPU_US.fetch_add((t_sub - t0 + ferros_sys::now() - t_hits) * 1_000_000 / ferros_sys::freq(), Ordering::Relaxed);

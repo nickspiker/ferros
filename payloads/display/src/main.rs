@@ -4188,13 +4188,13 @@ fn glass_front(x: usize, g: &GlassRow, edge_px: &[(u16, u16, u16, u16)], c: u64,
     under_pm(acc, t, p & ((1 << 48) - 1), 0).0
 }
 /// The windows into phase `k` over `r` (screen coordinates): each row composed frontmost first (a pixel comes from the first window that covers it; nothing behind the windows but black), to the glass's edge (since 2026-11-12, "Drawn under the controls": no longer cut to the app's circle), the bars in front of it; each window's pixels baked first unless its surface already is (`layer_row`), so the compose is in the panel's codes; then each pixel presented, the dither and the pack (neon.rs `present_app16`), bit 48 set = no dither for that pixel.
-/// `hits`: this call writes the hit map's rows too (hit.rs; the first of several phases published together, never a capture), and in development shows the map instead of the image when `k` is its phase.
-fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: usize, hits: bool) {
+/// `hits`: what this call writes into the hit map with the rows it composes (hit.rs `Write`: the rows whole, one window's own ids, or nothing for a capture), once for all the phases published together; in development the map's phase shows the map instead of the image.
+fn publish_app(r: draw::Rect, tabs: &neon::Odt, k: usize, width: usize, height: usize, hits: hit::Write) {
     publish_app_mask(r, tabs, 1 << k, width, height, hits);
 }
 
 /// `publish_app` into every phase `mask` names at once (2026-11-11, owner on the Pro: "no reason we can't hit 120fps with a sliding console row"): each row composed once, and only the dither and the pack done per phase (the codes are the composed pixels, bake.rs). The bars' changes go into all four phases, and until then each phase composed the windows, the glass and the bars, and coded every pixel, again.
-fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, height: usize, hits: bool) {
+fn publish_app_mask(r: draw::Rect, tabs: &neon::Odt, mask: u32, width: usize, height: usize, hits: hit::Write) {
     let r = r.clip(width, height);
     if r.is_empty() || RAW_HOLD.load(Ordering::Acquire) == 1 {
         return;
@@ -4282,11 +4282,11 @@ fn frames_op(what: u8) -> [u8; 2] {
     [0, on as u8]
 }
 
-/// Whether the app publish the workers are running writes the hit map's rows too (`publish_app_mask`'s `hits`).
-static mut PUB_APP_HITS: bool = false;
+/// What the app publish the workers are running writes into the hit map (`publish_app_mask`'s `hits`).
+static mut PUB_APP_HITS: hit::Write = hit::Write::Nothing;
 
 /// `publish_app_mask`'s rows `r` (one stripe of them, or all), into the phases `mask` names.
-fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, height: usize, hits: bool) {
+fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, height: usize, hits: hit::Write) {
     // The development view's phase is painted whole from the hit map as it comes round (`hit::on_layer`), never here: the phases written are the others.
     let write = if hit::view() && unsafe { CAPTURE } == 0 { mask & !(1 << hit::PHASE) } else { mask };
     let cm = neon::Chans::new(CHANNELS.load(Ordering::Relaxed));
@@ -4300,9 +4300,7 @@ fn publish_app_rows(r: draw::Rect, _tabs: &neon::Odt, mask: u32, width: usize, h
     // A capture (op 30) takes the whole composed row from `px`; otherwise an opaque front window over the whole row is read in place (`direct`).
     let can_direct = unsafe { CAPTURE } == 0;
     for y in r.y0 as usize..r.y1 as usize {
-        if hits {
-            hit::row(y, xa, xb, width, height, true);
-        }
+        hits.put(y, xa, xb, width, height);
         if write == 0 {
             continue;
         }
@@ -4761,7 +4759,7 @@ fn clean_forget(k: usize) {
     }
 }
 
-/// The hit map's rows no longer match the windows' layout (`layout_build` sets it, an app publish of the whole screen with the hit map's rows clears it): an app's show writes them only then.
+/// The hit map's rows no longer match the windows' layout (`layout_build` sets it, an app publish of the whole screen with the hit map's rows clears it): an app's show writes them whole only then, and otherwise only its own window's ids in the rows it composes (hit.rs `Write::Ids`).
 static mut HITS_STALE: bool = true;
 
 /// After a window left: every phase owes the whole screen; with none left, the map has the screen again and its next frame repaints all of it.
@@ -8175,7 +8173,7 @@ extern "C" fn receive(grants: u64) -> ! {
             // Only the caller's own surface: another app's window is never "mine" to it.
             let mine = surface_of(u64::from_le_bytes(m[1..9].try_into().unwrap())).filter(|&k| holds(h, k));
             let (x, y) = (u16::from_le_bytes([m[9], m[10]]) as i64, u16::from_le_bytes([m[11], m[12]]) as i64);
-            let yes = mine.is_some_and(|k| hit::at(x, y) == hit::WINDOW + k as u16);
+            let yes = mine.is_some_and(|k| hit::owner(x, y) == hit::WINDOW + k as u16);
             ferros_sys::reply(&tok, &[yes as u8]);
             continue;
         }
@@ -8236,7 +8234,7 @@ extern "C" fn receive(grants: u64) -> ! {
             // What the system has at this point: [x u16][y u16] → its place, one read of the hit map (hit.rs, the system's ids as the bars' compose leaves them): in the lower half outside the app's circle, a region (owner, 2026-11-07): 9 back on the left, 8 deck on the right, whole (the arrow and the ring are only drawn there, nothing to aim at), in front of the deck's circles as they are on the glass (hit.rs `row`, owner 2026-11-17); in the upper half, the doorway by the camera 10, else the console circle whose zone it is (every pixel of the dash is the nearest circle's, `dash_row`): the radios by their bit (facts 32's order: 0 cellular, 1 WiFi, 2 Bluetooth, 3 NFC, 4 GPS), 5 USB, 13 the clock, 14 the battery; 11 where no zone reaches (none on these screens). The quick row (QUICK.md), in front of what is inside the app's circle: its circle under the point while it stands open as 32 + its index, with its centre and radius after (x, y, r u16 each, as `quick::layout` draws it), or 12 anywhere else inside the app's circle while any of it shows (behind the row). G#FF for nothing of the system's: inside the circle with the row shut (an app's window, the map's plane), or off the glass; and in full screen everywhere on the console's rows (the console and the doorway gone, their pixels the app's; owner, 2026-11-11: "whilist console should be gone gone"), so a touch there is no corner's and the row cannot be pulled.
             let (w, h) = unsafe { SCREEN_WH };
             let (x, y) = (u16::from_le_bytes([m[1], m[2]]) as i64, u16::from_le_bytes([m[3], m[4]]) as i64);
-            let id = hit::at(x, y);
+            let id = hit::owner(x, y);
             let code = if (hit::SYS..hit::WINDOW).contains(&id) { (id - hit::SYS) as u8 } else { 0xFF };
             if (32..32 + quick::N as u8).contains(&code) {
                 let c = quick::layout(w as usize, h as usize)[(code - 32) as usize];
@@ -8741,7 +8739,7 @@ fn server(grants: u64) -> ! {
         CLEAN = alloc::vec![0u8; (width / 16) * height].leak().as_mut_ptr() as usize;
         BAR_SPAN_BACK = alloc::vec![(0u16, 0u16); top + bot].leak().as_mut_ptr() as usize;
         heap_at[2] = ALLOC.used();
-        // The hit map (hit.rs): the glass's, a u16 a pixel, and the bars' ids, front and back.
+        // The hit map (hit.rs): the glass's, a u32 a pixel (owner and local id zipped), and the bars' ids, front and back.
         let (glass_b, bars_b) = hit::alloc(width, height);
         hit_bytes = (glass_b, bars_b);
         heap_at[3] = ALLOC.used();
@@ -10080,13 +10078,14 @@ fn server(grants: u64) -> ! {
                             let t_settle = now();
                             let t_pub = now();
                             // Everything phase k owes, which now holds `changed`: it is about to be shown, and its dirty region is cleared below. Publishing `changed` alone dropped what it still owed from earlier shows, and stale strips of older frames flashed as the phases rotated (2026-11-01).
-                            // The hit map's rows with it only when the windows' layout changed since they were last written whole (`HITS_STALE`): a window shown again where it was owns the same pixels, and its rows were 1.5 us each of every frame, 4.4 ms of a full screen's (2026-11-11, Mahere's map from the GPU every frame).
+                            // The hit map's rows whole with it only when the windows' layout changed since they were last written whole (`HITS_STALE`): a window shown again where it was owns the same pixels, and its rows were 1.5 us each of every frame, 4.4 ms of a full screen's (2026-11-11, Mahere's map from the GPU every frame).
+                            // Otherwise this window's own ids in the rows composed (owner, 2026-11-28: the ids follow the pixels): its plane changed with its frame, the owners did not.
                             let dirty = unsafe { PHASE_DIRTY[k] };
-                            let hits = unsafe { HITS_STALE };
+                            let hits = if unsafe { HITS_STALE } { hit::Write::Rows } else { hit::Write::Ids(sk) };
                             publish_app(dirty, &tabs, k, width, height, hits);
                             unsafe {
                                 READ_END[sk] = now();
-                                if hits && dirty.clip(width, height) == full {
+                                if hits == hit::Write::Rows && dirty.clip(width, height) == full {
                                     HITS_STALE = false;
                                 }
                                 PHASE_DIRTY[k] = draw::Rect::EMPTY;
@@ -10252,7 +10251,7 @@ fn server(grants: u64) -> ! {
                         if ten && unsafe { TEMPORAL } {
                             pipe.settle(&mut armed, true);
                             let k = unsafe { (CUR_PHASE + 1) % PHASES };
-                            publish_app(unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height, true);
+                            publish_app(unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height, hit::Write::Rows);
                             unsafe {
                                 PHASE_DIRTY[k] = draw::Rect::EMPTY;
                                 CUR_PHASE = k;
@@ -10520,7 +10519,7 @@ fn server(grants: u64) -> ! {
                         true => {
                             let s = plane_image(width, height);
                             unsafe { CAPTURE = s.as_mut_ptr() as usize };
-                            publish_app(draw::Rect::full(width, height), &tabs, 0, width, height, false);
+                            publish_app(draw::Rect::full(width, height), &tabs, 0, width, height, hit::Write::Nothing);
                             unsafe { CAPTURE = 0 };
                             unbake(s);
                             alloc::format!("G#{:X}\n", s.as_ptr() as usize)
@@ -10912,7 +10911,7 @@ fn server(grants: u64) -> ! {
                 }
                 if { APP }.is_some() {
                     // Every phase in one pass of the rows: composed and coded once, dithered four times (`publish_app_mask`).
-                    publish_app_mask(r, &tabs, (1 << PHASES) - 1, width, height, true);
+                    publish_app_mask(r, &tabs, (1 << PHASES) - 1, width, height, hit::Write::Rows);
                 } else {
                     // The deck: the canvas by its address (`pixels` is held by the request handler's closure here).
                     let canvas = core::slice::from_raw_parts(back as *const Px, width * height);
@@ -11500,7 +11499,7 @@ fn server(grants: u64) -> ! {
                 } else {
                     // The true image, from what the screen holds now, as the idle fill publishes a phase.
                     match unsafe { APP } {
-                        Some(_) => publish_app(full, &tabs, kk, width, height, true),
+                        Some(_) => publish_app(full, &tabs, kk, width, height, hit::Write::Rows),
                         None => publish10x4(pixels, width, height, &tabs, 1 << kk, full),
                     }
                     unsafe { PHASE_DIRTY[kk] = draw::Rect::EMPTY };
@@ -11544,7 +11543,7 @@ fn server(grants: u64) -> ! {
             let k = unsafe { (CUR_PHASE + 1) % PHASES };
             if unsafe { !PHASE_DIRTY[k].is_empty() } {
                 match unsafe { APP } {
-                    Some(_) => publish_app(unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height, true),
+                    Some(_) => publish_app(unsafe { PHASE_DIRTY[k] }, &tabs, k, width, height, hit::Write::Rows),
                     None => publish10x4(pixels, width, height, &tabs, 1 << k, unsafe { PHASE_DIRTY[k] }),
                 }
                 unsafe { PHASE_DIRTY[k] = draw::Rect::EMPTY };

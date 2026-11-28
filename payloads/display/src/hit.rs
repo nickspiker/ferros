@@ -1,14 +1,15 @@
-//! The hit map (owner, 2026-11-11; fluor's model, `HitId = u16`: "I mean, I already built it in fluor so sure?"; then "the hitmap is never even touched if the pixel is opaque. early out!"): a u16 a pixel, the owner of what the glass shows there, the glass's own size (8 MB on husky).
+//! The hit map (owner, 2026-11-11; fluor's model, `HitId = u16`: "I mean, I already built it in fluor so sure?"; then "the hitmap is never even touched if the pixel is opaque. early out!"): a u32 a pixel, the glass's own size (16 MB on husky), zipped (owner, 2026-11-28; docs/HITMAP.md "The map"): its high half the owner of what the glass shows there (the display's id, below), its low half the owner's own id there (an app's widget, from its plane; 0 for the display's own things and for a window without a plane).
 //!
+//! - **The owner half is the display's alone.** An app's plane fills only the low half, and only inside the pixels the compose gave its window: an app names its own widgets, never a pixel. A touch is one load; no id is translated in the compose (the list's global ids come from `Table` only when op 89 asks).
 //! - **Written by the compose, front to back.** Each publish writes the rows it composes (`row`), once (the first phase of a publish that carries several), and each pixel once: a row starts as one free run of columns, and each layer, frontmost first, claims the runs it owns, writes its id there and takes them out of the row (`Free`), so nothing behind it is looked at there. What no layer claimed is the ground's.
 //! - **The layers, front to back:**
 //!   - the system's places (`SYS` + op 41's code), as the console's worker leaves them at its own compose step (`bars_row`, from `bar_decode`): outside the app's circle every pixel (at the top the doorway by the camera 10 and else the nearest console circle's zone: the radios 0-4, USB 5, the clock 13, the battery 14, with 11 where none reaches; back 9 on the left of the bottom and deck 8 on the right), and inside it the quick row's circles while the row stands open (32 + k). In full screen (`FULL`; owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone") only the helm's: back and deck stay the system's, undrawn (so deck's swipe over a full-screen app shows the controls again; WINDOWS.md "The helm"), and the console's rows are not read at all (`row`, one test a row), their pixels the app's;
 //!   - behind the quick row while any of it shows on the glass (`SYS` + 12): everything inside the app's circle (never in full screen, where the row does not show);
-//!   - with an app in front, its windows by the layer stack (`WINDOW` + surface): a window owns every pixel where it is not see-through, as fluor tags a widget by its shape; where no window is, nobody's;
+//!   - with an app in front, its windows by the layer stack (`WINDOW` + surface): a window owns every pixel where it is not see-through, as fluor tags a widget by its shape, the low half from its plane at the same pixel (a widening copy a run); where no window is, nobody's. A window's own ids are written again at every present of it, over the rows that present composed (`ids_row`, `Write::Ids`): its plane changed with its frame. The owners stay as the layout left them until it changes (`HITS_STALE`);
 //!   - on the deck: the open circle's page (`REGION`), the map's circles front first (`CIRCLE` + their index in the scene, the crowd's included), each its disc; the plane under them all (`PLANE`).
 //!   - the helm's wedges are the system's, frontmost everywhere, on the deck as over an app: the compose draws the bars in front of the scene (`bars_front`), so the map claims them first in the same walk, and a circle lying under deck or back is behind the button on the glass and to a touch alike (owner, 2026-11-17: "when a kist is under the back or home button the back or home button do not work when we're on deck"; then "as long as the topmost item gets drawn first and under is honored than any filled pixel will skip the hitmap completely"). From 2026-11-12 to 2026-11-17 the deck claimed the wedges behind the map's circles (owner, 2026-11-12, on the 8a: a tap on the settings circle in the bottom right was taken as deck's), a walk in another order than the pixels': the circle took a tap on a button drawn in front of it.
-//! - **Read by one lookup.** Op 27 ("is this point my window's") and op 41 ("what of the system's is here") read the pixel (`at`); the geometry they kept of their own (the windows' rectangles and clear bits, the console's circles, the quick row's, the doorway, the helm's halves) went with them; it lives on only where it also draws.
-//! - **Seen on the Developer page** (owner: "a debug/devel checkbox for toggling on/off the hitmap on the fourth frame so we get three frames normal and fourth is always hitmap"; then on the Pro: "make sure that fourth frame gets updated completely so I can see the whole map proper with fresh colours per rotate"): the fourth temporal phase (`PHASE`) shows the map, a flat colour per owner, instead of the image, painted whole from the map each time it comes round to the layer, in a palette new to that showing (`on_layer`), so every owner is one flat colour across the glass and a change of ownership shows from one rotation to the next. The publishes never paint into it. Toggled by op 58, from the Developer page's switch alone since 2026-11-18 (owner: "screenshot is the two finger slide", the gesture that switched it until then; the page is in every development build and in a release build after the twelve taps).
+//! - **Read by one lookup.** Op 27 ("is this point my window's") and op 41 ("what of the system's is here") read the pixel's owner half (`owner`); the geometry they kept of their own (the windows' rectangles and clear bits, the console's circles, the quick row's, the doorway, the helm's halves) went with them; it lives on only where it also draws.
+//! - **Seen on the Developer page** (owner: "a debug/devel checkbox for toggling on/off the hitmap on the fourth frame so we get three frames normal and fourth is always hitmap"; then on the Pro: "make sure that fourth frame gets updated completely so I can see the whole map proper with fresh colours per rotate"): the fourth temporal phase (`PHASE`) shows the map, a flat colour per word (each app's widgets a colour of their own beside the system's places), instead of the image, painted whole from the map each time it comes round to the layer, in a palette new to that showing (`on_layer`), so every owner is one flat colour across the glass and a change of ownership shows from one rotation to the next. The publishes never paint into it. Toggled by op 58, from the Developer page's switch alone since 2026-11-18 (owner: "screenshot is the two finger slide", the gesture that switched it until then; the page is in every development build and in a release build after the twelve taps).
 
 use super::*;
 use core::sync::atomic::AtomicU32;
@@ -26,8 +27,14 @@ pub const WINDOW: u16 = 1 << 9;
 /// A circle of the map's plane: its index in the scene added.
 pub const CIRCLE: u16 = 1 << 12;
 
-/// The map, a u16 a pixel, rows of the screen's width.
+/// The map, a u32 a pixel (owner high, local low), rows of the screen's width.
 static mut MAP: usize = 1;
+
+/// The map's word for one of the display's own things: its id in the owner half, the local half 0.
+#[inline]
+const fn word(owner: u16) -> u32 {
+    (owner as u32) << 16
+}
 /// The bars' ids (`bars_row`), a u16 a pixel of the bars' rows (`BAR_TOP` then `CHROME_BOT`, as `BAR_W`): front and back, swapped with the bars' decoded rows at a pass's top, so a publish reads the ids of the bars it composes.
 static mut BARS: usize = 1;
 static mut BARS_BACK: usize = 1;
@@ -51,25 +58,30 @@ static SEED: AtomicU32 = AtomicU32::new(0);
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 pub static ROWS: AtomicU64 = AtomicU64::new(0);
 
-/// The map and the bars' ids, made at start (before the heap's mark). Returns their bytes.
+/// The map and the bars' ids, made at start (before the heap's mark). Returns their bytes. The bars' ids stay a u16 a pixel, owners alone (the system's), widened into the map as they are claimed (`claim_ids`).
 pub fn alloc(width: usize, height: usize) -> (usize, usize) {
     let bars = unsafe { BAR_TOP + CHROME_BOT } * width;
     unsafe {
-        MAP = alloc::vec![NOBODY; width * height].leak().as_mut_ptr() as usize;
+        MAP = alloc::vec![0u32; width * height].leak().as_mut_ptr() as usize;
         BARS = alloc::vec![NOBODY; bars].leak().as_mut_ptr() as usize;
         BARS_BACK = alloc::vec![NOBODY; bars].leak().as_mut_ptr() as usize;
     }
-    (width * height * 2, 2 * bars * 2)
+    (width * height * 4, 2 * bars * 2)
 }
 
-/// Who owns screen point (x, y): op 27's and op 41's one read. A point off the glass is nobody's.
-pub fn at(x: i64, y: i64) -> u16 {
+/// What screen point (x, y) is, the map's word: the owner in the high half, the owner's own id in the low. A point off the glass is nobody's (0).
+pub fn at(x: i64, y: i64) -> u32 {
     let (w, h) = unsafe { SCREEN_WH };
     // WHY the bounds: the point is a client's message.
     if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 {
-        return NOBODY;
+        return 0;
     }
-    unsafe { *(MAP as *const u16).add(y as usize * w as usize + x as usize) }
+    unsafe { *(MAP as *const u32).add(y as usize * w as usize + x as usize) }
+}
+
+/// Who owns screen point (x, y): op 27's and op 41's one read, the word's high half.
+pub fn owner(x: i64, y: i64) -> u16 {
+    (at(x, y) >> 16) as u16
 }
 
 /// A row's columns no layer has claimed yet, [from, to) runs left to right: the map's early out. A layer claims a run (`claim`), writes its id over what of it is still free, and takes that out; the ground takes what is left (`rest`). The runs live in storage the caller gives (`slot_runs` for a publishing thread), so starting a row costs nothing.
@@ -237,7 +249,7 @@ pub fn region_gone() {
 /// Row `y`'s map over columns [xa, xb), front to back (the module's doc), from the layers as this publish composes them: `app` with an app in front (its windows), else the deck.
 pub fn row(y: usize, xa: usize, xb: usize, width: usize, height: usize, app: bool) {
     let t0 = now();
-    let out = unsafe { core::slice::from_raw_parts_mut((MAP as *mut u16).add(y * width), width) };
+    let out = unsafe { core::slice::from_raw_parts_mut((MAP as *mut u32).add(y * width), width) };
     let mut free = Free::new(slot_runs(), xa, xb);
     // Full screen (`FULL`; owner, 2026-11-11, on the Pro: "helm should be functional but not visible in full screen, whilist console should be gone gone"): the console's rows hold nothing of the system's, so the bars' ids are read on the helm's rows alone and the top falls to the windows, and nothing is behind the quick row, which does not show (`bar_line`). One test a row, never a pixel; every phase is published whole when `FULL` changes (op 43, `full_follow`), and with it every row of the map.
     let full = unsafe { FULL };
@@ -248,7 +260,7 @@ pub fn row(y: usize, xa: usize, xb: usize, width: usize, height: usize, app: boo
         claim_ids(&mut free, out, ids, xa, xb, |id| id != NOBODY);
     }
     if behind {
-        free.rest(|a, z| out[a..z].fill(SYS + 12));
+        free.rest(|a, z| out[a..z].fill(word(SYS + 12)));
     } else if app {
         windows(y, &mut free, out, width);
     } else {
@@ -258,8 +270,8 @@ pub fn row(y: usize, xa: usize, xb: usize, width: usize, height: usize, app: boo
     ROWS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The runs of `ids` over [xa, xb) whose ids pass `take`, claimed with those ids.
-fn claim_ids(free: &mut Free, out: &mut [u16], ids: &[u16], xa: usize, xb: usize, take: impl Fn(u16) -> bool) {
+/// The runs of `ids` over [xa, xb) whose ids pass `take`, claimed with those ids, each widened into the owner half (the system's own: the local half 0).
+fn claim_ids(free: &mut Free, out: &mut [u32], ids: &[u16], xa: usize, xb: usize, take: impl Fn(u16) -> bool) {
     let mut x = xa;
     while x < xb {
         let t = take(ids[x]);
@@ -268,38 +280,53 @@ fn claim_ids(free: &mut Free, out: &mut [u16], ids: &[u16], xa: usize, xb: usize
             e += 1;
         }
         if t {
-            free.claim(x, e, |a, z| out[a..z].copy_from_slice(&ids[a..z]));
+            free.claim(x, e, |a, z| {
+                for i in a..z {
+                    out[i] = word(ids[i]);
+                }
+            });
         }
         x = e;
     }
 }
 
-/// The windows' share of a row: the layer stack's spans (`layout_build`), each chain frontmost first; a pixel is the first window's that is not see-through there.
-fn windows(y: usize, free: &mut Free, out: &mut [u16], width: usize) {
+/// The windows' share of a row: the layer stack's spans (`layout_build`), each chain frontmost first; a pixel is the first window's that is not see-through there, its word the window in the owner half and the window's plane at the same pixel in the local half (0 without a plane).
+fn windows(y: usize, free: &mut Free, out: &mut [u32], width: usize) {
     let bands = unsafe { core::slice::from_raw_parts(&raw const BANDS as *const Band, NBANDS) };
     let order = unsafe { *(&raw const ORDER) };
     let height = unsafe { SCREEN_WH.1 } as usize;
+    // Each surface's plane row shown now, looked up once a row (a surface without a plane costs one load, `plane`).
+    let planes: [Option<&[u16]>; SURFACES] = core::array::from_fn(|k| plane(k).map(|p| plane_row(p, y, width)));
     if let Some(band) = bands.iter().find(|b| (y as u16) >= b.y0 && (y as u16) < b.y1) {
         for sp in band.spans() {
             let chain = sp.chain();
             free.claim(sp.x0 as usize, sp.x1 as usize, |a, z| {
                 let Some(&first) = chain.first() else {
-                    out[a..z].fill(NOBODY);
+                    out[a..z].fill(0);
                     return;
                 };
                 let (k0, f0, m0) = order[first as usize];
                 if m0 & OPAQUE != 0 && f0 != G2T16 {
-                    out[a..z].fill(WINDOW + k0 as u16);
+                    // The owner constant over the run; the local half a widening copy from the plane, or 0 without one.
+                    let own = word(WINDOW + k0 as u16);
+                    match planes[k0 as usize] {
+                        Some(ids) => {
+                            for x in a..z {
+                                out[x] = own | ids[x] as u32;
+                            }
+                        }
+                        None => out[a..z].fill(own),
+                    }
                     return;
                 }
                 for x in a..z {
-                    out[x] = NOBODY;
+                    out[x] = 0;
                     for &i in chain {
                         let (k, f, _) = order[i as usize];
                         let p = window_pixels(k as usize, width, height)[src_row(k as usize, y, x) * width + x];
                         // Not see-through: a G2T16 pixel with any α, a working one without bit 63 (`working`'s own test).
                         if if f == G2T16 { p >> 48 != 0 } else { p >> 63 == 0 } {
-                            out[x] = WINDOW + k as u16;
+                            out[x] = word(WINDOW + k as u16) | planes[k as usize].map_or(0, |ids| ids[x] as u32);
                             break;
                         }
                     }
@@ -307,15 +334,50 @@ fn windows(y: usize, free: &mut Free, out: &mut [u16], width: usize) {
             });
         }
     }
-    free.rest(|a, z| out[a..z].fill(NOBODY));
+    free.rest(|a, z| out[a..z].fill(0));
+}
+
+/// What an app publish writes into the map with the rows it composes (`publish_app_rows`, the GPU compose's rows after its kernel).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Write {
+    /// Nothing: a capture, which composes no glass.
+    Nothing,
+    /// Every row composed written whole (`row`): the layout changed since the map was written (`HITS_STALE`), or a publish not tied to one window's present.
+    Rows,
+    /// Surface k's own ids alone in the rows composed (`ids_row`): its window presented, and its plane changed with its frame; every owner as the layout left it.
+    Ids(usize),
+}
+
+impl Write {
+    /// Row y's share of it over columns [xa, xb), an app in front.
+    #[inline]
+    pub fn put(self, y: usize, xa: usize, xb: usize, width: usize, height: usize) {
+        match self {
+            Write::Nothing => {}
+            Write::Rows => row(y, xa, xb, width, height, true),
+            Write::Ids(k) => ids_row(k, y, xa, xb, width),
+        }
+    }
+}
+
+/// Surface k's own ids over columns [xa, xb) of row y, at a present of its window: where the owner half is its window, the local half from its plane shown now, so the ids follow its frame; every other pixel as the layout left it (front to back already: the owner half says the window won the pixel). A window without a plane has no ids to follow.
+pub fn ids_row(k: usize, y: usize, xa: usize, xb: usize, width: usize) {
+    let Some(p) = plane(k) else { return };
+    let ids = plane_row(p, y, width);
+    let out = unsafe { core::slice::from_raw_parts_mut((MAP as *mut u32).add(y * width), width) };
+    let own = WINDOW + k as u16;
+    for x in xa..xb {
+        let m = out[x];
+        out[x] = if (m >> 16) as u16 == own { word(own) | ids[x] as u32 } else { m };
+    }
 }
 
 /// The deck's share of a row, what the bars in front of it left free (`row`): a flight's frame is the map's plane throughout (its two images are the map's); else the open circle's page, then the map's circles front first, then the plane.
-fn deck(y: usize, free: &mut Free, out: &mut [u16], width: usize) {
+fn deck(y: usize, free: &mut Free, out: &mut [u32], width: usize) {
     if unsafe { (*(&raw const FLIGHT_FRAME)).is_none() } {
         if let Some((x, yc, r)) = unsafe { REGION_DISC } {
             if let Some((a, z)) = chord_q8(x, yc, r, y, width) {
-                free.claim(a, z, |a, z| out[a..z].fill(REGION));
+                free.claim(a, z, |a, z| out[a..z].fill(word(REGION)));
             }
         }
         let discs = unsafe { &(&*(&raw const DISCS))[..NDISCS] };
@@ -329,11 +391,11 @@ fn deck(y: usize, free: &mut Free, out: &mut [u16], width: usize) {
                 continue;
             }
             if let Some((a, z)) = chord_q8(x, yc, r, y, width) {
-                free.claim(a, z, |a, z| out[a..z].fill(CIRCLE + i));
+                free.claim(a, z, |a, z| out[a..z].fill(word(CIRCLE + i)));
             }
         }
     }
-    free.rest(|a, z| out[a..z].fill(PLANE));
+    free.rest(|a, z| out[a..z].fill(word(PLANE)));
 }
 
 /// The map written again over `r` without composing anything (the quick row came or went: everything inside the app's circle changed hands), by stripes across the publish workers as a publish is.
@@ -374,20 +436,19 @@ pub fn on_layer(k: usize) {
 pub static PAINTS: AtomicU64 = AtomicU64::new(0);
 pub static PAINT_US: AtomicU64 = AtomicU64::new(0);
 
-/// One stripe of the view's frame (`pub_take`, kind 3): each row from the map, a colour worked out once a run of one owner, then one wide copy into the phase (non-cacheable: written, never read).
+/// One stripe of the view's frame (`pub_take`, kind 3): each row from the map, a colour worked out once a run of one word, then one wide copy into the phase (non-cacheable: written, never read).
+/// The whole word is coloured, so each app's widgets (its own ids in the low half, docs/HITMAP.md) show in colours of their own beside the system's places.
 pub fn paint_stripe(width: usize, s: draw::Rect) {
     let seed = SEED.load(Ordering::Relaxed);
     let dst = phase_slice(PHASE, width * unsafe { SCREEN_WH.1 } as usize);
     // The glass's widest row (husky's 1344) fits; the publish's own rows are the same size.
     let mut row = [0u32; 1344];
-    // Each app's own ids from its plane where its window owns a pixel (docs/HITMAP.md), so every widget shows in a colour of its own.
-    let planes = planes();
     for y in s.y0 as usize..s.y1 as usize {
-        let ids = unsafe { core::slice::from_raw_parts((MAP as *const u16).add(y * width), width) };
-        let k0 = key(ids[0], &planes, y * width);
+        let ids = unsafe { core::slice::from_raw_parts((MAP as *const u32).add(y * width), width) };
+        let k0 = ids[0];
         let (mut last, mut c) = (k0, colour(k0, seed));
         for x in 0..width {
-            let k = key(ids[x], &planes, y * width + x);
+            let k = ids[x];
             if k != last {
                 last = k;
                 c = colour(k, seed);
@@ -443,7 +504,7 @@ pub fn bars_changed(b: usize, width: usize) -> Option<(usize, usize)> {
     Some((x0, x1))
 }
 
-/// An owner's colour in a palette: a hash of the id and the seed, one channel full so no owner reads as black, the others anywhere (10-bit codes, straight to the panel: a development view, not light).
+/// A word's colour in a palette: a hash of the word and the seed, one channel full so no owner reads as black, the others anywhere (10-bit codes, straight to the panel: a development view, not light).
 fn colour(id: u32, seed: u32) -> u32 {
     let mut h = (id ^ seed.rotate_left(16)).wrapping_mul(0x9E37_79B9);
     h ^= h >> 15;
@@ -456,7 +517,7 @@ fn colour(id: u32, seed: u32) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// The apps' planes (docs/HITMAP.md): each app's own hit ids beside the display's, a u16 a pixel in screen coordinates.
+// The apps' planes (docs/HITMAP.md): each app's own hit ids, a u16 a pixel in screen coordinates, read into the map's low half where the compose gave its window the pixel.
 // ---------------------------------------------------------------------------
 
 /// A plane's run in the display's pool: a head (its first u32 the plane that goes with the frame shown, 0 or 1), then two planes of the panel's size, so the app writes one while the display reads the other.
@@ -513,11 +574,14 @@ pub fn plane_give(k: usize, tok: &[u8; 32], grants: u64) -> Result<(u64, usize),
     Ok((id, plane_bytes(w, h)))
 }
 
-/// Surface k's plane shown now: the u16 ids of the frame on the glass, in screen coordinates. None without one, or when the surface has changed hands since it was given.
+/// Surface k's plane shown now: the u16 ids of the frame on the glass, in screen coordinates. None without one (one load), or when the surface has changed hands since it was given.
 fn plane(k: usize) -> Option<*const u16> {
     let at = PLANE_AT[k].load(Ordering::Acquire);
+    if at == 0 {
+        return None;
+    }
     let g = live_gen(k) as u64;
-    if at == 0 || g == 0 || PLANE_GEN[k].load(Ordering::Acquire) != g {
+    if g == 0 || PLANE_GEN[k].load(Ordering::Acquire) != g {
         return None;
     }
     let (w, h) = unsafe { SCREEN_WH };
@@ -526,25 +590,11 @@ fn plane(k: usize) -> Option<*const u16> {
     Some((at as usize + PLANE_HEAD + shown * plane_bytes(w as usize, h as usize)) as *const u16)
 }
 
-/// The key of what pixel (x, y) is, for the view and the list: an app's own id where its window owns the pixel and its plane names one there (bit 24, the surface, the id), else the display's id.
+/// Row y of a plane (`plane`), the screen's width of u16 ids.
+/// SAFETY: the plane is a screen of u16 in the display's own pool, row y one of the screen's (the callers compose screen rows); any u16 is an id, so an app that wrote its shown plane anyway garbles only its own ids, inside its own window's pixels.
 #[inline]
-fn key(id: u16, planes: &[Option<*const u16>; SURFACES], i: usize) -> u32 {
-    let k = id.wrapping_sub(WINDOW) as usize;
-    if k < SURFACES {
-        if let Some(p) = planes[k] {
-            // SAFETY: i is a pixel of the screen (the callers walk its rows), and the plane is a screen of u16.
-            let local = unsafe { core::ptr::read_volatile(p.add(i)) };
-            if local != 0 {
-                return 1 << 24 | (k as u32) << 16 | local as u32;
-            }
-        }
-    }
-    id as u32
-}
-
-/// Every surface's plane shown now (`plane`), looked up once a stripe or a list.
-fn planes() -> [Option<*const u16>; SURFACES] {
-    core::array::from_fn(plane)
+fn plane_row(p: *const u16, y: usize, width: usize) -> &'static [u16] {
+    unsafe { core::slice::from_raw_parts(p.add(y * width), width) }
 }
 
 /// The table of app ids (owner, 2026-11-27: "a u16 and just do our own bookkeeping ... a teency hash map with collision ness"): an app's (surface, its id, the holder generation) to the id the list names it by, from `APP_IDS` up, open addressing with linear probing, doubled when half full. Its entries go when their surface changes hands (`sweep`). The receive thread's alone.
@@ -561,7 +611,7 @@ impl Table {
         (key.wrapping_mul(0x9E37_79B9) >> 7) as usize
     }
 
-    /// The global id of `key` (bit 24 clear: the surface and the app's id) under holder generation `g`, handed out when first seen; None when every u16 past `APP_IDS` is in use (a refusal, said in the reply).
+    /// The global id of `key` (the surface in bits 16-23, the app's id in bits 0-15) under holder generation `g`, handed out when first seen; None when every u16 past `APP_IDS` is in use (a refusal, said in the reply).
     fn id(&mut self, key: u32, g: u8) -> Option<u16> {
         if self.slots.is_empty() || 2 * (self.used + 1) > self.slots.len() {
             let n = (self.slots.len() * 2).max(1 << 8);
@@ -618,23 +668,21 @@ impl Table {
 }
 
 /// Op 89 `hits` (docs/HITMAP.md "Accessibility and tests"): everything on the glass that a touch can land on, one entry each: [0][count u32] then per entry 18 bytes, all little-endian: its id (u16: the display's own, or an app's from the table), its surface (u8, G#FF for the display's own), a 0 byte, the app's own id (u16, 0 for the display's), its bounding box (x0, y0, x1, y1, each u16, x1 and y1 past the last pixel), and a pixel inside it (x, y, u16 each: the middle one of its pixels in row order, so a tap there lands on it whatever its shape).
-/// Two walks of the screen: the first counts each one's pixels and box, the second finds each one's middle pixel. The receive thread's, on demand: nothing runs while nobody asks.
+/// Two walks of the map's words: the first counts each word's pixels and box, the second finds each one's middle pixel. A word with a nonzero low half is an app's widget (only a window's claim writes one: its surface from the owner half, its own id the low half), named by its global id from the table; one with a zero low half is the display's own, named by the owner. The receive thread's, on demand: nothing runs while nobody asks.
 pub fn list() -> alloc::vec::Vec<u8> {
     let (w, h) = unsafe { SCREEN_WH };
     let (w, h) = (w as usize, h as usize);
-    let planes = planes();
     let table = unsafe { &mut *(&raw mut TABLE) };
     table.sweep();
-    // (key, count, x0, y0, x1, y1, middle index, seen in the second walk, middle pixel)
+    // (word, count, x0, y0, x1, y1, middle index, seen in the second walk, middle pixel)
     let mut seen: alloc::vec::Vec<(u32, u32, u16, u16, u16, u16, u32, u32, u32)> = alloc::vec::Vec::new();
     let mut index: alloc::collections::BTreeMap<u32, usize> = alloc::collections::BTreeMap::new();
-    let map = unsafe { MAP } as *const u16;
+    let map = unsafe { core::slice::from_raw_parts(MAP as *const u32, w * h) };
     for y in 0..h {
         for x in 0..w {
-            let i = y * w + x;
-            // SAFETY: i is a pixel of the screen, the map its size.
-            let k = key(unsafe { *map.add(i) }, &planes, i);
-            if k == NOBODY as u32 {
+            let k = map[y * w + x];
+            // Nobody's (`NOBODY` with no local id): nothing a touch can land on.
+            if k == 0 {
                 continue;
             }
             let at = *index.entry(k).or_insert_with(|| {
@@ -655,8 +703,7 @@ pub fn list() -> alloc::vec::Vec<u8> {
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
-            let k = key(unsafe { *map.add(i) }, &planes, i);
-            if let Some(&at) = index.get(&k) {
+            if let Some(&at) = index.get(&map[i]) {
                 let e = &mut seen[at];
                 if e.7 == e.6 {
                     e.8 = i as u32;
@@ -668,14 +715,16 @@ pub fn list() -> alloc::vec::Vec<u8> {
     let mut out = alloc::vec![0u8, 0, 0, 0, 0];
     let mut n = 0u32;
     for e in &seen {
-        let (gid, surface, local) = if e.0 >> 24 == 1 {
-            let k = ((e.0 >> 16) & 0xFF) as usize;
-            match table.id(e.0 & 0xFF_FFFF, live_gen(k)) {
-                Some(g) => (g, k as u8, e.0 as u16),
+        let (owner, local) = ((e.0 >> 16) as u16, e.0 as u16);
+        let (gid, surface, local) = if local != 0 {
+            // A local id is written only under a window's owner (`windows`, `ids_row`), so the owner is `WINDOW` + its surface.
+            let k = (owner - WINDOW) as usize;
+            match table.id((k as u32) << 16 | local as u32, live_gen(k)) {
+                Some(g) => (g, k as u8, local),
                 None => continue,
             }
         } else {
-            (e.0 as u16, 0xFF, 0)
+            (owner, 0xFF, 0)
         };
         out.extend_from_slice(&gid.to_le_bytes());
         out.push(surface);
