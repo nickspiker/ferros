@@ -34,11 +34,11 @@ cargo build -q --release -p ferros-flash --target x86_64-pc-windows-gnu
 cargo build -q --release -p ferros-flash --target x86_64-unknown-linux-gnu
 mac cargo build -q --release -p ferros-flash --target aarch64-apple-darwin
 cargo build -q -p ferros-flash --features publish
-# The GUI is its own crate (fluor's host build stays out of the workspace lock), built into the same target directory.
+# The GUI is its own crate (fluor's host build stays out of the workspace lock), built into the same target directory: named outright, since a crate with its own [workspace] otherwise builds into its own target/ (2026-11-28: the publish copied from the workspace's and found nothing).
 GUI=tools/flash-gui/Cargo.toml
-cargo build -q --release --manifest-path $GUI --target x86_64-pc-windows-gnu
-cargo build -q --release --manifest-path $GUI --target x86_64-unknown-linux-gnu
-mac cargo build -q --release --manifest-path $GUI --target aarch64-apple-darwin
+cargo build -q --release --manifest-path $GUI --target-dir "$T" --target x86_64-pc-windows-gnu
+cargo build -q --release --manifest-path $GUI --target-dir "$T" --target x86_64-unknown-linux-gnu
+mac cargo build -q --release --manifest-path $GUI --target-dir "$T" --target aarch64-apple-darwin
 FF=$T/debug/ferros-flash
 cp "$T/x86_64-pc-windows-gnu/release/ferros-flash.exe" "$OUT/ferros-flash-windows-x86_64.exe"
 cp "$T/x86_64-unknown-linux-gnu/release/ferros-flash" "$OUT/ferros-flash-linux-x86_64"
