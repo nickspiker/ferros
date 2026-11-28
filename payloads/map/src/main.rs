@@ -1702,6 +1702,10 @@ struct Map {
     /// The view a circle was opened from, flown back to when it closes (owner, 2026-11-06: "it should revert to the last view when exiting").
     back: Option<Cam>,
     leaving: bool,
+    /// The deck's view before a tap centred a puck (`centred`; owner, 2026-11-28: "a tap to center and rotate in frame so it's tangent left/right ... the deck button in the helm restores the previous deck view"), flown back to by the helm's Deck.
+    /// Its own field, not `back`: a circle opened from the centred view keeps `back` for its close, and this one waits under it.
+    /// Kept across taps on other pucks, so Deck goes back to where the person started; dropped once the camera is taken elsewhere (a pan or pinch of the plane, Deck's swipe, Back's zoom out, a pack, the view read again).
+    puck_view: Option<Cam>,
     /// The fade from the plane (0) to the open page (1), on the flight's spring; and whether the display flies this flight from its two prerendered images (op 45 took it), and the page image's camera (the open circle landed).
     fade: f64,
     fast: bool,
@@ -2251,6 +2255,8 @@ impl Map {
         self.place_circles(n, &was);
         let viewed = self.load_view();
         if viewed {
+            // The camera is the kept view now: a view saved before a puck was centred is gone with the one it was saved from.
+            self.puck_view = None;
             self.send_scene();
         }
         // The camera to the display too: until 2026-11-22 only the scene went, and the display went on showing the old camera over the new places (and hit-tested taps the map read under the new one) until something else drew.
@@ -2776,6 +2782,8 @@ impl Map {
             }
             *cam = rez(*cam);
         }
+        // The view before a puck was centred, which the helm's Deck flies back to, likewise.
+        self.puck_view = self.puck_view.map(rez);
         let was = self.cam;
         self.cam.x = self.cam.x * z / Z_ONE;
         self.cam.y = self.cam.y * z / Z_ONE;
@@ -3251,6 +3259,25 @@ impl Map {
         cam.x += dx;
         cam.y += dy;
         cam
+    }
+
+    /// The camera that centres circle i on the panel, tangent to its left and right edges, its face upright (a tapped puck; owner, 2026-11-28: "tap to center and rotate in frame so it's tangent left/right, unlike the full zoom in on a kist").
+    /// The centre is the circle's, the zoom puts its radius at half the panel's width (`at` with the active circle's radius made the half width, and no offset), and the turn is the circle's own undone: the display turns the face by the camera's turn times the circle's (display `puck::seen`), so the conjugate leaves it level.
+    fn centred(&self, i: usize) -> Cam {
+        let c = &self.deck.circles[i];
+        // WHY the floor of 1, as in `at`: a radius of 0 is a legal circle (deck.rs: "0 draws nothing") and `hit` takes it at its centre pixel (0 ≤ 0), so a tap can land here with it, and the division would panic.
+        Cam { x: c.at.x, y: c.at.y, z: ((self.w / 2) << 16) / c.r.max(1), c: c.turn.c, s: -c.turn.s }
+    }
+
+    /// Whether camera `a` shows circle i as `centred(i)` does to within a pixel on the glass: its centre within a pixel of the panel's centre, its radius within a pixel of the half width, its face within a pixel of level at the rim.
+    /// WHY a pixel and not equality: the plane let go at the centred view is rescaled to zoom one (`renormalise`), which floors the circle's radius and the camera's place to whole units of the new scale, so the same view comes back up to a pixel off the camera `centred` then computes; a tap there must still read as "already centred", or it flies a sub-pixel flight that moves the zoom off one again.
+    fn shows_centred(&self, a: Cam, i: usize) -> bool {
+        let c = &self.deck.circles[i];
+        let (gx, gy) = a.glass(c.at.x as f64, c.at.y as f64);
+        let rim = (c.r * a.z >> 16) - self.w / 2;
+        // The face's turn on the glass (the camera's times the circle's, Q28): its sine times the radius in pixels is how far its rim is off level; a positive cosine, so not upside down.
+        let (fc, fs) = (a.c * c.turn.c - a.s * c.turn.s, a.s * c.turn.c + a.c * c.turn.s);
+        gx.abs() <= 1. && gy.abs() <= 1. && rim.abs() <= 1 && fc > 0 && (fs * (self.w / 2)).abs() <= ONE * ONE
     }
 
     /// Go to `to`: the camera flies there a display frame at a time (`step_cam`), each part of it on the critically damped spring (`spring`) in the space it looks even in (owner, 2026-11-05: the tap's flight follows the settings' snap; 2026-11-06: eased, as the pages are). From rest it eases in; a new target mid-flight keeps the speed the camera has, so a second tap turns the flight without a jolt.
@@ -6095,6 +6122,8 @@ impl Map {
             self.back = None;
             self.leaving = true;
         }
+        // The camera goes elsewhere: Deck no longer goes back to a view before a centred puck.
+        self.puck_view = None;
         let to = self.deck_fit();
         self.fly(to);
         self.draw();
@@ -6167,6 +6196,8 @@ impl Map {
                 _ => ((0..n).map(|i| (self.deck.circles[i].at.x, self.deck.circles[i].at.y)).collect(), self.cam),
             });
         }
+        // The camera goes to the pack: Deck no longer goes back to a view before a centred puck.
+        self.puck_view = None;
         self.travel_to(&land[..n], cam, false);
         self.fly(cam);
         // The pack as the glass will show it, its places on whole world units: the largest overlap there and the most any circle stands off everything (the display draws a circle at its whole world units).
@@ -6229,6 +6260,8 @@ impl Map {
     /// Back's tap on a packed deck: every circle back to where it stood before (`pack_deck`), the camera with them, on the same travel. Whether there was a scatter to go back to.
     fn scatter_back(&mut self) -> bool {
         let Some((to, cam)) = self.scatter.take() else { return false };
+        // The camera goes back with the scatter: Deck no longer goes back to a view before a centred puck.
+        self.puck_view = None;
         self.travel_to(&to, cam, true);
         self.fly(cam);
         true
@@ -6290,6 +6323,8 @@ impl Map {
             self.back = None;
             self.leaving = true;
         }
+        // The camera goes out to every circle: Deck no longer goes back to a view before a centred puck.
+        self.puck_view = None;
         let t0 = now();
         let (to, gain, turned) = self.deck_turned();
         let us = ferros_sys::us_since(t0);
@@ -6329,6 +6364,12 @@ impl Map {
                 self.fly(to);
                 self.draw();
                 return "map: deck: the open circle closed";
+            }
+            // A puck centred by a tap (`centred`): back to the deck's view before it. After an open circle, one level at a time: a circle opened from the centred view closes to it first (its `back`), and the next Deck goes on out to the view before the puck.
+            if let Some(to) = self.puck_view.take() {
+                self.fly(to);
+                self.draw();
+                return "map: deck: back to the view before the puck was centred";
             }
             return "map: deck: the map already";
         }
@@ -6467,6 +6508,18 @@ impl Map {
                             m[4..6].copy_from_slice(&(sy as u16).to_le_bytes());
                             let mut r = [0u8; 1];
                             call(self.display, &m, &mut r);
+                            // And the camera centres it, upright and tangent left and right (`centred`; owner, 2026-11-28: "I'm finding myself accidentally scaling the pucks"), still never opened: the face draws larger as the display samples its square at the new size.
+                            // Judged by where the camera is going, not where it is: a second tap during the flight, or one on the puck already centred, is the face's tap alone.
+                            let dest = self.target.unwrap_or(self.cam);
+                            if !self.shows_centred(dest, i) {
+                                // The view to come back to (the helm's Deck) is the one before the first puck was centred: a tap on another puck while one is centred keeps it.
+                                if self.puck_view.is_none() {
+                                    self.puck_view = Some(dest);
+                                }
+                                let to = self.centred(i);
+                                self.fly(to);
+                                self.draw();
+                            }
                             return;
                         }
                         // A stop it has not said yet (it crashed while the person was elsewhere, `stopped`): this tap opens the circle on that, once, and the next tap launches.
@@ -7113,6 +7166,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         flight: None,
         back: None,
         leaving: false,
+        puck_view: None,
         fade: 0.,
         fast: false,
         page_cam: None,
@@ -8414,6 +8468,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                     map.keep_on_screen();
                     map.pans = [map.pans[1], map.pans[2], (cur[id].1 - prev[id].1, cur[id].2 - prev[id].2)];
                     map.panned = true;
+                    // The camera taken elsewhere by hand: Deck no longer goes back to a view before a centred puck.
+                    map.puck_view = None;
                 }
             } else if nb == 2 {
                 let (a, b) = (both[0], both[1]);
@@ -8464,6 +8520,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                     map.cam.x = wx - dx;
                     map.cam.y = wy - dy;
                     map.keep_on_screen();
+                    // The camera taken elsewhere by hand, as a pan takes it.
+                    map.puck_view = None;
                 }
             }
             let t_draw = now();

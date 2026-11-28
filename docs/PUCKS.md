@@ -51,7 +51,7 @@ The circles on the deck never cover more than the screen (owner, 2026-11-18: "th
 
 "Tap/drag with one finger moves it, with two scales/rotates and a simple tap passes thru so we can make our dozenal calculator work too."
 - One finger dragging a puck moves its circle, two fingers in it move, size and turn it: the deck's own gestures on every circle, kept in `map.place.*`.
-- A tap (down and up without moving past the slop) on a puck goes to the puck: the map sends it to the display (op 74, scene index and screen pixel), which turns it into the face's own frame, Q14 of the radius from the centre, and answers the puck's held WATCH with it. Nothing flies, nothing takes focus: a puck is never opened.
+- A tap (down and up without moving past the slop) on a puck goes to the puck: the map sends it to the display (op 74, scene index and screen pixel), which turns it into the face's own frame, Q14 of the radius from the centre, and answers the puck's held WATCH with it. The tap also centres the puck (owner, 2026-11-28: "a tap to center and rotate in frame so it's tangent left/right, unlike the full zoom in on a kist"): the camera flies so its circle sits at the panel's centre, upright, tangent to the left and right edges, and its face draws larger; a second tap is the face's alone. The helm's Deck flies back to the view before the first puck was centred (a pan or pinch of the plane forgets it). Nothing takes focus: a puck is still never opened.
 - A puck whose wants are not yet answered asks them on its first tap, as a kist does.
 
 ## Declaring a puck, its slot, its right
