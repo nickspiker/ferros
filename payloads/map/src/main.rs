@@ -4811,6 +4811,14 @@ impl Map {
             "sound" => {
                 // Sound (owner, 2026-11-24: "Not sure why that's under developer options and not sound", then "yes, add a sound page"): the speaker, microphone and buzz tests, moved here from Developer, between the battery and the torch.
                 // The speaker test (owner, 2026-11-22: "Just throw a mic and speaker test in the ferros settings and I can test it"; devtest.rs): a 1 kHz tone while a button is held, at the slider's level, which the service never lets past its ceiling (no speaker protection yet, said here); the amplifiers' state after each answer, as numbers (their registers' bits, so in the developer's G#).
+                // The volume first (owner, 2026-11-28): the device's one gain, a typed setting (typed.rs `VOLUME`), live under the finger and kept at the lift, its level said as the speaker test says its own.
+                typed_row(self, b, &mut y, typed::VOLUME);
+                let vol = match self.slide {
+                    Some((Choice::Typed(i), t)) if i as usize == typed::VOLUME => typed::ALL[typed::VOLUME].value(t),
+                    _ => typed::ALL[typed::VOLUME].now(),
+                };
+                row(self, b, &mut y, small, grey(), say(Say::UnderFullScale(devtest::level_under(vol))).as_str(), None);
+                y += uu(1, 1);
                 b.text(cx, y, note as u16, dim(), 1, tr(Msg::SpeakerTest));
                 y += uu(2, 1);
                 rows(self, b, &mut y, note, grey(), tr(Msg::NoSpeakerProtection));

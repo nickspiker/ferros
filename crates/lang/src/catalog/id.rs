@@ -408,6 +408,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FrameCounter => "penghitung bingkai",
         // ---- the Developer page's speaker, microphone and buzz tests ----
         Msg::SpeakerTest => "uji pengeras suara",
+        Msg::Volume => "volume",
         Msg::NoSpeakerProtection => "belum ada perlindungan pengeras suara: levelnya dijaga rendah",
         Msg::HoldToPlay => "tahan tombol untuk memutar, lepaskan untuk berhenti",
         Msg::Left => "kiri",

@@ -408,6 +408,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FrameCounter => "kihesabu fremu",
         // ---- the Developer page's speaker, microphone and buzz tests ----
         Msg::SpeakerTest => "jaribio la spika",
+        Msg::Volume => "sauti",
         Msg::NoSpeakerProtection => "bado hakuna kinga ya spika: kiwango kinawekwa chini",
         Msg::HoldToPlay => "shikilia kitufe ili kucheza, achia ili kusimamisha",
         Msg::Left => "kushoto",

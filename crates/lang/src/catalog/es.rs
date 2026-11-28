@@ -408,6 +408,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FrameCounter => "contador de fotogramas",
         // ---- the Developer page's speaker, microphone and buzz tests ----
         Msg::SpeakerTest => "prueba del altavoz",
+        Msg::Volume => "volumen",
         Msg::NoSpeakerProtection => "aún sin protección del altavoz: el nivel se mantiene bajo",
         Msg::HoldToPlay => "mantén un botón para reproducir, suéltalo para parar",
         Msg::Left => "izquierdo",

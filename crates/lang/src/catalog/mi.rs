@@ -408,6 +408,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FrameCounter => "kaute anga",
         // ---- the Developer page's speaker, microphone and buzz tests ----
         Msg::SpeakerTest => "whakamātautau tukuoro",
+        Msg::Volume => "kaha oro",
         Msg::NoSpeakerProtection => "kāore anō kia whakamarumarutia te tukuoro: ka iti tonu te taumata",
         Msg::HoldToPlay => "pupuritia tētahi pātene kia pāho, tukua kia mutu",
         Msg::Left => "mauī",

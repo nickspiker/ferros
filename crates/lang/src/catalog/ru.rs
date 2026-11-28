@@ -408,6 +408,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FrameCounter => "счётчик кадров",
         // ---- the Developer page's speaker, microphone and buzz tests ----
         Msg::SpeakerTest => "проверка динамика",
+        Msg::Volume => "громкость",
         Msg::NoSpeakerProtection => "защиты динамика пока нет: уровень держится низким",
         Msg::HoldToPlay => "удерживайте кнопку для воспроизведения, отпустите для остановки",
         Msg::Left => "левый",

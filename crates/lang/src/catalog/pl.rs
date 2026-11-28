@@ -408,6 +408,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FrameCounter => "licznik klatek",
         // ---- the Developer page's speaker, microphone and buzz tests ----
         Msg::SpeakerTest => "test głośnika",
+        Msg::Volume => "głośność",
         Msg::NoSpeakerProtection => "brak jeszcze ochrony głośnika: poziom jest trzymany nisko",
         Msg::HoldToPlay => "przytrzymaj przycisk, aby odtwarzać, puść, aby zatrzymać",
         Msg::Left => "lewy",

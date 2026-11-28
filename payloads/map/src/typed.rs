@@ -26,7 +26,7 @@ pub struct Typed {
 }
 
 /// Every typed setting, the index a page's slider row carries (`Choice::Typed`).
-pub const ALL: [Typed; 5] = [
+pub const ALL: [Typed; 6] = [
     // The torch (docs/TORCH.md "Settings"; owner, 2026-11-11: "brightness and strobe frequency and duty cycle and timeout"): the level a tap lights it at, the strobe (off, or a flash every 4 s to 16 a second, read as its period), the share of each flash lit, and when it turns itself off (never, or 16 s to about 4 h 33 min).
     Typed { pref: ferros_sys::PREF_TORCH_LEVEL, name: Msg::Brightness, kind: Kind::Level },
     Typed { pref: ferros_sys::PREF_TORCH_STROBE, name: Msg::Strobe, kind: Kind::Octaves { steps: ferros_sys::torch::STROBE_STEPS, off: Msg::Off, ns: ferros_sys::torch::strobe_period_ns } },
@@ -34,11 +34,15 @@ pub const ALL: [Typed; 5] = [
     Typed { pref: ferros_sys::PREF_TORCH_TIMEOUT, name: Msg::TurnsOffAfter, kind: Kind::Octaves { steps: ferros_sys::torch::TIMEOUT_STEPS, off: Msg::Never, ns: ferros_sys::torch::timeout_ns } },
     // The panel's brightness, on Appearance (owner, 2026-11-12: "tap brings you to the more granular screen settings page, which I wanted to combine a few things, brightness, theme, other look related items").
     Typed { pref: ferros_sys::PREF_BRIGHTNESS, name: Msg::Brightness, kind: Kind::Stops },
+    // The sound's volume (docs/AUDIO.md "Volume"): the level the audio service mixes every stream at, 1 to 255 by sixteenths of an octave, 255 full scale; the amplifiers run without their protection firmware, so the owner listens as it rises.
+    Typed { pref: ferros_sys::PREF_VOLUME, name: Msg::Volume, kind: Kind::Level },
 ];
 /// The torch page's settings, in `ALL`.
 pub const TORCH: core::ops::Range<usize> = 0..4;
 /// The torch's level, in `ALL`.
 pub const TORCH_LEVEL: usize = 0;
+/// The sound's volume, in `ALL` (docs/AUDIO.md "Volume": preference 46, 1 to 255 in sixteenths of an octave, the mixer's one gain; owner, 2026-11-28: "do we have volume control wired in yet?").
+pub const VOLUME: usize = 5;
 /// The panel's brightness, in `ALL`.
 pub const BRIGHTNESS: usize = 4;
 
@@ -47,6 +51,8 @@ impl Typed {
     pub fn now(&self) -> u8 {
         match self.kind {
             Kind::Level if self.pref == ferros_sys::PREF_TORCH_LEVEL => ferros_sys::torch::level(),
+            // The volume never set reads as the level the mixer uses for it (two octaves down, ferros_sys::audio `DEFAULT_LEVEL`).
+            Kind::Level if self.pref == ferros_sys::PREF_VOLUME => ferros_sys::audio::level(),
             _ => ferros_sys::pref(self.pref),
         }
     }

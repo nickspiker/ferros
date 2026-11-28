@@ -408,6 +408,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FrameCounter => "bilang ng frame",
         // ---- the Developer page's speaker, microphone and buzz tests ----
         Msg::SpeakerTest => "pagsubok ng speaker",
+        Msg::Volume => "lakas ng tunog",
         Msg::NoSpeakerProtection => "wala pang proteksyon ang speaker: pinananatiling mababa ang lakas",
         Msg::HoldToPlay => "pindutin nang matagal ang button para tumugtog, bitawan para huminto",
         Msg::Left => "kaliwa",

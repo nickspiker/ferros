@@ -408,6 +408,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FrameCounter => "bộ đếm khung hình",
         // ---- the Developer page's speaker, microphone and buzz tests ----
         Msg::SpeakerTest => "kiểm tra loa",
+        Msg::Volume => "âm lượng",
         Msg::NoSpeakerProtection => "chưa có bảo vệ loa: mức âm được giữ thấp",
         Msg::HoldToPlay => "giữ một nút để phát, thả ra để dừng",
         Msg::Left => "trái",

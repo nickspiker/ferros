@@ -408,6 +408,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FrameCounter => "kare sayacı",
         // ---- the Developer page's speaker, microphone and buzz tests ----
         Msg::SpeakerTest => "hoparlör testi",
+        Msg::Volume => "ses seviyesi",
         Msg::NoSpeakerProtection => "henüz hoparlör koruması yok: seviye düşük tutulur",
         Msg::HoldToPlay => "çalmak için bir düğmeyi basılı tut, durdurmak için bırak",
         Msg::Left => "sol",

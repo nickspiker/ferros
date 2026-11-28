@@ -696,6 +696,8 @@ messages! {
     FrameCounter,
     // The Developer page's tests (payloads/map devtest.rs): the speaker test's heading, its warning, its buttons' note and labels, what the audio service answered; the microphone test's heading, its listen checkbox, its record button and outcomes; the buzz test's heading, its button, its failure.
     SpeakerTest,
+    /// The sound page's one gain (docs/AUDIO.md "Volume").
+    Volume,
     NoSpeakerProtection,
     HoldToPlay,
     Left,

@@ -408,6 +408,7 @@ pub fn text(m: Msg) -> &'static str {
         Msg::FrameCounter => "फ़्रेम गणक",
         // ---- the Developer page's speaker, microphone and buzz tests ----
         Msg::SpeakerTest => "स्पीकर परीक्षण",
+        Msg::Volume => "आवाज़",
         Msg::NoSpeakerProtection => "अभी स्पीकर सुरक्षा नहीं: स्तर कम रखा जाता है",
         Msg::HoldToPlay => "चलाने के लिए बटन दबाए रखें, रोकने के लिए छोड़ दें",
         Msg::Left => "बायाँ",
