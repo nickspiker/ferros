@@ -58,7 +58,7 @@ Scoped and shelved for night work on 2026-11-11 (memory `genesis_kist_shelved`);
 - **Touch**: the touch server's op 1 (HELD, the contacts on the glass now) read once a frame, right after the frame wait (with sound, the sound's write): a thumb held still sends no events, and the pad must still see it.
   A contact that came down where another window is in front (op 27 on its first frame) is not the pad's until it lifts.
   The buttons are the union of what every finger holds: multi-touch, a thumb on the D-pad and one on the buttons.
-- **Pacing**: one emulated frame a panel frame from the display's frame wait (op 24), never a timer; with sound, the sound's write instead (below, "Audio").
+- **Pacing**: one emulated frame a Genesis frame on the counter (59.9227 Hz, a real deadline: the next frame is due a period after the last, the loop sleeps to it, and one that fell a frame behind starts counting from now), since 2026-11-28; until then one emulated frame a panel frame from the display's frame wait (op 24), which on the Pro ran Sonic at 119 frames a second in play (its panel at 120 Hz while lively) and 12 on a still screen (its 10 Hz rest flips): the 8a's steady 60 Hz panel had hidden it. The chooser and the pause page still pace on op 24. With sound, the sound's write instead (below, "Audio").
   Op 24 returns at a frame start or, when none started, after a 120th of a second; on the 8a about half the waits came back that way, the count unmoved, and the first build ran Sonic at 83 frames a second.
   The shell waits again until the count moves.
   The panel's 60 Hz against the Genesis's 59.92 is a frame's drift every 12.5 s, unseen without sound (with sound, the audio clock leads and the picture follows it; below).
