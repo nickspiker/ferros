@@ -33,6 +33,10 @@ path = "src/weather.rs"
 name = "puck_thermo"
 path = "src/thermo.rs"
 
+[[bin]]
+name = "puck_battery"
+path = "src/battery.rs"
+
 [dependencies]
 ferros_sys = { path = "../../crates/sys" }
 ferros_heap = { path = "../../crates/heap", features = ["process"] }

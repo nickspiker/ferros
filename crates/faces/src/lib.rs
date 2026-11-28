@@ -12,6 +12,7 @@ extern crate alloc;
 
 pub mod compass;
 pub mod gps;
+pub mod rotary;
 pub mod sky;
 pub mod thermo;
 pub mod tide;

@@ -78,10 +78,17 @@ The circles on the deck never cover more than the screen (owner, 2026-11-18: "th
 | Compass | true north | ferros_compass, WMM2025 (all 100 NOAA test values, D and I within 0.005°) | the magnetometers' own 2^6 ms, only while shown | puck, gps | the ferros project key |
 | GPS | the satellites and how well they place the device | the driver's FIX, SATS and WATCH thru the `gps` right and claim | the driver's doorbell, only while large (the radio on only then) | puck, gps | the ferros project key |
 | Weather | the forecast where the person is, to 10 km | MET Norway thru fgtw.org (branch `pucks-weather`, not deployed) | the forecast's next hour or update, only while shown | puck, gps, udp | the ferros project key |
+| Battery | the charge round the rim (0 to 100 %, clockwise) and large in the middle, the current (mA, negative draining) and the battery's temperature under it; the arc green (`USED`) while charging | the kernel's gauge sample thru the facts (`battery_pct`, `battery_ua`, `battery_temp_cc`) | the facts' bell (the share or the charging side changing), or 2^5 s after it last woke for the current and temperature the bell does not ring for, a shown number moving; only while shown | puck | the ferros project key (option blake3 of "ferros puck battery", 2026-11-28) |
 
 - **Faces** (ferros_faces, the six of 2026-11-17): each a list of ferros_puck's drawing ops in the circle's own units, drawn by the puck itself into its square (ferros_puck::square), the fuller face when large; no human words but a station's name. The tide's since 2026-11-24 is painted per pixel instead (the widget's chart averages each column over its span, which no op list says).
 - **Capsules**: tools/clock-kist.sh, tools/basecalc-kist.sh (the puck by default, `--window` the pad in a window instead: one option, one vault domain), tools/pucks-kist.sh (the six, masked, the ferros project key, options minted 2026-11-17).
 - **basecalc's build** needs two sibling branches not yet on their repos' main: basecalc `ferros-engine` (the engine as a library) and ferros-libc `basecalc-file` (FILE and abort for the C), and builds GMP, MPFR and MPC for ferros itself (tools/basecalc-build.sh).
+
+### The rotary face
+
+ferros_faces::rotary (crates/faces/src/rotary.rs; owner, 2026-11-28: "rotary goodness around the temp readout, magnetic strength, stuff like that") is one face for every gauge-like puck: a dim track over three quarters of the circle near the rim, open at the bottom; the fill from the track's start to the value, clockwise or counterclockwise, with a short needle across the track; an optional second value as a thin arc inside it on the same scale; the value large in the middle and its notes smaller under it; the range's quarters as ticks in focus.
+The angle is linear over the range and runs on past either end along a tanh into half the gap, C² at the joins and bounded by its own form (never a clamp), so a value outside the range is still seen moving and the fill is never more than 7/8 of a turn.
+The battery is its first reader; the timer, the thermometer's dial and the compass's field-strength ring are to share it.
 
 ### The location step
 

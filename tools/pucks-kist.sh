@@ -1,8 +1,8 @@
 #!/bin/bash
-# ferros's own pucks as kists (docs/PUCKS.md; owner, 2026-11-17: "plus a tide puck", "GPS, compass, shit that's useful! Pucks! I'm DOWN!"; 2026-11-20 the thermometer): tide, sun, moon, compass, GPS, weather and the thermometer, each built masked (tools/ferros-masked-build.sh: the network stower refuses native code) and signed by the ferros project key with every egg (kistcat kist), since ferros is a commons and its own pucks are ferros's (memory kist_keys_follow_ownership; KISTS.md "Whose key signs a kist").
-# Each capsule declares `puck` (its circle: never asked) and `gps` (its place, asked once, default off); the weather `udp` as well; the thermometer `puck` alone (its mailbox is open to all: owner, 2026-11-20). Written to $OUT/<name>.capsule.vsf.
+# ferros's own pucks as kists (docs/PUCKS.md; owner, 2026-11-17: "plus a tide puck", "GPS, compass, shit that's useful! Pucks! I'm DOWN!"; 2026-11-20 the thermometer; 2026-11-28 the battery): tide, sun, moon, compass, GPS, weather, the thermometer and the battery, each built masked (tools/ferros-masked-build.sh: the network stower refuses native code) and signed by the ferros project key with every egg (kistcat kist), since ferros is a commons and its own pucks are ferros's (memory kist_keys_follow_ownership; KISTS.md "Whose key signs a kist").
+# Each capsule declares `puck` (its circle: never asked) and `gps` (its place, asked once, default off); the weather `udp` as well; the thermometer `puck` alone (its mailbox is open to all: owner, 2026-11-20), and the battery `puck` alone (the facts are anyone's). Written to $OUT/<name>.capsule.vsf.
 # Not stowed by this script: a device runs a puck only after its display, map, init, kists and kernel know pucks (PUCKS.md "What changes on the device"); stow each with `cargo run -p ferros-send -- send <capsule>` once those are on the device.
-# The options are each puck's identity across versions (ORACLE.md section 5: minted once, 2026-11-17, kept); never change them. Raise --version with every capsule published.
+# The options are each puck's identity across versions (ORACLE.md section 5: minted once, 2026-11-17, kept; the battery's 2026-11-28, blake3 of "ferros puck battery"); never change them. Raise --version with every capsule published.
 # Environment: FERROS_PROJECT_KEY (default keys/ferros.key.vsf, label FERROS_PROJECT; the path is passed, the key never leaves kistcat's process), OUT (default target/kists), and the masked build's FERROS_REPO, FERROS_MASKED_OUT and FERROS_MASK for a build from a worktree.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -20,6 +20,7 @@ pucks=(
     "GPS|puck_gps|a90c8ba8a5bb470f6c9f08495f31d0faf88f63a9ab997d83fbfad020576d8b5b|gps|the satellites and how well they place you, while you look"
     "Weather|puck_weather|889a46078ac08d6a7905ee1bbf41866c1ed248cb5b769cf77e4aa718c86ded8c|gps|the weather where you are, to 10 km|udp|to ask fgtw.org for the forecast"
     "Thermometer|puck_thermo|9103301d7ac9e379a867c3cf413e5a3ed016848712a6fb30993632b6b0518278"
+    "Battery|puck_battery|bc974417c04be4f3ee7a8ca423a2492529cea089c2860ad2d4de7be4fbecfa9e"
 )
 for p in "${pucks[@]}"; do
     IFS='|' read -r name bin option rest <<< "$p"
