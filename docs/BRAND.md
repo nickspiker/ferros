@@ -64,7 +64,7 @@ The steps, one line each: plug in, turn on unlocking, unlock on the device (this
 
 The silhouette's words, by state: `?` (nothing seen), the model name with "in Android" or "in its bootloader" under it, `no access` with "driver needed" (Windows) or "no permission to open it" (Linux and macOS), `ferros` with "already running ferros".
 
-The log offer, on every screen: a small "send the log" in a corner; what it sends and where, said in full, and nothing sent without a yes.
+The log offer, on the welcome (the owner, 2026-11-28): a box, unticked, "Send this run's log to help fix things"; ticked, it unfolds two choices, "only when something fails" and "the whole run", and what it sends and where, said in full; nothing sent unless it is ticked.
 
 ## Where it lives
 

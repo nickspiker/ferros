@@ -1,9 +1,10 @@
 //! ferros-flash-gui: the ferros installer as people see it (docs/FLASHER.md "The GUI", docs/BRAND.md).
 //! A fluor window on the same library as the ferros-flash CLI: the same detection over nusb, the same signed release, the same VSF run log.
-//! Screen 0 is the welcome: the mark, "Consent.", three dim lines, the device silhouette that is the live detector, the honest wipe line.
+//! Screen 0 is the welcome: the mark, "Consent.", three dim lines, the box that sends this run's log (unticked; ticking it unfolds its two choices and the plain facts), the device silhouette that is the live detector, the honest wipe line.
 //! Screen 1, after "Install ferros", says what this does and the steps ahead.
+//! Nothing is sent unless the box is ticked: then the run's report goes to fgtw.org at a failure ("only when something fails") or at the run's end ("the whole run"), and the answer shows in a small line at the bottom of whatever screen is up.
 //! Everything is drawn front to back into one frame (fluor's `under`): the words first, then the shapes, the glow behind the title, and the near-black canvas last.
-//! The glow breathes with the shown frames (one step a frame, no clock), the silhouette changes on USB events (no poll), and nothing happens on a timer.
+//! The glow breathes and the choices unfold with the shown frames (one step a frame, no clock), the silhouette changes on USB events (no poll), and nothing happens on a timer.
 //! Usage: ferros-flash-gui [--release <https base or a staged directory>] [--snap <out.vsf>] [--steps] [--pretend <none|noaccess|android|bootloader|ferros>]
 //! `--snap` writes the first settled frame as a VSF visual (snap.rs) and keeps running; `--steps` opens on screen 1 and `--pretend` shows a device state in place of the detector (which is not started), both for looking at the screens without a device on the cable.
 
@@ -13,12 +14,14 @@ mod detect;
 mod fetch;
 mod mark;
 mod snap;
+mod tick;
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use detect::Device;
-use ferros_flash::runlog::{self, Ev, RunLog};
+use ferros_flash::runlog::{self, Ev, Level, RunLog};
 use fluor::canvas::Canvas;
 use fluor::coord::Coord;
 use fluor::event::{CursorIcon, ElementState, Event, ModifiersState, MouseButton};
@@ -28,11 +31,12 @@ use fluor::host::app::{Context, EventResponse, FluorApp, run_app};
 use fluor::host::chrome::{ResizeEdge, get_resize_edge, strip_height};
 use fluor::host::chrome_widget::DefaultChrome;
 use fluor::host::widget::{Container, Widget, apply_hover, apply_pressed, build_overlay_deltas, dispatch_release};
-use fluor::paint::{self, HIT_NONE, HitId, claim_hits, draw_squircle_rrect, fill_rect};
+use fluor::paint::{self, HIT_NONE, HitId, draw_squircle_rrect, fill_rect};
 use fluor::pixel::{Blend, BlendMode, G2t16, Pixel};
 use fluor::text::{TextRenderer, TextStyle};
 use fluor::widgets::Button;
 use mark::Mark;
+use tick::Tick;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Where the release lives unless `--release` names another place (tools/flash/publish.sh).
@@ -48,7 +52,7 @@ const BG: u32 = g2t(9, 9, 10);
 const TITLE: u32 = g2t(198, 192, 180);
 /// The three dim lines.
 const BODY: u32 = g2t(118, 114, 106);
-/// The bottom line and the corner affordance.
+/// The bottom line, the log's facts and the answer line.
 const QUIET: u32 = g2t(84, 82, 78);
 /// The one warm glow.
 const GLOW: u32 = g2t(232, 150, 64);
@@ -58,6 +62,8 @@ const WARM: u32 = g2t(228, 178, 120);
 const ORANGE: u32 = g2t(238, 120, 28);
 /// The button's resting fill; hover and held are derived from it by fluor.
 const BUTTON: u32 = g2t(92, 56, 24);
+/// The dot of a ticked box or a chosen radio button: the warm light's own colour, as a fill.
+const TICK: u32 = GLOW;
 
 /// The glow's breathing period in shown frames: 2^9 frames, a slow breath at a desktop's rate.
 const BREATH_FRAMES: u32 = 1 << 9;
@@ -75,30 +81,72 @@ enum Screen {
     Steps,
 }
 
-/// The corner's "send the log": closed, asking (the consent words and two buttons), sending, and the answer.
-enum LogPanel {
-    Closed,
-    Asking,
+/// The box's two choices (the owner, 2026-11-28): send at each failure, or once at the run's end.
+#[derive(Clone, Copy, PartialEq)]
+enum When {
+    Fails,
+    Whole,
+}
+
+impl When {
+    fn words(self) -> &'static str {
+        match self {
+            When::Fails => "only when something fails",
+            When::Whole => "the whole run",
+        }
+    }
+    fn id(self) -> &'static str {
+        match self {
+            When::Fails => "fails",
+            When::Whole => "whole",
+        }
+    }
+}
+
+/// The person's consent as it stands, read by the panic hook as well as the window: SEND_NONE unless the box is ticked.
+static CONSENT: AtomicU8 = AtomicU8::new(SEND_NONE);
+const SEND_NONE: u8 = 0;
+const SEND_FAILS: u8 = 1;
+const SEND_WHOLE: u8 = 2;
+
+/// The last send's state, shown in a small line at the bottom of whatever screen is up.
+enum Answer {
     Sending,
     Sent([u8; 32]),
     NotSent(String),
 }
 
-/// Everything that takes a click: the chrome's own controls and this window's buttons.
+/// The words the box says next to it, on screen 0.
+const CONSENT_WORDS: &str = "Send this run's log to help fix things";
+/// The plain facts under the two choices, one short dim line each (docs/BRAND.md "The voice": what it holds and where it goes, said in full).
+const FACTS: [&str; 5] = [
+    "It goes to fgtw.org/report: one document of what this tool did and what the device answered.",
+    "It never holds a handle, a key, a location or your files.",
+    "The device's serial is replaced by a short hash.",
+    "fgtw.org keeps it 32 days.",
+    "Your computer's address is not kept.",
+];
+
+/// Everything that takes a click: the chrome's own controls and this window's buttons and boxes.
 struct Ui {
     chrome: DefaultChrome<G2t16>,
     /// "Install ferros", present only while a device is seen on the welcome.
     install: Option<Button<G2t16>>,
-    /// The log panel's "Send it" and "Not now", present while it asks.
-    send: Option<Button<G2t16>>,
-    later: Option<Button<G2t16>>,
+    /// The box on screen 0, unticked at the start of every run.
+    consent: Tick,
+    /// Its two choices, unfolded under it while it is ticked; they take hits only then.
+    fails: Tick,
+    whole: Tick,
 }
 
 impl Container for Ui {
     fn visit(&mut self, f: &mut dyn FnMut(&mut dyn Widget)) {
         self.chrome.visit(f);
-        for b in [&mut self.install, &mut self.send, &mut self.later].into_iter().flatten() {
+        if let Some(b) = &mut self.install {
             f(b);
+        }
+        for t in [&mut self.consent, &mut self.fails, &mut self.whole] {
+            f(t);
         }
     }
 }
@@ -118,6 +166,7 @@ fn open_log() -> Log {
         eprintln!("ferros-flash-gui: cannot keep a log: {e}");
         std::process::exit(1)
     });
+    let path = l.path().to_path_buf();
     let log = Arc::new(Mutex::new(l));
     let hook = log.clone();
     std::panic::set_hook(Box::new(move |p| {
@@ -127,8 +176,40 @@ fn open_log() -> Log {
             let _ = l.append(&Ev::error("crash", "the window crashed at {}: {}").t(&at).t(&msg));
             eprintln!("ferros-flash-gui crashed ({msg} at {at}); the log is {}", l.path().display());
         }
+        // A crash is a failure and the run's end at once, so either choice covers it.
+        // Sent here, on the crashing thread and before the process ends, since no thread outlives the window.
+        if CONSENT.load(Ordering::Relaxed) != SEND_NONE {
+            let r = post_report(&path);
+            if let Ok(mut l) = hook.lock() {
+                let _ = l.append(&match &r {
+                    Ok(h) => Ev::info("send", "fgtw.org took it").hash("report", h),
+                    Err(e) => Ev::error("send", "not sent: {}").t(e),
+                });
+            }
+        }
     }));
     log
+}
+
+/// This run's report as it stands, posted to fgtw.org: the report's BLAKE3 when taken, else why not.
+fn post_report(path: &std::path::Path) -> Result<[u8; 32], String> {
+    let run = std::fs::read(path).map_err(|e| e.to_string())?;
+    let doc = runlog::report(&run, &format!("ferros-flash-gui {VERSION} {}", platform()), vsf::eagle_time_oscillations())?;
+    // A deadline on the post: from the panic hook it runs on the crashing thread before the process ends, and a stalled connection must not hold the dying window open. 2^4 s, long enough for the report on any live link.
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(1 << 4)).build();
+    let r = agent.post(runlog::REPORT_URL).set("Content-Type", "application/octet-stream").send_bytes(&doc).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut r.into_reader(), &mut out).map_err(|e| e.to_string())?;
+    runlog::reply(&out)
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `c` at a fraction `f` (ZERO to ONE) of its opacity: fluor's `under` takes a colour's darkness and its α apart, so scaling the α alone is the same colour, fainter.
+fn fade(c: u32, f: f32) -> u32 {
+    ((((c >> 24) as f32 * f) as u32) << 24) | (c & 0xFF_FFFF)
 }
 
 fn note(log: &Log, ev: Ev) {
@@ -153,9 +234,13 @@ struct App {
     frame: u32,
     /// The VSF capture still to write, and whether a frame has been drawn since the release settled.
     snap: Option<String>,
-    panel: LogPanel,
-    /// The corner affordance's hit id.
-    send_hit: HitId,
+    /// The box's choice; it counts only while the box is ticked.
+    when: When,
+    /// How far the choices under the box have unfolded, ZERO folded to ONE open: each shown frame halves what is left of the way.
+    unfold: f32,
+    /// A failure was logged while no consent covered it: ticking "only when something fails" sends the run then.
+    unsent_fail: bool,
+    answer: Option<Answer>,
     viewport: Viewport,
 }
 
@@ -195,9 +280,11 @@ impl App {
     fn new(base: String, snap: Option<String>, screen: Screen, device: Device, log: Log) -> App {
         let mut hits = HIT_NONE;
         let chrome = DefaultChrome::with_depth(Viewport::new(1, 1), "ferros", None, None, &mut hits);
-        let send_hit = fluor::host::widget::next_id(&mut hits);
+        let consent = Tick::new(&mut hits, false, false);
+        let fails = Tick::new(&mut hits, true, true);
+        let whole = Tick::new(&mut hits, true, false);
         App {
-            ui: Ui { chrome, install: None, send: None, later: None },
+            ui: Ui { chrome, install: None, consent, fails, whole },
             hits,
             proxy: None,
             log,
@@ -208,32 +295,21 @@ impl App {
             release_settled: false,
             frame: 0,
             snap,
-            panel: LogPanel::Closed,
-            send_hit,
+            when: When::Fails,
+            unfold: 0.,
+            unsent_fail: false,
+            answer: None,
             viewport: Viewport::new(1, 1),
         }
     }
 
-    /// The buttons for this screen, this device and this panel, at this size: made again whenever any of those change (a Button keeps its caches by size, so a fresh one at a new size is the plain way).
+    /// The buttons for this screen and this device, at this size: made again whenever any of those change (a Button keeps its caches by size, so a fresh one at a new size is the plain way).
     fn place_buttons(&mut self) {
         let l = Layout::of(self.viewport);
         let bh = l.body * 2.4;
         self.ui.install = (self.screen == Screen::Welcome && self.device.seen()).then(|| {
             let mut b = Button::with_depth(&mut self.hits, l.cx(), l.y(0.845), l.body * 10., bh, l.body * 1.1, "Install ferros");
             b.set_fill(Some(BUTTON));
-            b
-        });
-        let asking = matches!(self.panel, LogPanel::Asking);
-        let (sh, sw) = (l.quiet * 2.2, l.quiet * 7.);
-        let py = l.y(0.5);
-        self.ui.send = asking.then(|| {
-            let mut b = Button::with_depth(&mut self.hits, l.cx() - sw * 0.6, py, sw, sh, l.quiet * 1.1, "Send it");
-            b.set_fill(Some(BUTTON));
-            b
-        });
-        self.ui.later = asking.then(|| {
-            let mut b = Button::with_depth(&mut self.hits, l.cx() + sw * 0.6, py, sw, sh, l.quiet * 1.1, "Not now");
-            b.set_fill(Some(g2t(40, 38, 36)));
             b
         });
     }
@@ -248,21 +324,47 @@ impl App {
         }
     }
 
-    /// The report sent to fgtw.org on its own thread, the answer coming back as a user event; the consent goes into the run's own log first, as the CLI's does.
-    fn send_log(&mut self) {
+    /// The consent as it stands: none unless the box is ticked, else its choice.
+    fn consent(&self) -> Option<When> {
+        self.ui.consent.on.then_some(self.when)
+    }
+
+    /// A record into the run's log, and a failure (an error of any step but the send's own, so a send that fails does not send again) sent when the person chose "only when something fails".
+    fn record(&mut self, ev: Ev) {
+        let fail = ev.level() == Level::Error && ev.step() != "send";
+        note(&self.log, ev);
+        if fail {
+            match self.consent() {
+                Some(When::Fails) => self.send_log("a failure"),
+                _ => self.unsent_fail = true,
+            }
+        }
+    }
+
+    /// The box or a choice changed: the radio buttons follow it, the panic hook sees it, and a failure no consent covered yet goes now if the choice is the failures.
+    fn consent_changed(&mut self) {
+        self.ui.fails.on = self.when == When::Fails;
+        self.ui.whole.on = self.when == When::Whole;
+        let c = match self.consent() {
+            None => SEND_NONE,
+            Some(When::Fails) => SEND_FAILS,
+            Some(When::Whole) => SEND_WHOLE,
+        };
+        CONSENT.store(c, Ordering::Relaxed);
+        if self.unsent_fail && self.consent() == Some(When::Fails) {
+            self.send_log("a failure before the box was ticked");
+        }
+    }
+
+    /// The report sent to fgtw.org on its own thread, the answer coming back as a user event; why it is sent goes into the run's own log first.
+    fn send_log(&mut self, why: &str) {
         let path = self.log.lock().map(|l| l.path().to_path_buf()).unwrap();
-        note(&self.log, Ev::info("send", "the person chose to send this run's log").flag("serial_kept", false));
+        note(&self.log, Ev::info("send", "sending this run's log to fgtw.org: {}").t(why).id("when", self.when.id()));
+        self.unsent_fail = false;
         let Some(proxy) = self.proxy.clone() else { return };
+        self.answer = Some(Answer::Sending);
         std::thread::spawn(move || {
-            let r = (|| {
-                let run = std::fs::read(&path).map_err(|e| e.to_string())?;
-                let doc = runlog::report(&run, &format!("ferros-flash-gui {VERSION} {}", platform()), vsf::eagle_time_oscillations(), false)?;
-                let r = ureq::post(runlog::REPORT_URL).set("Content-Type", "application/octet-stream").send_bytes(&doc).map_err(|e| e.to_string())?;
-                let mut out = Vec::new();
-                std::io::Read::read_to_end(&mut r.into_reader(), &mut out).map_err(|e| e.to_string())?;
-                runlog::reply(&out)
-            })();
-            let _ = proxy.send(UserEvent::Sent(r));
+            let _ = proxy.send(UserEvent::Sent(post_report(&path)));
         });
     }
 }
@@ -306,6 +408,13 @@ fn glow(canvas: &mut Canvas<G2t16>, cx: f32, cy: f32, sx: f32, sy: f32, peak: f3
             }
         }
     }
+}
+
+/// A height the layout leaves for the silhouette, kept positive: `(d + √(d² + e²)) / 2`, which is `d` itself once `d` is a few `e` above zero and falls smoothly toward zero below it, C∞ everywhere (no clamp, AGENT.md "GUI continuity").
+/// WHY: the room left is the layout's remainder, and a window much wider than tall (the fonts scale with the width) or the unfolded facts take more than there is, so `d` goes negative.
+/// PROOF: at a width three times the height the three lines alone reach past three quarters of it; a negative height would hand the text renderer a negative font size for the silhouette's words.
+fn soft_height(d: f32, e: f32) -> f32 {
+    (d + (d * d + e * e).sqrt()) * 0.5
 }
 
 /// The device silhouette: a soft squircle outline, `stroke` wide, in `colour`, with the state's word and its line inside it.
@@ -406,24 +515,31 @@ impl FluorApp<G2t16> for App {
             note(&self.log, Ev::info("screen", "Install ferros: the steps screen").id("device", self.device.word()));
             self.screen = Screen::Steps;
             self.place_buttons();
+            // Today the run ends here: nothing past screen 1 is built ("This build goes no further yet"), so reaching it is the end "the whole run" waits for.
+            // When the steps after it are built, this send moves to the real end.
+            if self.consent() == Some(When::Whole) {
+                self.send_log("the run's end");
+            }
         }
-        if self.ui.send.as_mut().is_some_and(|b| b.take_click()) {
-            self.panel = LogPanel::Sending;
-            self.place_buttons();
-            self.send_log();
+        // The consent, each tick and untick recorded in the run's own log as it happens.
+        if self.ui.consent.take_click() {
+            self.ui.consent.on = !self.ui.consent.on;
+            note(
+                &self.log,
+                if self.ui.consent.on {
+                    Ev::info("consent", "the person ticked the box: send this run's log {}").t(self.when.words()).flag("send", true).id("when", self.when.id())
+                } else {
+                    Ev::info("consent", "the person unticked the box: nothing is sent").flag("send", false)
+                },
+            );
+            self.consent_changed();
         }
-        if self.ui.later.as_mut().is_some_and(|b| b.take_click()) {
-            note(&self.log, Ev::info("send", "the person chose not to send the log now"));
-            self.panel = LogPanel::Closed;
-            self.place_buttons();
-        }
-        if hit == self.send_hit {
-            self.panel = match self.panel {
-                LogPanel::Closed | LogPanel::Sent(_) | LogPanel::NotSent(_) => LogPanel::Asking,
-                LogPanel::Asking => LogPanel::Closed,
-                LogPanel::Sending => LogPanel::Sending,
-            };
-            self.place_buttons();
+        for (picked, when) in [(self.ui.fails.take_click(), When::Fails), (self.ui.whole.take_click(), When::Whole)] {
+            if picked && self.when != when {
+                self.when = when;
+                note(&self.log, Ev::info("consent", "the person chose to send this run's log {}").t(when.words()).flag("send", true).id("when", when.id()));
+                self.consent_changed();
+            }
         }
         r
     }
@@ -439,7 +555,7 @@ impl FluorApp<G2t16> for App {
                     Device::Ferros => Ev::info("device", "a device running ferros"),
                     Device::Failed { why } => Ev::error("device", "USB cannot be read: {}").t(why),
                 };
-                note(&self.log, ev);
+                self.record(ev);
                 self.device = d;
                 self.place_buttons();
             }
@@ -459,17 +575,16 @@ impl FluorApp<G2t16> for App {
                 self.release_settled = true;
             }
             UserEvent::Sent(r) => {
-                self.panel = match r {
+                self.answer = Some(match r {
                     Ok(h) => {
-                        note(&self.log, Ev::info("send", "fgtw.org took it").hash("report", &h));
-                        LogPanel::Sent(h)
+                        self.record(Ev::info("send", "fgtw.org took it").hash("report", &h));
+                        Answer::Sent(h)
                     }
                     Err(e) => {
-                        note(&self.log, Ev::error("send", "not sent: {}").t(&e));
-                        LogPanel::NotSent(e)
+                        self.record(Ev::error("send", "not sent: {}").t(&e));
+                        Answer::NotSent(e)
                     }
-                };
-                self.place_buttons();
+                });
             }
         }
         EventResponse::Handled
@@ -498,57 +613,28 @@ impl FluorApp<G2t16> for App {
         let text = &mut *ctx.text;
         let mut canvas = Canvas::new(target, w, h, &mut *ctx.damage);
         let (colour, word, under) = (self.device_colour(), self.device.word().to_string(), self.device.under().to_string());
-        let Ui { chrome, install, send, later } = &mut self.ui;
+        // The choices under the box unfold while it is ticked and fold while it is not: each shown frame halves what is left of the way, so the motion is smooth and needs no clock.
+        let target_unfold = if self.ui.consent.on { 1. } else { 0. };
+        self.unfold += (target_unfold - self.unfold) * 0.5;
+        let u = self.unfold;
+        let Ui { chrome, install, consent, fails, whole } = &mut self.ui;
         let hit_map = &mut chrome.hit_test_map;
 
-        // The log panel in front of everything while it asks or answers.
-        let panel_words: Vec<(String, f32, u32)> = match &self.panel {
-            LogPanel::Closed => Vec::new(),
-            LogPanel::Asking => {
-                let path = self.log.lock().map(|l| l.path().display().to_string()).unwrap_or_default();
-                vec![
-                    ("Send this run's log to the ferros developers?".into(), l.body, TITLE),
-                    (format!("It goes to {} as one document of what this tool did and what the device answered.", runlog::REPORT_URL), l.quiet, BODY),
-                    ("It never holds a handle, a key, a location or your files. The device's serial is replaced by a hash.".into(), l.quiet, BODY),
-                    ("fgtw.org keeps it 32 days and does not keep your computer's address.".into(), l.quiet, BODY),
-                    (format!("The file is {path}"), l.quiet, QUIET),
-                ]
-            }
-            LogPanel::Sending => vec![("Sending the log.".into(), l.body, TITLE)],
-            LogPanel::Sent(h) => vec![("Sent. Its name at fgtw.org:".into(), l.body, TITLE), (h.iter().map(|b| format!("{b:02x}")).collect(), l.quiet, BODY), ("Quote it to us.".into(), l.quiet, BODY)],
-            LogPanel::NotSent(e) => vec![("Not sent.".into(), l.body, TITLE), (e.clone(), l.quiet, BODY), ("The log stays on this computer.".into(), l.quiet, BODY)],
-        };
-        if !panel_words.is_empty() {
-            let mut y = l.y(0.3);
-            for (words, size, colour) in &panel_words {
-                let style = TextStyle::new(*size, *colour);
-                for line in wrap(text, words, &style, l.w - 2. * l.margin) {
-                    text.draw_text_center(&mut canvas, &line, l.cx(), y, &style, None, None);
-                    y += size * 1.6;
-                }
-                y += size * 0.4;
-            }
-            for b in [send, later].into_iter().flatten() {
-                let id = b.hit_id();
-                b.render_content_into(&mut canvas, 0., 0., text, None, Some(&mut hit_map[..]), id);
-            }
-            // The panel's card: opaque, so nothing of the screen shows through it where it lies.
-            let (top, bottom) = (l.y(0.24), l.y(0.58));
-            draw_squircle_rrect(&mut canvas, (l.margin * 0.5) as isize, top as isize, (l.w - l.margin) as isize, (bottom - top) as isize, g2t(22, 21, 22), [l.body * 2.; 4], paint::WINDOW_SHAPE_POWER);
-        }
-
-        // The corner affordance, on every screen: "send the log", and its hit.
-        {
-            let style = TextStyle::new(l.quiet * 0.95, QUIET);
-            let words = "send the log";
-            let tw = text.measure_text(words, &style);
-            let (rx, cy) = (l.w - l.margin * 0.5, (h as f32) - l.quiet * 1.4);
-            text.draw_text_right(&mut canvas, words, rx, cy, &style, None, None);
-            // Inside the frame by construction: the right edge is half a margin in, the bottom a quiet size and a half up (a negative left edge, a window narrower than the words, casts to 0).
-            let (x0, x1) = ((rx - tw - l.quiet) as usize, (rx + l.quiet * 0.5) as usize);
-            let (y0, y1) = ((cy - l.quiet) as usize, (cy + l.quiet) as usize);
-            for y in y0..y1 {
-                claim_hits(&mut hit_map[y * w + x0..y * w + x1], self.send_hit);
+        // The send's answer, in front, a small line at the bottom of whatever screen is up.
+        if let Some(a) = &self.answer {
+            let words = match a {
+                Answer::Sending => "Sending this run's log.".to_string(),
+                Answer::Sent(h) => format!("Sent. Its name at fgtw.org: {}. Quote it to us.", hex(h)),
+                Answer::NotSent(e) => format!("Not sent. {}. The log stays on this computer.", e.trim_end_matches('.')),
+            };
+            let style = TextStyle::new(l.quiet * 0.8, BODY);
+            let lines = wrap(text, &words, &style, l.w - 2. * l.margin);
+            let step = l.quiet * 0.8 * 1.4;
+            // The last line sits a quiet size above the window's bottom edge and the others stack up from it; `words` is never empty, so `lines` is not.
+            let mut y = h as f32 - l.quiet * 1.1 - step * (lines.len() as f32 - 1.);
+            for line in &lines {
+                text.draw_text_center(&mut canvas, line, l.cx(), y, &style, None, None);
+                y += step;
             }
         }
 
@@ -556,15 +642,17 @@ impl FluorApp<G2t16> for App {
             Screen::Welcome => l.title_size(),
             Screen::Steps => l.title_size() * 0.8,
         };
+        // Unfolding lifts the title and its lines by a thirty-second of the height, linear in the unfold, to give the choices room.
+        let lift = l.hh * (1. / (1 << 5) as f32) * u;
         let title_cy = match self.screen {
-            Screen::Welcome => l.y(0.26),
+            Screen::Welcome => l.y(0.26) - lift,
             Screen::Steps => l.y(0.16),
         };
         match self.screen {
             Screen::Welcome => {
                 text.draw_text_center(&mut canvas, "Consent.", l.cx(), title_cy, &TextStyle::new(title_size, TITLE).weight(600), None, None);
                 let body = TextStyle::new(l.body, BODY);
-                let mut y = l.y(0.36);
+                let mut y = l.y(0.36) - lift;
                 // The three lines as the owner wrote them; a window too narrow for one folds it, nothing else.
                 for words in ["Nothing happens on this device unless you say so.", "Nobody's buying your data. If you ever choose to sell it, that's yours to decide too.", "And when something breaks, the only person to call is you."] {
                     for line in wrap(text, words, &body, l.w - 2. * l.margin) {
@@ -572,14 +660,44 @@ impl FluorApp<G2t16> for App {
                         y += l.body * 1.7;
                     }
                 }
+
+                // The box, centred as one with its words, a line under the three.
+                let q = l.quiet;
+                let (side, gap) = (q * 1.1, q * 0.6);
+                let box_y = y + q * 0.3;
+                let style = TextStyle::new(q, BODY);
+                let x0 = l.cx() - (side + gap + text.measure_text(CONSENT_WORDS, &style)) * 0.5;
+                consent.draw(&mut canvas, text, x0, box_y, side, gap, CONSENT_WORDS, &style, 1., Some(&mut hit_map[..]));
+
+                // The two choices on one row and the facts under them, spreading out from under the box and fading in with the unfold; the choices take hits only while the box is ticked.
+                let radio = TextStyle::new(q * 0.95, fade(BODY, u));
+                let (fw, ww) = (text.measure_text(When::Fails.words(), &radio), text.measure_text(When::Whole.words(), &radio));
+                let between = q * 2.;
+                let rx0 = l.cx() - (2. * (side + gap) + fw + between + ww) * 0.5;
+                let radio_y = box_y + u * q * 1.9;
+                let ticked = consent.on;
+                fails.draw(&mut canvas, text, rx0, radio_y, side, gap, When::Fails.words(), &radio, u, ticked.then_some(&mut hit_map[..]));
+                whole.draw(&mut canvas, text, rx0 + side + gap + fw + between, radio_y, side, gap, When::Whole.words(), &radio, u, ticked.then_some(&mut hit_map[..]));
+                let fact = TextStyle::new(q * 0.85, fade(QUIET, u));
+                let mut fy = radio_y + u * q * 1.6;
+                for words in FACTS {
+                    for line in wrap(text, words, &fact, l.w - 2. * l.margin) {
+                        text.draw_text_center(&mut canvas, &line, l.cx(), fy, &fact, None, None);
+                        fy += u * q * 0.85 * 1.45;
+                    }
+                }
+
                 if let Some(b) = install {
                     let id = b.hit_id();
                     b.render_content_into(&mut canvas, 0., 0., text, None, Some(&mut hit_map[..]), id);
                     // The button's own glow, under it: the same warm light as the title's, small and steady.
                     glow(&mut canvas, b.center_x, b.center_y, b.width * 0.5, b.height * 0.9, 1. / (1 << 3) as f32, GLOW);
                 }
-                silhouette(&mut canvas, text, l.cx(), l.y(0.615), l.hh * 0.25, colour, &word, &under, l.body * 1.3);
-                text.draw_text_center(&mut canvas, "This replaces Android and erases the device. You're choosing that.", l.cx(), l.y(0.95), &TextStyle::new(l.quiet, QUIET), None, None);
+                // The silhouette fills what is left between the box's facts and three quarters of the way down, so it gives way as they unfold.
+                let top = fy + q * 1.2;
+                let sh = soft_height(l.y(0.76) - top, l.body * 2.);
+                silhouette(&mut canvas, text, l.cx(), top + sh * 0.5, sh, colour, &word, &under, l.body * 1.3 * sh / (l.hh * 0.25));
+                text.draw_text_center(&mut canvas, "This replaces Android and erases the device. You're choosing that.", l.cx(), l.y(0.935), &TextStyle::new(l.quiet, QUIET), None, None);
             }
             Screen::Steps => {
                 text.draw_text_center(&mut canvas, "Welcome!", l.cx(), title_cy, &TextStyle::new(title_size, TITLE).weight(600), None, None);
@@ -601,8 +719,18 @@ impl FluorApp<G2t16> for App {
                     text.draw_text_center(&mut canvas, line, l.cx(), y, &step, None, None);
                     y += l.body * 1.5;
                 }
-                silhouette(&mut canvas, text, l.cx(), l.y(0.815), l.hh * 0.17, colour, &word, &under, l.body);
-                text.draw_text_center(&mut canvas, "This build goes no further yet: nothing is written to the device.", l.cx(), l.y(0.95), &TextStyle::new(l.quiet, QUIET), None, None);
+                // The owner's line under the steps (2026-11-28), in the quiet style.
+                let quiet = TextStyle::new(l.quiet, QUIET);
+                y += l.body * 0.4;
+                for line in wrap(text, "A fresh OS, a bumpy road. Don't expect it to pair with your DJI goggles and fly your drone today.", &quiet, max) {
+                    text.draw_text_center(&mut canvas, &line, l.cx(), y, &quiet, None, None);
+                    y += l.quiet * 1.5;
+                }
+                // The silhouette fills what is left under the words, down to nine tenths of the height.
+                let top = y + l.body * 0.4;
+                let sh = soft_height(l.y(0.9) - top, l.body * 2.);
+                silhouette(&mut canvas, text, l.cx(), top + sh * 0.5, sh, colour, &word, &under, l.body * sh / (l.hh * 0.17));
+                text.draw_text_center(&mut canvas, "This build goes no further yet: nothing is written to the device.", l.cx(), l.y(0.935), &TextStyle::new(l.quiet, QUIET), None, None);
             }
         }
 

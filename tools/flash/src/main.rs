@@ -4,9 +4,9 @@
 //!   ferros-flash getvar <name|all> [serial]    one bootloader variable, or all of them (read only)
 //!   ferros-flash board <product> <out.vsf>     the built-in board manifest as its VSF document
 //!   ferros-flash log show <run.log.vsf>        a run's records, rendered
-//!   ferros-flash log report <run.log.vsf> <out.vsf> [--keep-serial]    the one document a person submits
+//!   ferros-flash log report <run.log.vsf> <out.vsf>    the one document a person submits (the serial always blinded)
 //!   ferros-flash log unpack <report.vsf> <out.log.vsf>    a received report's records back as a run log (tools/flash/reports.sh fetches them)
-//!   ferros-flash log send [run.log.vsf] [--keep-serial]    that document sent to fgtw.org/report on a typed yes (the newest run when none is named)
+//!   ferros-flash log send [run.log.vsf]    that document sent to fgtw.org/report on a typed yes (the newest run when none is named)
 //!   ferros-flash release verify <release.vsf>  a release checked against the ferros key, its files listed
 //!   ferros-flash release make ...              (built with `publish`) a release signed with a key from keys/
 //!   ferros-flash show  <head> <tail> <tail-lba> [block]
@@ -471,7 +471,7 @@ mod phone {
         }
         let path = log.lock().unwrap().path().to_path_buf();
         println!();
-        send(&path, false);
+        send(&path);
     }
 }
 
@@ -498,24 +498,17 @@ fn log_cmd(a: &[String]) {
         (Some("report"), Some(p)) => {
             let out = a
                 .get(4)
-                .unwrap_or_else(|| die("log report <run.log.vsf> <out.vsf> [--keep-serial]"));
-            let keep = a.iter().any(|x| x == "--keep-serial");
+                .unwrap_or_else(|| die("log report <run.log.vsf> <out.vsf>"));
             let doc = runlog::report(
                 &read(p),
                 &format!("ferros-flash {VERSION} {}", platform()),
                 vsf::eagle_time_oscillations(),
-                keep,
             )
             .unwrap_or_else(|e| die(e));
             std::fs::write(out, &doc).unwrap_or_else(|e| die(format!("{out}: {e}")));
             println!(
-                "{out}: A#{} bytes, the phone's serial {}",
-                doc.len(),
-                if keep {
-                    "kept"
-                } else {
-                    "replaced by its keyed hash"
-                }
+                "{out}: A#{} bytes, the device's serial replaced by a 32-bit keyed hash",
+                doc.len()
             );
         }
         (Some("unpack"), Some(p)) => {
@@ -525,38 +518,29 @@ fn log_cmd(a: &[String]) {
             println!("{out}: A#{} records", runlog::read(&run).0.len());
         }
         (Some("send"), _) => {
-            let keep = a.iter().any(|x| x == "--keep-serial");
-            let path = match a.get(3).filter(|x| !x.starts_with("--")) {
+            let path = match a.get(3) {
                 Some(p) => std::path::PathBuf::from(p),
                 None => runlog::newest(&runlog::default_dir()).unwrap_or_else(|| die("no run on this computer to send")),
             };
-            send(&path, keep);
+            send(&path);
         }
-        _ => die("log show <run.log.vsf> | log report <run.log.vsf> <out.vsf> [--keep-serial] | log send [run.log.vsf] [--keep-serial]"),
+        _ => die("log show <run.log.vsf> | log report <run.log.vsf> <out.vsf> | log send [run.log.vsf]"),
     }
 }
 
 /// A run's report sent to fgtw.org, only on the person's typed yes, said in full first; the consent and the answer are added to that run's own log.
-fn send(path: &std::path::Path, keep_serial: bool) {
+fn send(path: &std::path::Path) {
     let run = std::fs::read(path).unwrap_or_else(|e| die(format!("{}: {e}", path.display())));
     let (recs, _) = runlog::read(&run);
     let doc = runlog::report(
         &run,
         &format!("ferros-flash {VERSION} {}", platform()),
         vsf::eagle_time_oscillations(),
-        keep_serial,
     )
     .unwrap_or_else(|e| die(e));
     println!("Send this run's log to the ferros developers?");
     println!("  It goes to {} as one document of A#{} bytes: A#{} records of what the tool did and what the phone answered.", runlog::REPORT_URL, doc.len(), recs.len());
-    println!(
-        "  It never holds a handle, a key, a location or your files. The phone's serial is {}.",
-        if keep_serial {
-            "included, as you asked"
-        } else {
-            "replaced by a hash"
-        }
-    );
+    println!("  It never holds a handle, a key, a location or your files. The device's serial is replaced by a short hash.");
     println!("  fgtw.org keeps it 32 days and does not keep your computer's address. `ferros-flash log show {}` shows every line of it.", path.display());
     if !ask("Send it?") {
         println!(
@@ -569,7 +553,6 @@ fn send(path: &std::path::Path, keep_serial: bool) {
     if let Some(l) = log.as_mut() {
         let _ = l.append(
             &Ev::info("send", "the person chose to send this run's log")
-                .flag("serial_kept", keep_serial)
                 .u("bytes", doc.len() as u64),
         );
     }

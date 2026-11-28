@@ -90,6 +90,14 @@ impl Ev {
         self
     }
 
+    /// How severe: the GUI sends a consented report at a failure (tools/flash-gui).
+    pub fn level(&self) -> Level {
+        self.level
+    }
+    pub fn step(&self) -> &str {
+        &self.step
+    }
+
     /// The record: one complete VSF document, its creation time the moment it was made.
     pub fn record(&self, at: i64) -> Result<Vec<u8>, String> {
         let mut s = VsfSection::new("log");
@@ -213,28 +221,19 @@ pub fn read(bytes: &[u8]) -> (Vec<Read>, usize) {
     (out, whole)
 }
 
-/// The report a person submits: one VSF document holding the run's whole records exactly as their disk holds them, with the report's own facts.
-/// `keep_serial`: the phone's serial is the only identifier a run holds; unless the person keeps it in, the report carries its keyed BLAKE3 instead.
-pub fn report(run: &[u8], tool: &str, made: i64, keep_serial: bool) -> Result<Vec<u8>, String> {
+/// The report a person submits: one VSF document holding the run's records as their disk holds them, with the report's own facts.
+/// The device's serial is the only identifier a run holds, and it never leaves the computer: every record that names it carries a 32-bit keyed BLAKE3 of it instead (`without_serial`; the owner, 2026-11-28).
+pub fn report(run: &[u8], tool: &str, made: i64) -> Result<Vec<u8>, String> {
     let (recs, whole) = read(run);
     let mut s = VsfSection::new("report");
     s.add_field("tool", ascii_or_text(tool));
     s.set_uint("records", recs.len() as u64);
     s.add_field("torn_tail", VsfType::u0(whole < run.len()));
-    s.add_field("serial_kept", VsfType::u0(keep_serial));
+    // Always false: the field stays so the report's layout and fgtw.org's check of it are unchanged.
+    s.add_field("serial_kept", VsfType::u0(false));
     // Each record whole, as raw bytes (`v` b): it is itself a complete VSF document a reader opens on its own.
     for r in &recs {
-        s.add_field(
-            "record",
-            VsfType::v(
-                b'b',
-                if keep_serial {
-                    r.raw.clone()
-                } else {
-                    without_serial(&r.raw)?
-                },
-            ),
-        );
+        s.add_field("record", VsfType::v(b'b', without_serial(&r.raw)?));
     }
     VsfBuilder::new()
         .creation_time_oscillations(made)
@@ -296,7 +295,8 @@ pub fn reply(bytes: &[u8]) -> Result<[u8; 32], String> {
     }
 }
 
-/// A record with its `serial` field replaced by the serial's keyed BLAKE3 (the same phone still reads as the same phone within a report, and no further).
+/// A record with its `serial` field replaced by `serial_blind`, the first 4 bytes of the serial's keyed BLAKE3.
+/// 32 bits tell one device from another across a handful of reports and no further: too short to look a serial up by, so the report never names the device.
 fn without_serial(raw: &[u8]) -> Result<Vec<u8>, String> {
     let (h, end) = vsf::VsfHeader::decode(raw)?;
     // By the TOC, so the section keeps its name (a body alone may be written nameless, its name in the TOC).
@@ -317,7 +317,7 @@ fn without_serial(raw: &[u8]) -> Result<Vec<u8>, String> {
             .to_string();
         let k = blake3::derive_key("ferros-flash report serial", v.as_bytes());
         f.name = "serial_blind".into();
-        f.values = vec![VsfType::hb(k.to_vec())];
+        f.values = vec![VsfType::hb(k[..4].to_vec())];
     }
     let at = h
         .creation_time
@@ -349,7 +349,7 @@ mod tests {
             &d,
             1 << 40,
             Ev::info("start", "ferros-flash {} on {}")
-                .t("0.1.0")
+                .t("0.0.0")
                 .t("windows-x86_64"),
         )
         .unwrap();
@@ -435,15 +435,17 @@ mod tests {
         l.append(&Ev::info("device", "found").id("serial", "TESTSERIAL0"))
             .unwrap();
         let run = std::fs::read(l.path()).unwrap();
-        let doc = report(&run, "ferros-flash 0.1.0", 1 << 42, false).unwrap();
+        let doc = report(&run, "ferros-flash 0.0.0", 1 << 42).unwrap();
         let (h, end) = vsf::VsfHeader::decode_strict(&doc).unwrap();
         let secs = h.sections(&doc, end).unwrap();
         assert_eq!(secs[0].uint("records"), Some(2));
         assert!(!doc.windows(11).any(|w| w == b"TESTSERIAL0"));
-        // What fgtw.org's /report checks: the report and each record whole by their provenance hashes, the count right, no `serial` unless kept.
+        // What fgtw.org's /report checks: the report and each record whole by their provenance hashes, the count right, never a `serial`.
         vsf::verification::is_original(&doc).unwrap();
+        assert_eq!(secs[0].get_field("serial_kept").and_then(|f| f.values.first().cloned()), Some(VsfType::u0(false)));
         let recs: Vec<_> = secs[0].get_fields("record");
         assert_eq!(recs.len(), 2);
+        let mut blinds = Vec::new();
         for f in recs {
             let Some(VsfType::v(b'b', rec)) = f.values.first() else {
                 panic!("a record is raw bytes")
@@ -453,11 +455,14 @@ mod tests {
             let rs = rh.sections(rec, rend).unwrap();
             assert_eq!(rs.len(), 1);
             assert!(rs[0].get_field("serial").is_none());
+            if let Some(b) = rs[0].get_field("serial_blind") {
+                blinds.push(b.values.clone());
+            }
         }
+        // One record named the serial: its blind is the keyed BLAKE3's first 4 bytes, 32 bits and no more.
+        let k = blake3::derive_key("ferros-flash report serial", b"TESTSERIAL0");
+        assert_eq!(blinds, vec![vec![VsfType::hb(k[..4].to_vec())]]);
         assert_eq!(read(&unpack(&doc).unwrap()).0.len(), 2);
-        let kept = report(&run, "ferros-flash 0.1.0", 1 << 42, true).unwrap();
-        assert_eq!(unpack(&kept).unwrap(), run);
-        assert!(kept.windows(11).any(|w| w == b"TESTSERIAL0"));
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

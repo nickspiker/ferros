@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "ferros-flash"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "blake3",
  "futures-core",
@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "ferros-flash-gui"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ferros-flash",
  "fluor",
