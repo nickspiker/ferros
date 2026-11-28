@@ -22,14 +22,17 @@ A pixel see-through in the app's picture is see-through in its ids too, so what 
 
 ### Where the plane lives
 
-The app's id plane is the app's own memory, given to the display as a view (KERNEL.md "Views", SYS_SHARE GIVE_VIEW and BIND): the display reads it, the app writes it, nothing is copied.
-A surface slot is a full panel of u64 already (32 MiB on husky); a plane beside it in the slot would outgrow the slot, and NO-CEILINGS.md says a slot grows as used, not by a larger preset.
-Two planes, so the ids read always belong to the picture shown: the app's present names which plane goes with the frame, as the scroll ring's offset goes with it today.
+The display serves it (built 2026-11-27): an app asks with op 88 naming its surface, and the display gives it a run of the display's own pool read-write (SYS_SHARE `give`, as ip gives its socket rings), at k runs into the pool for surface k, cleared first.
+A view the other way, the app's memory given to the display, was the first design; the kernel gives a run only from a server to the caller it answers, and apps are the display's callers, never the reverse.
+The run: a head of 64 bytes (its first u32 the plane that goes with the frame shown, 0 or 1), then two planes of u16 ids in screen coordinates; the app writes the next frame's ids into the one not shown, then names it in the head, so the ids read belong to the picture on the glass.
+Its size is the panel's (proof: it can never bind anything the panel shows); the pool grows to hold the runs of the surfaces that asked, and a surface slot keeps its pixels alone (32 MiB on husky, full already).
+A plane counts only while the surface's holder is the one it was given to (the windows' bell's generation), so a dead app's ids never show for the next.
 
 ### The bookkeeping
 
-Global ids are u16, handed out by the display; a small table maps each to (surface, the app's own id) and back (the owner: "a teency hash map with collision ness").
-The display's own ids (`SYS`, the deck's) keep their numbers; an app's ids are given out from the rest as first seen, and freed when its window goes.
+Global ids are u16, handed out by the display; a small table maps each to (surface, the app's own id) and back (the owner: "a teency hash map with collision ness"): open addressing, linear probing, doubled when half full (hit.rs `Table`).
+The display's own ids (`SYS`, the deck's) keep their numbers, all under G#2000; an app's are given out from G#2000 up as first seen, and an entry goes when its surface changes hands (`sweep`, at each list).
+The debug view needs no table: it colours each pixel by its key (the display's id, or the surface and the app's id), so the painting threads share nothing.
 The global id is what the debug view colours, what the accessibility and test ops name, and what the display says when a touch lands.
 
 ### What reads it
@@ -48,9 +51,9 @@ The global id is what the debug view colours, what the accessibility and test op
 ## Stages
 
 0. **The design** (this file), for the owner to mark up.
-1. **The plane and the view:** fluor's host writes its `HitId` map into a panel-sized plane it gives the display as a view, two planes, the present naming the one shown; the display binds it per window. Mahere's ferros build gains `hit_test_map` (it has none: its touches are its own two-finger solve).
-2. **The table and the debug view:** global ids handed out, the fourth phase coloured by them.
-3. **The list and tap ops** for accessibility and the test harness (and the bridge: `bridge hits`, `bridge tap <id>`).
+1. **The plane** (built 2026-11-27, not yet run on a device): display op 88 gives a surface's holder its plane; fluor's ferros host asks at start and copies its `HitId` map into the plane not shown at every present (fluor src/host/ferros/mod.rs `HitPlane`). Apps with a map: basecalc, Photon (its chrome), Kūaha. Mahere's ferros build has none yet (its touches are its own two-finger solve).
+2. **The table and the debug view** (built 2026-11-27, not yet run): the fourth phase coloured by each pixel's key, so every app widget shows in a colour of its own; the table hands out ids for the list.
+3. **The list and tap** (built 2026-11-27, not yet run): display op 89 `hits` (the system's, or anyone's on a development build): every id on the glass with its surface, the app's own id, its box and a pixel inside it; `ferros-bridge input hits` prints it, `ferros-bridge input tap #<id>` taps that pixel (payloads/capture prints long replies 256 bytes a line, then `end`).
 4. **Touch routing by id:** the display answers a finger down with (window, id, local x, y); fluor's host takes the id from it.
 5. **Pucks:** a puck's square gains an id plane beside its pixels, sampled with them into the circle, so a face's parts are addressable too.
 

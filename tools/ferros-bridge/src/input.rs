@@ -17,6 +17,8 @@ pub fn usage() {
     eprintln!("ferros-bridge input — fingers and keys in shown frames (docs/INPUT-INJECT.md)");
     eprintln!("  A position is two fractions of the panel's width and height (0.5 0.25) or two panel pixels (672px 748px).");
     eprintln!("  tap X Y [HOLD]                     a finger down and up where it landed (HOLD frames, default 8)");
+    eprintln!("  tap #ID                            the thing with that id in the display's list, tapped at a pixel inside it");
+    eprintln!("  hits                               everything on the glass a touch can land on: ids, whose, boxes (display op 89)");
     eprintln!("  hold X Y FRAMES                    a finger held still");
     eprintln!("  swipe X0 Y0 X1 Y1 [FRAMES]         down, a straight line over FRAMES (16), up at once: the fling is the consumer's");
     eprintln!("  drag X0 Y0 X1 Y1 [FRAMES] [HOLD]   down, held HOLD frames (32), the line, held HOLD frames again, up: no fling");
@@ -284,12 +286,62 @@ fn shot(bridge: &Path, out: Option<&String>) {
     }
 }
 
+/// One thing on the glass a touch can land on, as the display lists it (op 89, docs/HITMAP.md): its id, its surface (None for the display's own: the deck's circles, the system's places), the app's own id, its box, and a pixel inside it.
+struct Hit {
+    id: u16,
+    surface: Option<u8>,
+    local: u16,
+    bx: [u16; 4],
+    probe: (u16, u16),
+}
+
+/// Everything on the glass a touch can land on (display op 89 through payloads/capture), its hex lines joined up to capture's `end`.
+fn hits(bridge: &Path) -> Vec<Hit> {
+    let bin = payload(bridge, "capture");
+    let said = spawn(bridge, &bin, "59", "hits", &["--use", "display"], 16, |l| l == "end");
+    if !said.iter().any(|l| l == "end") {
+        fail("the display did not list what is on the glass (op 89: a display from before 2026-11-27, or one that refused: development builds and the system only)");
+    }
+    let hex: String = said.iter().take_while(|l| *l != "end").filter(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_hexdigit())).cloned().collect();
+    let b: Vec<u8> = (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()).collect();
+    if b.first() != Some(&0) || b.len() < 5 {
+        fail(&format!("the display refused the list (answer {:?})", b.first()));
+    }
+    let n = u32::from_le_bytes([b[1], b[2], b[3], b[4]]) as usize;
+    let u = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+    // WHY the bound: the count is the display's word; an answer cut short (a line lost from the console) lists only the entries it holds.
+    let n = n.min((b.len() - 5) / 18);
+    (0..n)
+        .map(|k| {
+            let e = 5 + 18 * k;
+            Hit { id: u(e), surface: (b[e + 2] != 0xFF).then_some(b[e + 2]), local: u(e + 4), bx: [u(e + 6), u(e + 8), u(e + 10), u(e + 12)], probe: (u(e + 14), u(e + 16)) }
+        })
+        .collect()
+}
+
+/// `input hits`: the list, one line each, as the test harness and a person read it.
+fn print_hits(bridge: &Path) {
+    let list = hits(bridge);
+    println!("{} things a touch can land on (id, whose, the app's own id, box x0 y0 x1 y1, a pixel inside):", list.len());
+    for h in &list {
+        let whose = match h.surface {
+            Some(k) => format!("surface {k}"),
+            None => String::from("display"),
+        };
+        println!("  #{:<5} {:<10} {:<5} {:>4} {:>4} {:>4} {:>4}  at {}px {}px", h.id, whose, h.local, h.bx[0], h.bx[1], h.bx[2], h.bx[3], h.probe.0, h.probe.1);
+    }
+}
+
 pub async fn cmd(args: &[String]) {
     let bridge = std::env::current_exe().unwrap_or_else(|e| fail(&format!("own path: {e}")));
     let Some(verb) = args.first() else {
         usage();
         std::process::exit(1);
     };
+    if verb == "hits" {
+        print_hits(&bridge);
+        return;
+    }
     // The options, then the gesture's own words.
     let mut words: Vec<String> = Vec::new();
     let (mut idle, mut take_shot, mut shot_out, mut save, mut dry) = (false, false, None, None, false);
@@ -317,6 +369,13 @@ pub async fn cmd(args: &[String]) {
     let mut ev_list: Vec<Event> = Vec::new();
     let mut as_is: Option<Vec<u8>> = None;
     match verb.as_str() {
+        // `tap #<id>`: the thing with that id in the display's list (`input hits`), tapped at a pixel inside it.
+        "tap" if words.len() == 1 && words[0].starts_with('#') => {
+            let id: u16 = words[0][1..].parse().unwrap_or_else(|_| fail(&format!("{}: an id from `input hits` (#8192)", words[0])));
+            let Some(h) = hits(&bridge).into_iter().find(|h| h.id == id) else { fail(&format!("#{id} is not on the glass now (`input hits` lists what is)")) };
+            ev_list.push(ev(0, Ev::Down { finger: 0, at: At::Px(h.probe.0, h.probe.1) }));
+            ev_list.push(ev(TAP_HOLD, Ev::Up { finger: 0 }));
+        }
         "tap" => {
             ev_list.push(ev(0, Ev::Down { finger: 0, at: at(w(0), w(1)) }));
             ev_list.push(ev(num(words.get(2), TAP_HOLD, "hold"), Ev::Up { finger: 0 }));

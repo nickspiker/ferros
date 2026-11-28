@@ -380,13 +380,17 @@ pub fn paint_stripe(width: usize, s: draw::Rect) {
     let dst = phase_slice(PHASE, width * unsafe { SCREEN_WH.1 } as usize);
     // The glass's widest row (husky's 1344) fits; the publish's own rows are the same size.
     let mut row = [0u32; 1344];
+    // Each app's own ids from its plane where its window owns a pixel (docs/HITMAP.md), so every widget shows in a colour of its own.
+    let planes = planes();
     for y in s.y0 as usize..s.y1 as usize {
         let ids = unsafe { core::slice::from_raw_parts((MAP as *const u16).add(y * width), width) };
-        let (mut last, mut c) = (ids[0], colour(ids[0], seed));
+        let k0 = key(ids[0], &planes, y * width);
+        let (mut last, mut c) = (k0, colour(k0, seed));
         for x in 0..width {
-            if ids[x] != last {
-                last = ids[x];
-                c = colour(last, seed);
+            let k = key(ids[x], &planes, y * width + x);
+            if k != last {
+                last = k;
+                c = colour(k, seed);
             }
             row[x] = c;
         }
@@ -440,8 +444,8 @@ pub fn bars_changed(b: usize, width: usize) -> Option<(usize, usize)> {
 }
 
 /// An owner's colour in a palette: a hash of the id and the seed, one channel full so no owner reads as black, the others anywhere (10-bit codes, straight to the panel: a development view, not light).
-fn colour(id: u16, seed: u32) -> u32 {
-    let mut h = (id as u32 ^ seed.rotate_left(16)).wrapping_mul(0x9E37_79B9);
+fn colour(id: u32, seed: u32) -> u32 {
+    let mut h = (id ^ seed.rotate_left(16)).wrapping_mul(0x9E37_79B9);
     h ^= h >> 15;
     h = h.wrapping_mul(0x85EB_CA6B);
     h ^= h >> 13;
@@ -449,4 +453,239 @@ fn colour(id: u16, seed: u32) -> u32 {
     c[[0, 1, 2, 1][(h >> 30) as usize]] = 1023;
     // Every code halved (owner, 2026-11-11: "the colours should be roughly 18% grey in value ... it's just too bright across the board"): the full channel lands at 511, about 22% of white's light on this panel's ~2.2 power law, near the 18% grey he asked for; one shift is the knob.
     pack10(c[0] >> 1, c[1] >> 1, c[2] >> 1)
+}
+
+// ---------------------------------------------------------------------------
+// The apps' planes (docs/HITMAP.md): each app's own hit ids beside the display's, a u16 a pixel in screen coordinates.
+// ---------------------------------------------------------------------------
+
+/// A plane's run in the display's pool: a head (its first u32 the plane that goes with the frame shown, 0 or 1), then two planes of the panel's size, so the app writes one while the display reads the other.
+pub const PLANE_HEAD: usize = 64;
+/// Ids from the apps' planes, as the list (op 89) and the view name them: the display's own ids keep theirs, and an app's (window, id) pair is handed one from here up as first seen (`Table`).
+pub const APP_IDS: u16 = 1 << 13;
+
+/// Surface k's plane: its address (0 none), the holder generation it was given under (it counts only while that holder holds the surface), and the view id the app holds it by.
+static PLANE_AT: [AtomicU64; SURFACES] = [const { AtomicU64::new(0) }; SURFACES];
+static PLANE_GEN: [AtomicU64; SURFACES] = [const { AtomicU64::new(0) }; SURFACES];
+static PLANE_ID: [AtomicU64; SURFACES] = [const { AtomicU64::new(0) }; SURFACES];
+/// The display's pool (`ferros_sys::share`): its address and its size as a log, grown in place as surfaces ask.
+static POOL_AT: AtomicU64 = AtomicU64::new(0);
+static POOL_LOG: AtomicU32 = AtomicU32::new(0);
+
+/// One plane's bytes: the panel's pixels, a u16 each, on a cache line.
+fn plane_bytes(w: usize, h: usize) -> usize {
+    (w * h * 2 + 63) & !63
+}
+
+/// The run a plane takes, as a log: the head and two planes, rounded up to a power of two (the pool gives runs aligned to their size). Proof of the size: it is the panel's, so it never binds anything the panel can show.
+fn run_log(w: usize, h: usize) -> u32 {
+    (PLANE_HEAD + 2 * plane_bytes(w, h)).next_power_of_two().trailing_zeros()
+}
+
+/// Surface k's plane given read-write to the caller of `tok`, the app that holds the surface (op 88): its run at k runs into the pool, the pool grown to hold it, cleared first so the app reads no ids of the surface's last holder. (view id, plane bytes) or the refusal byte.
+pub fn plane_give(k: usize, tok: &[u8; 32], grants: u64) -> Result<(u64, usize), u8> {
+    let (w, h) = unsafe { SCREEN_WH };
+    let (w, h) = (w as usize, h as usize);
+    let log = run_log(w, h);
+    let off = (k as u64) << log;
+    // The pool holds runs 0..=k: k + 1 runs, a power of two of them.
+    let want = log + ((k + 1) as u64).next_power_of_two().trailing_zeros();
+    if POOL_LOG.load(Ordering::Acquire) < want {
+        // The pool's handle slot: the first pair past the display's grants (its count at the grants page's G#200), as ip's.
+        let slot = unsafe { core::ptr::read_volatile((ferros_sys::arc_base() + grants + 0x200) as *const u32) } as u64;
+        let Some(a) = ferros_sys::share::pool(want, slot, None) else { return Err(4) };
+        POOL_AT.store(a, Ordering::Release);
+        POOL_LOG.store(want, Ordering::Release);
+    }
+    // The painters stop reading the old plane before it is cleared; an earlier holder's view is taken back (gone already when that holder ended).
+    PLANE_AT[k].store(0, Ordering::Release);
+    let old = PLANE_ID[k].swap(0, Ordering::AcqRel);
+    if old != 0 {
+        ferros_sys::share::take(old);
+    }
+    let at = POOL_AT.load(Ordering::Acquire) + off;
+    // SAFETY: [at, at + 2^log) is run k of the display's own pool (grown above to hold it); no painter reads it while PLANE_AT[k] is 0.
+    unsafe { core::ptr::write_bytes(at as *mut u8, 0, PLANE_HEAD + 2 * plane_bytes(w, h)) };
+    let Some(id) = ferros_sys::share::give(tok, off, log) else { return Err(4) };
+    PLANE_ID[k].store(id, Ordering::Release);
+    PLANE_GEN[k].store(live_gen(k) as u64, Ordering::Release);
+    PLANE_AT[k].store(at, Ordering::Release);
+    Ok((id, plane_bytes(w, h)))
+}
+
+/// Surface k's plane shown now: the u16 ids of the frame on the glass, in screen coordinates. None without one, or when the surface has changed hands since it was given.
+fn plane(k: usize) -> Option<*const u16> {
+    let at = PLANE_AT[k].load(Ordering::Acquire);
+    let g = live_gen(k) as u64;
+    if at == 0 || g == 0 || PLANE_GEN[k].load(Ordering::Acquire) != g {
+        return None;
+    }
+    let (w, h) = unsafe { SCREEN_WH };
+    // SAFETY: the head's first word, which the app writes (0 or 1); any other value it might write picks a plane all the same.
+    let shown = unsafe { core::ptr::read_volatile(at as *const u32) } as usize & 1;
+    Some((at as usize + PLANE_HEAD + shown * plane_bytes(w as usize, h as usize)) as *const u16)
+}
+
+/// The key of what pixel (x, y) is, for the view and the list: an app's own id where its window owns the pixel and its plane names one there (bit 24, the surface, the id), else the display's id.
+#[inline]
+fn key(id: u16, planes: &[Option<*const u16>; SURFACES], i: usize) -> u32 {
+    let k = id.wrapping_sub(WINDOW) as usize;
+    if k < SURFACES {
+        if let Some(p) = planes[k] {
+            // SAFETY: i is a pixel of the screen (the callers walk its rows), and the plane is a screen of u16.
+            let local = unsafe { core::ptr::read_volatile(p.add(i)) };
+            if local != 0 {
+                return 1 << 24 | (k as u32) << 16 | local as u32;
+            }
+        }
+    }
+    id as u32
+}
+
+/// Every surface's plane shown now (`plane`), looked up once a stripe or a list.
+fn planes() -> [Option<*const u16>; SURFACES] {
+    core::array::from_fn(plane)
+}
+
+/// The table of app ids (owner, 2026-11-27: "a u16 and just do our own bookkeeping ... a teency hash map with collision ness"): an app's (surface, its id, the holder generation) to the id the list names it by, from `APP_IDS` up, open addressing with linear probing, doubled when half full. Its entries go when their surface changes hands (`sweep`). The receive thread's alone.
+struct Table {
+    /// Each slot: 0 free, else bit 63, the generation (bits 32-39), the key (bits 0-23), the global id (bits 40-55).
+    slots: alloc::vec::Vec<u64>,
+    used: usize,
+    next: u32,
+}
+static mut TABLE: Table = Table { slots: alloc::vec::Vec::new(), used: 0, next: APP_IDS as u32 };
+
+impl Table {
+    fn hash(key: u32) -> usize {
+        (key.wrapping_mul(0x9E37_79B9) >> 7) as usize
+    }
+
+    /// The global id of `key` (bit 24 clear: the surface and the app's id) under holder generation `g`, handed out when first seen; None when every u16 past `APP_IDS` is in use (a refusal, said in the reply).
+    fn id(&mut self, key: u32, g: u8) -> Option<u16> {
+        if self.slots.is_empty() || 2 * (self.used + 1) > self.slots.len() {
+            let n = (self.slots.len() * 2).max(1 << 8);
+            let old = core::mem::replace(&mut self.slots, alloc::vec![0; n]);
+            self.used = 0;
+            for e in old.into_iter().filter(|&e| e != 0) {
+                self.put(e);
+            }
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = Self::hash(key) & mask;
+        loop {
+            let e = self.slots[i];
+            if e == 0 {
+                break;
+            }
+            if e as u32 & 0xFF_FFFF == key && (e >> 32) as u8 == g {
+                return Some((e >> 40) as u16);
+            }
+            i = (i + 1) & mask;
+        }
+        // WHY: the global ids are a u16 (owner); the ones past APP_IDS are all handed out only when 57344 (window, id) pairs are on the glass at once.
+        if self.next > u16::MAX as u32 {
+            return None;
+        }
+        let gid = self.next as u16;
+        self.next += 1;
+        self.put(1 << 63 | (gid as u64) << 40 | (g as u64) << 32 | key as u64);
+        Some(gid)
+    }
+
+    fn put(&mut self, e: u64) {
+        let mask = self.slots.len() - 1;
+        let mut i = Self::hash(e as u32 & 0xFF_FFFF) & mask;
+        while self.slots[i] != 0 {
+            i = (i + 1) & mask;
+        }
+        self.slots[i] = e;
+        self.used += 1;
+    }
+
+    /// The entries of surfaces whose holder has changed since they were made: gone, the table rebuilt from the rest; with none left at all, the ids start again from `APP_IDS`.
+    fn sweep(&mut self) {
+        let keep: alloc::vec::Vec<u64> = self.slots.iter().copied().filter(|&e| e != 0 && (e >> 32) as u8 == live_gen(((e >> 16) & 0xFF) as usize) && live_gen(((e >> 16) & 0xFF) as usize) != 0).collect();
+        self.slots = alloc::vec![0; self.slots.len().max(1 << 8)];
+        self.used = 0;
+        if keep.is_empty() {
+            self.next = APP_IDS as u32;
+        }
+        for e in keep {
+            self.put(e);
+        }
+    }
+}
+
+/// Op 89 `hits` (docs/HITMAP.md "Accessibility and tests"): everything on the glass that a touch can land on, one entry each: [0][count u32] then per entry 18 bytes, all little-endian: its id (u16: the display's own, or an app's from the table), its surface (u8, G#FF for the display's own), a 0 byte, the app's own id (u16, 0 for the display's), its bounding box (x0, y0, x1, y1, each u16, x1 and y1 past the last pixel), and a pixel inside it (x, y, u16 each: the middle one of its pixels in row order, so a tap there lands on it whatever its shape).
+/// Two walks of the screen: the first counts each one's pixels and box, the second finds each one's middle pixel. The receive thread's, on demand: nothing runs while nobody asks.
+pub fn list() -> alloc::vec::Vec<u8> {
+    let (w, h) = unsafe { SCREEN_WH };
+    let (w, h) = (w as usize, h as usize);
+    let planes = planes();
+    let table = unsafe { &mut *(&raw mut TABLE) };
+    table.sweep();
+    // (key, count, x0, y0, x1, y1, middle index, seen in the second walk, middle pixel)
+    let mut seen: alloc::vec::Vec<(u32, u32, u16, u16, u16, u16, u32, u32, u32)> = alloc::vec::Vec::new();
+    let mut index: alloc::collections::BTreeMap<u32, usize> = alloc::collections::BTreeMap::new();
+    let map = unsafe { MAP } as *const u16;
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            // SAFETY: i is a pixel of the screen, the map its size.
+            let k = key(unsafe { *map.add(i) }, &planes, i);
+            if k == NOBODY as u32 {
+                continue;
+            }
+            let at = *index.entry(k).or_insert_with(|| {
+                seen.push((k, 0, x as u16, y as u16, x as u16, y as u16, 0, 0, 0));
+                seen.len() - 1
+            });
+            let e = &mut seen[at];
+            e.1 += 1;
+            e.2 = e.2.min(x as u16);
+            e.3 = e.3.min(y as u16);
+            e.4 = e.4.max(x as u16 + 1);
+            e.5 = e.5.max(y as u16 + 1);
+        }
+    }
+    for e in seen.iter_mut() {
+        e.6 = e.1 / 2;
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let k = key(unsafe { *map.add(i) }, &planes, i);
+            if let Some(&at) = index.get(&k) {
+                let e = &mut seen[at];
+                if e.7 == e.6 {
+                    e.8 = i as u32;
+                }
+                e.7 += 1;
+            }
+        }
+    }
+    let mut out = alloc::vec![0u8, 0, 0, 0, 0];
+    let mut n = 0u32;
+    for e in &seen {
+        let (gid, surface, local) = if e.0 >> 24 == 1 {
+            let k = ((e.0 >> 16) & 0xFF) as usize;
+            match table.id(e.0 & 0xFF_FFFF, live_gen(k)) {
+                Some(g) => (g, k as u8, e.0 as u16),
+                None => continue,
+            }
+        } else {
+            (e.0 as u16, 0xFF, 0)
+        };
+        out.extend_from_slice(&gid.to_le_bytes());
+        out.push(surface);
+        out.push(0);
+        out.extend_from_slice(&local.to_le_bytes());
+        for v in [e.2, e.3, e.4, e.5, (e.8 as usize % w) as u16, (e.8 as usize / w) as u16] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        n += 1;
+    }
+    out[1..5].copy_from_slice(&n.to_le_bytes());
+    out
 }

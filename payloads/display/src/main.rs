@@ -3388,7 +3388,7 @@ static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
 /// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight), the system's own (78 and 79, the icon cache; 80, the windows as they stood; 87, the loading pies) and the system's alone on a release build (58 the hit view, 84 the screenshot, 85 the offer): their caller's holdings are asked of the kernel as they arrive.
 /// An op left off this list runs with holdings 0, so a system-only op left off is refused to everyone (2026-11-20: 78 and 79 were, and no kist icon ever reached the glass).
 fn names_surface(op: u8) -> bool {
-    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 54 | 56 | 58 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76 | 78 | 79 | 80 | 84 | 85 | 87)
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 54 | 56 | 58 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76 | 78 | 79 | 80 | 84 | 85 | 87 | 88 | 89)
 }
 
 /// What the process behind the call holds (kernel SYS_CALLER: bit `CALLER_SURFACE0` + k surface slot k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
@@ -8320,6 +8320,37 @@ extern "C" fn receive(grants: u64) -> ! {
             continue;
         }
         // 58 `hit view [what u8: 0 off, 1 on, 2 toggle, 3 ask]` → [0][on u8]: the hit map in the fourth temporal phase (hit.rs), the Developer page's switch. On every build since 2026-11-18, the page being the gate; on a release build the system's alone ([4], `NOT_YOURS`, from another caller), on a development build anyone's (the bridge's tools), as before. Answered here, at once.
+        // 88 `hit plane [base u64]` → [0][view id u64][plane bytes u32][width u16][height u16], all little-endian (docs/HITMAP.md): the caller's surface's hit plane, a run of the display's pool given it read-write: a head of `hit::PLANE_HEAD` bytes (its first u32 the plane that goes with the frame shown, 0 or 1), then two planes of u16 ids in screen coordinates, `plane bytes` apart. [NOT_YOURS] for a surface the caller does not hold, [4] when the pool could not grow or the run could not be given (the kernel's console says why).
+        if op == 88 && n >= 9 {
+            let mine = surface_of(u64::from_le_bytes(m[1..9].try_into().unwrap())).filter(|&k| holds(h, k));
+            match mine.map(|k| hit::plane_give(k, &tok, grants)) {
+                Some(Ok((id, bytes))) => {
+                    let (w, hh) = unsafe { SCREEN_WH };
+                    let mut out = [0u8; 17];
+                    out[1..9].copy_from_slice(&id.to_le_bytes());
+                    out[9..13].copy_from_slice(&(bytes as u32).to_le_bytes());
+                    out[13..15].copy_from_slice(&w.to_le_bytes());
+                    out[15..17].copy_from_slice(&hh.to_le_bytes());
+                    ferros_sys::reply(&tok, &out);
+                }
+                Some(Err(e)) => {
+                    ferros_sys::reply(&tok, &[e]);
+                }
+                None => {
+                    ferros_sys::reply(&tok, &[NOT_YOURS]);
+                }
+            }
+            continue;
+        }
+        // 89 `hits` → `hit::list`: everything a touch can land on, the apps' own widgets among it (docs/HITMAP.md), for accessibility and the test harness. The system's, or anyone's on a development build, as the view (58).
+        if op == 89 {
+            if DEV || system(h) {
+                ferros_sys::reply(&tok, &hit::list());
+            } else {
+                ferros_sys::reply(&tok, &[NOT_YOURS]);
+            }
+            continue;
+        }
         if op == 58 && n >= 2 {
             if DEV || system(h) {
                 ferros_sys::reply(&tok, &hit::view_op(m[1]));
