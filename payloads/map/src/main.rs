@@ -268,6 +268,10 @@ fn mark_look(px: i64) -> (i64, [u32; 4], bool) {
 
 /// Movement under this many panel pixels is a finger resting, not a drag: a tap may wobble this much.
 const SLOP: i64 = 24;
+/// A puck drag's phases on display op 90 (ferros_puck::call's `DRAG_DOWN`, `DRAG_MOVE`, `DRAG_UP`): where the finger landed, where it is each frame it moves, where it lifted.
+const PUCK_DRAG_DOWN: u8 = 0;
+const PUCK_DRAG_MOVE: u8 = 1;
+const PUCK_DRAG_UP: u8 = 2;
 /// The helm's swipe inward acts past this fraction of the screen's harmonic span (a sixth: 248 px on the 8a's 1080x2400, 309 on the Pro's 1344x2992), and only mostly inward; a finger that stays within the roll's fraction (a twelfth) and never swiped lifts as a tap (owner, 2026-11-12, on the 8a).
 const HELM_SWIPE: f64 = 6.;
 const HELM_ROLL: f64 = 12.;
@@ -3278,6 +3282,24 @@ impl Map {
         // The face's turn on the glass (the camera's times the circle's, Q28): its sine times the radius in pixels is how far its rim is off level; a positive cosine, so not upside down.
         let (fc, fs) = (a.c * c.turn.c - a.s * c.turn.s, a.s * c.turn.c + a.c * c.turn.s);
         gx.abs() <= 1. && gy.abs() <= 1. && rim.abs() <= 1 && fc > 0 && (fs * (self.w / 2)).abs() <= ONE * ONE
+    }
+
+    /// Whether a one-finger drag from circle i is its puck's own (display op 90) rather than the deck's move of it: an answered puck, and the one the camera shows centred, judged by where the camera is going as the tap's centring is (`shows_centred` of the target, else the camera), so a drag during the flight to it is the puck's too.
+    fn drags_puck(&self, i: usize) -> bool {
+        self.kist(i).is_some_and(|k| k.is_puck() && !k.unanswered()) && self.shows_centred(self.target.unwrap_or(self.cam), i)
+    }
+
+    /// A point of a drag on circle i's puck to the display (op 90), which passes it to the puck in its face's frame.
+    fn puck_drag(&self, i: usize, x: i64, y: i64, phase: u8) {
+        // WHY the casts: the point is a finger on the glass (the touch's own u16 pixels), and i a scene circle, which the scene's u8 index holds.
+        let mut m = [0u8; 7];
+        m[0] = 90;
+        m[1] = i as u8;
+        m[2..4].copy_from_slice(&(x as u16).to_le_bytes());
+        m[4..6].copy_from_slice(&(y as u16).to_le_bytes());
+        m[6] = phase;
+        let mut r = [0u8; 1];
+        call(self.display, &m, &mut r);
     }
 
     /// Go to `to`: the camera flies there a display frame at a time (`step_cam`), each part of it on the critically damped spring (`spring`) in the space it looks even in (owner, 2026-11-05: the tap's flight follows the settings' snap; 2026-11-06: eased, as the pages are). From rest it eases in; a new target mid-flight keeps the speed the camera has, so a second tap turns the flight without a jolt.
@@ -7448,6 +7470,8 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
     // The circle the fingers hold, decided again whenever the number of moving fingers changes (one finger: the circle it started on; two: the circle both are inside), and for how many fingers it was decided.
     let mut grab: Option<usize> = None;
     let mut grab_n = 0usize;
+    // A one-finger drag on the centred puck is the puck's own (display op 90; owner, 2026-11-28: "a drag is the puck's own only while it is centred, else it moves the puck as before"): its circle and the last point sent, from the drag's start to its lift.
+    let mut puck_drag: Option<(usize, i64, i64)> = None;
     let mut last_app_check = 0u64;
     // The bells as the pages were last drawn with them (BELLS), the radios' switches (preference 15) likewise, and the second the clock or About last drew (`tick`).
     let mut bells_seen = [0u64; ferros_sys::BELL_FACTS as usize + 1];
@@ -8031,6 +8055,7 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             start = [(false, 0, 0); 16];
             grab = None;
             grab_n = 0;
+            puck_drag = None;
             // A finger on the open settings catches the strip and the page where they are: the motion stops under it.
             map.swipe = 0;
             map.drag_base = (map.page_dx, map.vscroll());
@@ -8219,6 +8244,10 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
         if held == 0 && down {
             down = false;
             map.touching = false;
+            // A drag on the centred puck lifted: its end where the finger last was. It moved, so no tap follows (`moved`).
+            if let Some((i, x, y)) = puck_drag.take() {
+                map.puck_drag(i, x, y, PUCK_DRAG_UP);
+            }
             // The helm button let go: its light out (the display fades it). After a screenshot both were lit full (`shot`): both go out, and the display's fade is the acknowledgement's end.
             if corner == 8 || corner == 9 {
                 map.helm_light(corner, 0.0);
@@ -8426,6 +8455,17 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
                     let (ga, gb) = (map.grasp(prev[both[0]].1, prev[both[0]].2), map.grasp(prev[both[1]].1, prev[both[1]].2));
                     if ga == gb { ga } else { None }
                 };
+                // A puck's drag ends when the fingers change (a second finger is the deck's two-finger move of the circle, as on every circle); one finger from the centred puck starts one, at the point it landed, so the turn made inside the slop is the puck's too.
+                if let Some((i, x, y)) = puck_drag.take() {
+                    map.puck_drag(i, x, y, PUCK_DRAG_UP);
+                }
+                if nb == 1 {
+                    if let Some(i) = grab.filter(|&i| map.drags_puck(i)) {
+                        let (x, y) = (start[both[0]].1, start[both[0]].2);
+                        map.puck_drag(i, x, y, PUCK_DRAG_DOWN);
+                        puck_drag = Some((i, x, y));
+                    }
+                }
             }
             if nb >= 1 && map.view != View::Map {
                 // Moving away from an arrived circle leaves it: the overlay goes, the plane is free again, and the view it was opened from is not flown back to.
@@ -8435,11 +8475,18 @@ pub extern "C" fn payload_main(grants: u64, input: u64, input_len: u64) -> ! {
             // A one-finger drag of a circle on the deck: its drop targets grow (targets.rs); a second finger, or none held, and they go.
             if regrab {
                 match grab {
-                    Some(i) if nb == 1 => map.drop_begin(i),
+                    Some(i) if nb == 1 && puck_drag.is_none() => map.drop_begin(i),
                     _ => map.drop_cancel(),
                 }
             }
-            if nb == 1 {
+            if let Some((i, x, y)) = puck_drag.as_mut().filter(|_| nb == 1) {
+                // The centred puck's drag: the finger's place each frame it moves, to the puck; the circle and the plane stay where they are.
+                let id = both[0];
+                if (cur[id].1, cur[id].2) != (*x, *y) {
+                    (*x, *y) = (cur[id].1, cur[id].2);
+                    map.puck_drag(*i, *x, *y, PUCK_DRAG_MOVE);
+                }
+            } else if nb == 1 {
                 let id = both[0];
                 let (dx, dy) = map.cam.delta(cur[id].1 - prev[id].1, cur[id].2 - prev[id].2);
                 // WHY the filter: the deck is rebuilt under a held finger when the person's list or arrangement is read again (a stow, the identity service's sync), and it may hold fewer circles than when the finger took one: the index the finger took is past them, and indexing it would panic.

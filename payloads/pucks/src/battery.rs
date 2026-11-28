@@ -83,6 +83,7 @@ fn draw(w: &mut ferros_puck::Writer, b: &Battery, focus: bool) -> Result<(), fer
         places: 0,
         colour: if charging { USED } else { TEXT },
         notes: &notes[..n],
+        label: None,
     };
     face(w, &r, focus)
 }

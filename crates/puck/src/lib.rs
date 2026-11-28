@@ -567,8 +567,9 @@ pub fn q14(f: f32) -> i16 {
 
 /// The puck endpoint's calls (the display serves them on `puck`; the kernel puts the caller's kist identity and its square ahead of each, so a puck can only ever name its own circle and its own pixels).
 pub mod call {
-    /// `[WATCH][seen u32][wants u8]` → `[0][count u32][shown u8][large u8][d u16][c i16][s i16][taps u8][taps × (x i16, y i16)]`: held until the circle's view moves past `seen`, a doorbell, never a poll.
+    /// `[WATCH][seen u32][wants u8]` → `[0][count u32][shown u8][large u8][d u16][c i16][s i16][taps u8][taps × (x i16, y i16)]`, then, only when a drag moved since, `[drags u8][drags × (x i16, y i16, phase u8)]`: held until the circle's view moves past `seen`, a doorbell, never a poll.
     /// The view is what the display asks the puck to draw: whether its circle is on the glass, whether it is large (at least half the panel's width across: room for the fuller face), its diameter in pixels and its turn (cos, sin, Q14: the gravity turn, or the camera's and the circle's own), and the taps that passed thru to it since, each in Q14 of the radius from the centre in the face's own frame (x right, y down its up).
+    /// The drags are a finger dragged on the circle while it is the centred one (display op 90 from the deck), each point in the same frame as a tap, oldest first, with its phase (`DRAG_DOWN`, `DRAG_MOVE`, `DRAG_UP`); a reply without them (every reply from a display before drags) is no drag.
     /// `wants` bit 0 (`FRAMES`): answered at every frame the deck shows while the circle is on the glass, for a puck whose picture moves continuously (the clock's rings); without it, only when the view changes or a tap comes.
     pub const WATCH: u8 = 1;
     /// `[SHOW][offset u32][d u16][c i16][s i16]` → `[status]`: the puck's square, `d` pixels a side drawn at turn (c, s), lies `offset` bytes past the porch of its slot (G2t16 pixels, row by row). Answered once the display has taken it: from then on the display reads that square alone until the next SHOW, so the puck draws its next one anywhere else in its slot.
@@ -577,6 +578,14 @@ pub mod call {
     pub const FRAMES: u8 = 1;
     /// The most taps one WATCH answer carries (more between two watches: the oldest kept).
     pub const TAPS: usize = 1 << 3;
+    /// The most drag points one WATCH answer carries (more between two watches: the newest move takes the last move's place, so the down and the up are never lost).
+    pub const DRAGS: usize = 1 << 3;
+    /// A drag point's phases: where the finger landed, where it is now, and where it lifted.
+    pub const DRAG_DOWN: u8 = 0;
+    pub const DRAG_MOVE: u8 = 1;
+    pub const DRAG_UP: u8 = 2;
+    /// The longest WATCH answer: the view, every tap and every drag point.
+    pub const WATCH_REPLY: usize = 14 + 4 * TAPS + 1 + 5 * DRAGS;
     /// SHOW's statuses.
     pub const OK: u8 = 0;
     /// The square was refused: past the slot's frames, no square held, or a malformed call.

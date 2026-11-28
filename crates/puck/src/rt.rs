@@ -1,7 +1,7 @@
 //! A puck's side on the device (feature `sys`): its calls to the display, its view's doorbell, its square, Eagle time, a GPS fix when granted, and its place kept as VSF.
 //!
 //! The shape of every puck: while its circle is on the glass, build its face's list from its engine at now, draw it into its square at the size and turn the display asked for (`show`), hand the square over; then sleep in one wait until the earliest of its content's own next deadline, the next moment its time-anchored ops move half a pixel, and a change of its circle's view (`View`), never on an interval.
-//! The view comes from a held WATCH on the display (a thread of its own, `watch`): the display answers it when the circle is shown or hidden, changes size or turns, when a tap passes thru to it, and, for a puck that asked for them, at every frame the deck shows.
+//! The view comes from a held WATCH on the display (a thread of its own, `watch`): the display answers it when the circle is shown or hidden, changes size or turns, when a tap passes thru to it or a finger drags on it while it is centred, and, for a puck that asked for them, at every frame the deck shows.
 //! A puck whose circle is not on the glass draws nothing.
 //! The place: a GPS fix taken only when the person granted GPS (a claim, released at the first fix or after `FIX_GIVE_UP_S`), rounded to the ~10 km cell (ferros_weather's grid) before it is kept, and kept in the puck's own vault domain as a VSF document; the finer fix never leaves the process's memory.
 
@@ -88,6 +88,31 @@ pub fn taps(out: &mut [(i16, i16); call::TAPS]) -> usize {
     n
 }
 
+/// Drag points on the circle not yet taken (display op 90: a finger dragged on it while it is the centred one): (x, y) as a tap's, and the phase (`call::DRAG_DOWN`, `DRAG_MOVE`, `DRAG_UP`), packed x in bits 0-15, y in 16-31, the phase in 32-39. A ring as the taps', the oldest going when it is full.
+static DRAGS: [AtomicU64; call::DRAGS] = [const { AtomicU64::new(0) }; call::DRAGS];
+static DRAGS_IN: AtomicU64 = AtomicU64::new(0);
+static DRAGS_OUT: AtomicU64 = AtomicU64::new(0);
+
+/// The drag points since the last call, oldest first, into `out`; how many.
+/// Every point, not only the latest: a puck that turns a value by the finger's angle about the centre unwraps it point to point, and a lagging puck that heard only the latest could lose a turn.
+pub fn drags(out: &mut [(i16, i16, u8); call::DRAGS]) -> usize {
+    let end = DRAGS_IN.load(Ordering::Acquire);
+    let mut at = DRAGS_OUT.load(Ordering::Acquire);
+    // The ring holds the last `DRAGS`: anything older was overwritten.
+    if end - at > call::DRAGS as u64 {
+        at = end - call::DRAGS as u64;
+    }
+    let mut n = 0;
+    while at < end {
+        let t = DRAGS[at as usize % call::DRAGS].load(Ordering::Acquire);
+        out[n] = (t as u16 as i16, (t >> 16) as u16 as i16, (t >> 32) as u8);
+        n += 1;
+        at += 1;
+    }
+    DRAGS_OUT.store(end, Ordering::Release);
+    n
+}
+
 /// Wake the main loop (a worker thread finished something the face shows).
 pub fn ring() {
     BELL.fetch_add(1, Ordering::Release);
@@ -107,7 +132,7 @@ extern "C" fn watcher(_: u64) -> ! {
         m[0] = call::WATCH;
         m[1..5].copy_from_slice(&seen.to_le_bytes());
         m[5] = WANTS.load(Ordering::Acquire) as u8;
-        let mut r = [0u8; 14 + 4 * call::TAPS];
+        let mut r = [0u8; call::WATCH_REPLY];
         let n = ferros_sys::call(cap(link.grants, link.slot), &m, &mut r);
         // A display that ended holding the watch fails it once (the kernel answers ERR for a server gone); the next call waits for the display that comes after it, which answers at once (its count starts again), and the deck binds this puck to its circle there again (docs/PUCKS.md "When the display starts again"). Two failures in a row are no display behind the grant: asking again would only spin.
         if n == ferros_sys::ERR && !failed {
@@ -126,14 +151,27 @@ extern "C" fn watcher(_: u64) -> ! {
         let d = u16::from_le_bytes([r[7], r[8]]);
         TURN.store(u16::from_le_bytes([r[9], r[10]]) as u64 | (u16::from_le_bytes([r[11], r[12]]) as u64) << 16, Ordering::Release);
         VIEW.store(seen as u64 | (d as u64) << 32 | (r[5] as u64 & 1) << 48 | (r[6] as u64 & 1) << 49, Ordering::Release);
-        // WHY the bound: the count is the display's word and the reply holds at most `TAPS`.
-        let k = (r[13] as usize).min(call::TAPS).min((n as usize - 14) / 4);
+        // WHY the bounds: the counts are the display's word and the reply holds at most `TAPS` taps and `DRAGS` drag points, in the `n` bytes it says it wrote.
+        let n = n as usize;
+        let k = (r[13] as usize).min(call::TAPS).min((n - 14) / 4);
         for j in 0..k {
             let at = 14 + 4 * j;
             let t = u16::from_le_bytes([r[at], r[at + 1]]) as u64 | (u16::from_le_bytes([r[at + 2], r[at + 3]]) as u64) << 16;
             let i = TAPS_IN.load(Ordering::Acquire);
             TAPS[i as usize % call::TAPS].store(t, Ordering::Release);
             TAPS_IN.store(i + 1, Ordering::Release);
+        }
+        // The drags follow the taps the reply holds, only when there are any.
+        let dat = 14 + 4 * k;
+        if n > dat {
+            let m = (r[dat] as usize).min(call::DRAGS).min((n - dat - 1) / 5);
+            for j in 0..m {
+                let at = dat + 1 + 5 * j;
+                let t = u16::from_le_bytes([r[at], r[at + 1]]) as u64 | (u16::from_le_bytes([r[at + 2], r[at + 3]]) as u64) << 16 | (r[at + 4] as u64) << 32;
+                let i = DRAGS_IN.load(Ordering::Acquire);
+                DRAGS[i as usize % call::DRAGS].store(t, Ordering::Release);
+                DRAGS_IN.store(i + 1, Ordering::Release);
+            }
         }
         ring();
     }

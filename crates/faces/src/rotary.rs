@@ -4,7 +4,7 @@
 //! - **The track**: three quarters of the circle near the rim, open at the bottom, dim.
 //! - **The fill**: from the track's start to the value's angle, in the face's colour, with a short needle across the track at the value.
 //! - **The second value** (optional): a thin arc inside the track on the same scale (a trail, a target, a second reading).
-//! - **The numbers**: the value large in the middle, its notes smaller under it, each in the person's base (`NUMBER`).
+//! - **The numbers**: the value large in the middle, its notes smaller under it, each in the person's base (`NUMBER`); or words in its place (`label`) for a reading a number cannot write (the timer's h:mm:ss).
 //! - **The angle** is a C² function of the value (`turns`): linear over the range, and past either end it runs on into the gap along a tanh, never reaching the gap's middle, so a value outside the range is still seen moving.
 
 use crate::{u, TEXT, TEXT2};
@@ -16,7 +16,7 @@ pub const GAP: f32 = 1. - TRACK;
 /// How far past either end of the range the fill can run, as a share of a turn: half the gap, so its far end stays on its own side of the gap's middle (in f32 a value far enough out lands on the middle itself, as tanh rounds to 1), never round onto the track's start.
 const RUN: f32 = GAP * 0.5;
 /// The track's radius and width, the second value's, and the needle's ends and half-width, as fractions of the circle's radius.
-const R_TRACK: f32 = 0.8;
+pub const R_TRACK: f32 = 0.8;
 const W_TRACK: f32 = 0.1;
 const R_SECOND: f32 = 0.68;
 const W_SECOND: f32 = 1. / (1 << 5) as f32;
@@ -51,6 +51,8 @@ pub struct Rotary<'a> {
     pub colour: Colour,
     /// The smaller numbers under the large one, top first; each carries one more place in focus.
     pub notes: &'a [Note],
+    /// Words in the middle in place of the large number (the value still sets the fill): a reading `NUMBER` cannot write, as the timer's h:mm:ss in the person's base (ferros_puck::fmt `duration`).
+    pub label: Option<&'a str>,
 }
 
 /// The fill's length in turns from the track's start for `x`, the value as a share of its range (0 at lo, 1 at hi): x · TRACK on [0, 1]; past hi, TRACK + RUN · tanh((x − 1) · TRACK / RUN), and below lo, RUN · tanh(x · TRACK / RUN).
@@ -89,6 +91,9 @@ fn from_start(w: &mut Writer, a0: f32, dir: f32, len: f32, r: f32, width: f32, c
     Ok(())
 }
 
+/// The label's height, a fraction of the radius: a little under the number's, so the widest reading the timer writes (h:mm:ss with two hour digits, eight glyphs) stays inside the track's inner edge.
+const LABEL: f32 = 0.2;
+
 /// The value as Q16 of its unit, as `NUMBER` takes it.
 fn q16(v: f32) -> i64 {
     (v * (1 << 16) as f32) as i64
@@ -97,8 +102,14 @@ fn q16(v: f32) -> i64 {
 pub fn face(w: &mut Writer, r: &Rotary, focus: bool) -> Result<(), Full> {
     let (a0, dir) = start(r.clockwise);
     let share = |v: f32| (v - r.lo) / (r.hi - r.lo);
-    if let Some(v) = r.value {
-        w.number(0, q14(0.02), u(0.24), TEXT, q16(v), r.places, r.unit)?;
+    match (r.label, r.value) {
+        (Some(s), _) => {
+            w.text(0, q14(0.02), u(LABEL), TEXT, s)?;
+        }
+        (None, Some(v)) => {
+            w.number(0, q14(0.02), u(0.24), TEXT, q16(v), r.places, r.unit)?;
+        }
+        (None, None) => {}
     }
     for (k, n) in r.notes.iter().enumerate() {
         w.number(0, q14(0.32 + 0.16 * k as f32), u(0.1), TEXT2, q16(n.value), n.places + focus as u8, n.unit)?;

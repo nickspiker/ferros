@@ -2,7 +2,7 @@
 //!
 //! - **Who sends.** A puck calls the `puck` endpoint (grant slot 9), and the kernel puts its kist identity (developer key and option) and its square (slot, generation, bytes held) ahead of every call (process.rs `puck_stamp`): a square is kept under that identity, and read only where and as far as the kernel says the puck holds one.
 //! - **Which circle.** The deck (the map) binds each puck's identity to a scene icon, `PUCK0 + j` for its j-th puck (op 73, the system's alone).
-//! - **The view.** Each scene, every bound puck's circle as it shows: on the glass or not, large (at least half the panel across), its diameter, its turn (the camera's and the circle's own: it turns with the deck). A puck's held WATCH is answered when the view moves (a size by a pixel, a turn by half a pixel at the rim), when a tap passes thru to it (op 74 from the deck), and, for a puck that asked (`call::FRAMES`), at every flip the deck shows. A doorbell, never a poll.
+//! - **The view.** Each scene, every bound puck's circle as it shows: on the glass or not, large (at least half the panel across), its diameter, its turn (the camera's and the circle's own: it turns with the deck). A puck's held WATCH is answered when the view moves (a size by a pixel, a turn by half a pixel at the rim), when a tap passes thru to it (op 74 from the deck) or a finger drags on it while it is the centred one (op 90), and, for a puck that asked (`call::FRAMES`), at every flip the deck shows. A doorbell, never a poll.
 //! - **The square.** SHOW names a square in the puck's slot; the render thread takes it at the top of its next pass (`due`) and answers then, so from that answer on the puck draws only elsewhere, and this server never reads a square while its puck writes it.
 //! - **Drawing.** The circle's sprite is made from the square when the square, the circle's size or its turn changes: each pixel of the circle sampled from the square (bilinear, the turn between the square's and the circle's undone), trimmed by the circle's C¹ edge, baked (bake.rs `g2t_row`). A circle shown larger than the square or turned since is drawn from it scaled and turned until the puck's next square lands.
 //!
@@ -64,18 +64,21 @@ struct Entry {
     /// Taps not yet heard: (x, y) Q14 of the radius in the face's frame.
     taps: [(i16, i16); call::TAPS],
     ntaps: usize,
+    /// Drag points not yet heard (op 90): (x, y) as a tap's, and the phase.
+    drags: [(i16, i16, u8); call::DRAGS],
+    ndrags: usize,
     /// A watch held: its reply token.
     held: Option<[u8; 32]>,
 }
 
-const FREE: Entry = Entry { id: [0; 64], cur: None, pending: None, seq: 0, view: HIDDEN, view_n: 0, frames: false, taps: [(0, 0); call::TAPS], ntaps: 0, held: None };
+const FREE: Entry = Entry { id: [0; 64], cur: None, pending: None, seq: 0, view: HIDDEN, view_n: 0, frames: false, taps: [(0, 0); call::TAPS], ntaps: 0, drags: [(0, 0, 0); call::DRAGS], ndrags: 0, held: None };
 static mut ENTRIES: [Entry; N] = [FREE; N];
 /// The deck's binding: icon `PUCK0 + j` is the puck with identity `BOUND[j]` (zeros: none).
 static mut BOUND: [[u8; 64]; N] = [[0; 64]; N];
 /// What the scene being drawn has shown so far, per bound puck j: its view, and where (centre x, y and radius Q8, turn Q14) for the deck's taps.
 static mut SEEN: [View; N] = [HIDDEN; N];
 static mut GEOM: [(i64, i64, i64, i64, i64); N] = [(0, 0, 0, 1 << 14, 0); N];
-/// Each scene circle's puck, by scene index (G#FF none), for op 74.
+/// Each scene circle's puck, by scene index (G#FF none), for ops 74 and 90.
 static mut BY_SCENE: [u8; 256] = [0xFF; 256];
 static LOCK: AtomicBool = AtomicBool::new(false);
 /// A new square or binding since the render thread last looked: the frame is drawn again.
@@ -118,9 +121,9 @@ fn entry<'a>(es: &'a mut [Entry; N], id: &[u8; 64]) -> Option<&'a mut Entry> {
     Some(e)
 }
 
-/// Answer a watch with the view now and the taps not yet heard (which go with it).
+/// Answer a watch with the view now and the taps and drag points not yet heard (which go with it); the drags' count and points only when there are any, so a reply with none is the form from before drags.
 fn answer(e: &mut Entry, tok: &[u8; 32]) {
-    let mut out = [0u8; 14 + 4 * call::TAPS];
+    let mut out = [0u8; call::WATCH_REPLY];
     out[1..5].copy_from_slice(&e.view_n.to_le_bytes());
     out[5] = e.view.shown as u8;
     out[6] = e.view.large as u8;
@@ -132,8 +135,19 @@ fn answer(e: &mut Entry, tok: &[u8; 32]) {
         out[14 + 4 * k..16 + 4 * k].copy_from_slice(&x.to_le_bytes());
         out[16 + 4 * k..18 + 4 * k].copy_from_slice(&y.to_le_bytes());
     }
-    let n = 14 + 4 * e.ntaps;
+    let mut n = 14 + 4 * e.ntaps;
+    if e.ndrags > 0 {
+        out[n] = e.ndrags as u8;
+        for (k, &(x, y, phase)) in e.drags[..e.ndrags].iter().enumerate() {
+            let at = n + 1 + 5 * k;
+            out[at..at + 2].copy_from_slice(&x.to_le_bytes());
+            out[at + 2..at + 4].copy_from_slice(&y.to_le_bytes());
+            out[at + 4] = phase;
+        }
+        n += 1 + 5 * e.ndrags;
+    }
     e.ntaps = 0;
+    e.ndrags = 0;
     ferros_sys::reply(tok, &out[..n]);
 }
 
@@ -174,14 +188,7 @@ pub fn tap(m: &[u8]) -> u8 {
     if j >= N {
         return 1;
     }
-    let (x, y) = (u16::from_le_bytes([m[1], m[2]]) as i64, u16::from_le_bytes([m[3], m[4]]) as i64);
-    let (sx, sy, sr, fc, fs) = unsafe { GEOM[j] };
-    // From the circle's centre in Q8 pixels, into the face's frame (its turn undone), then Q14 of the radius.
-    let (dx, dy) = ((x << 8) + 128 - sx, (y << 8) + 128 - sy);
-    let (fx, fy) = ((dx * fc + dy * fs) >> 14, (dy * fc - dx * fs) >> 14);
-    // WHY the floor: a circle under a pixel is never drawn, so never tapped, but its radius is the divisor.
-    let r = sr.max(256);
-    let q = |v: i64| ((v << 14) / r) as i16;
+    let (x, y) = face_point(j, &m[1..5]);
     let id = unsafe { (*(&raw const BOUND))[j] };
     let es = lock();
     if let Some(e) = es.iter_mut().find(|e| e.id == id && id != [0; 64]) {
@@ -190,8 +197,49 @@ pub fn tap(m: &[u8]) -> u8 {
             e.taps.copy_within(1.., 0);
             e.ntaps -= 1;
         }
-        e.taps[e.ntaps] = (q(fx), q(fy));
+        e.taps[e.ntaps] = (x, y);
         e.ntaps += 1;
+        tell(e);
+    }
+    unlock();
+    0
+}
+
+/// A screen pixel `[x u16][y u16]` on bound puck j's circle in the face's own frame: from the circle's centre in Q8 pixels, its turn undone, then Q14 of the radius.
+fn face_point(j: usize, m: &[u8]) -> (i16, i16) {
+    let (x, y) = (u16::from_le_bytes([m[0], m[1]]) as i64, u16::from_le_bytes([m[2], m[3]]) as i64);
+    let (sx, sy, sr, fc, fs) = unsafe { GEOM[j] };
+    let (dx, dy) = ((x << 8) + 128 - sx, (y << 8) + 128 - sy);
+    let (fx, fy) = ((dx * fc + dy * fs) >> 14, (dy * fc - dx * fs) >> 14);
+    // WHY the floor: a circle under a pixel is never drawn, so never tapped, but its radius is the divisor.
+    let r = sr.max(256);
+    let q = |v: i64| ((v << 14) / r) as i16;
+    (q(fx), q(fy))
+}
+
+/// Op 90 from the deck (the system's alone): `[scene index u8][x u16][y u16][phase u8]`, a finger dragged on that circle while it is the centred one (`call::DRAG_DOWN` where it landed, `DRAG_MOVE` where it is each frame it moves, `DRAG_UP` where it lifted), passed thru to its puck in the face's own frame as a tap is. Answers 0, or 1 when the circle is no puck's or the phase is none of the three.
+pub fn drag(m: &[u8]) -> u8 {
+    if m.len() < 6 || m[5] > call::DRAG_UP {
+        return 1;
+    }
+    let j = unsafe { BY_SCENE[m[0] as usize] } as usize;
+    if j >= N {
+        return 1;
+    }
+    let (x, y) = face_point(j, &m[1..5]);
+    let phase = m[5];
+    let id = unsafe { (*(&raw const BOUND))[j] };
+    let es = lock();
+    if let Some(e) = es.iter_mut().find(|e| e.id == id && id != [0; 64]) {
+        // A puck that has not heard the last `DRAGS`: a move takes the place of the move before it (the puck hears where the finger is, the steps between lost), so the down and the up are never the ones dropped; else the oldest goes.
+        if e.ndrags == call::DRAGS && phase == call::DRAG_MOVE && e.drags[e.ndrags - 1].2 == call::DRAG_MOVE {
+            e.ndrags -= 1;
+        } else if e.ndrags == call::DRAGS {
+            e.drags.copy_within(1.., 0);
+            e.ndrags -= 1;
+        }
+        e.drags[e.ndrags] = (x, y, phase);
+        e.ndrags += 1;
         tell(e);
     }
     unlock();
@@ -246,7 +294,7 @@ extern "C" fn receive(grants: u64) -> ! {
                 if let Some(old) = e.held.take() {
                     answer(e, &old);
                 }
-                if seen != e.view_n || e.ntaps > 0 {
+                if seen != e.view_n || e.ntaps > 0 || e.ndrags > 0 {
                     answer(e, &tok);
                 } else {
                     e.held = Some(tok);

@@ -168,7 +168,7 @@ fn rotary() {
     use ferros_puck::fmt::unit;
     use ferros_puck::LIST_MAX;
     let notes = [rotary::Note { value: -412.5, places: 0, unit: unit::NONE }, rotary::Note { value: 31.25, places: 1, unit: unit::CELSIUS }];
-    let at = |v: Option<f32>, clockwise: bool, second: Option<f32>| rotary::Rotary { value: v, lo: 0., hi: 100., second, clockwise, unit: unit::PERCENT, places: 0, colour: TEXT, notes: &notes };
+    let at = |v: Option<f32>, clockwise: bool, second: Option<f32>| rotary::Rotary { value: v, lo: 0., hi: 100., second, clockwise, unit: unit::PERCENT, places: 0, colour: TEXT, notes: &notes, label: None };
     // The face fits a list and draws whole at the range's ends, inside, past both ends, and before any reading, either way round, with and without a second value.
     for v in [None, Some(-40.), Some(0.), Some(0.5), Some(37.), Some(100.), Some(160.), Some(1e9)] {
         for clockwise in [true, false] {
@@ -217,4 +217,109 @@ fn rotary() {
         let t = rotary::turns(x);
         assert!(t >= -rotary::GAP * 0.5 && t <= rotary::TRACK + rotary::GAP * 0.5, "turns({x}) = {t}");
     }
+}
+
+#[test]
+fn timer_dial() {
+    // The log dial's anchors: a turn is a minute, two an hour, three sixty hours, none a second; and θ is its inverse.
+    for (th, secs) in [(0., 1.), (1., 60.), (2., 3600.), (3., 216000.)] {
+        let t = timer::seconds(th);
+        assert!((t - secs).abs() < secs * 1e-12, "60^{th} = {t}, not {secs}");
+        assert!((timer::theta(secs) - th).abs() < 1e-12, "log60({secs}) = {}", timer::theta(secs));
+    }
+    // Relative: a turn clockwise from five minutes is five hours, a turn back is five minutes again, half a turn is √60 times.
+    assert!((timer::turned(300., 1.) - 18000.).abs() < 1e-6);
+    assert!((timer::turned(timer::turned(300., 1.), -1.) - 300.).abs() < 1e-9);
+    assert!((timer::turned(300., 0.5) - 300. * libm::sqrt(60.)).abs() < 1e-9);
+    // Smooth and unbounded: any number of turns either way multiplies and divides, never sticking at an end.
+    let mut t = 1.;
+    for _ in 0..1 << 6 {
+        let u = timer::turned(t, 1. / (1 << 3) as f64);
+        assert!(u > t);
+        t = u;
+    }
+    assert!((timer::theta(t) - 8.).abs() < 1e-9);
+}
+
+#[test]
+fn timer_unwrap() {
+    // The angle about the centre: up 0, right a quarter, down a half, left minus a quarter (the face's frame: y down).
+    let q = 1 << 13;
+    for ((x, y), a) in [((0, -q), 0.), ((q, 0), 0.25), ((0, q), 0.5), ((-q, 0), -0.25)] {
+        assert!((timer::angle(x, y) - a).abs() < 1e-12, "angle({x}, {y}) = {}", timer::angle(x, y));
+    }
+    // Across the seam at the bottom (½ to −½) the step is the short way round, clockwise or back.
+    assert!((timer::unwrap(0.49, -0.49) - 0.02).abs() < 1e-12);
+    assert!((timer::unwrap(-0.49, 0.49) + 0.02).abs() < 1e-12);
+    assert!((timer::unwrap(0.1, 0.3) - 0.2).abs() < 1e-12);
+    assert!((timer::unwrap(0.3, 0.1) + 0.2).abs() < 1e-12);
+    // A finger going round three times clockwise in steps, the seam crossed each turn, comes to three turns.
+    let n = 1 << 6;
+    let mut sum = 0.;
+    let mut prev = timer::angle(0, -q);
+    for k in 1..=3 * n {
+        let th = k as f64 / n as f64 * core::f64::consts::TAU;
+        let a = timer::angle((libm::sin(th) * q as f64) as i16, (-libm::cos(th) * q as f64) as i16);
+        sum += timer::unwrap(prev, a);
+        prev = a;
+    }
+    assert!((sum - 3.).abs() < 1e-3, "three turns came to {sum}");
+}
+
+#[test]
+fn timer_drain() {
+    // Full at the start, empty at the end, half way at half the time, and in [0, 1] all the way down.
+    assert_eq!(timer::drain(300., 300.), 1.);
+    assert_eq!(timer::drain(0., 300.), 0.);
+    assert_eq!(timer::drain(150., 300.), 0.5);
+    for k in 0..=1 << 8 {
+        let left = 7200. * k as f64 / (1 << 8) as f64;
+        let s = timer::drain(left, 7200.);
+        assert!((0. ..=1.).contains(&s), "share {s} at {left}");
+    }
+    // The decades' step: 0 and 1 past its ends, a half at its middle, rising and smooth (its slope flat at both joins).
+    assert_eq!(timer::ring_fill(-1.), 0.);
+    assert_eq!(timer::ring_fill(0.), 0.);
+    assert_eq!(timer::ring_fill(1.), 1.);
+    assert_eq!(timer::ring_fill(7.), 1.);
+    assert!((timer::ring_fill(0.5) - 0.5).abs() < 1e-12);
+    let h = 1. / (1 << 10) as f64;
+    for x in [0., 1.] {
+        let slope = (timer::ring_fill(x + h) - timer::ring_fill(x - h)) / (2. * h);
+        assert!(slope.abs() < 1e-6, "slope {slope} at {x}");
+    }
+    // Never falling; near the ends f64 rounds e^(−1/t) against 1 to the same value, so rising strictly only away from them.
+    let mut prev = 0.;
+    for k in 1..1 << 8 {
+        let f = timer::ring_fill(k as f64 / (1 << 8) as f64);
+        assert!(f >= prev && (f > prev || k < 1 << 3 || k > (1 << 8) - (1 << 3)), "ring_fill falls or stalls at {k}");
+        prev = f;
+    }
+}
+
+#[test]
+fn timer_face() {
+    // Every state's face fits a list and draws, at rest and in focus: set, running, done, the stopwatch, a dial past six turns.
+    for (label, share, running, stopwatch, theta) in [("5:00", 1., false, false, Some(timer::theta(300.))), ("2:31", 0.5, true, false, Some(timer::theta(300.))), ("0.0", 0., true, false, Some(timer::theta(300.))), ("1:02:03", 0.05, true, true, None), ("60:00:00", 1., false, false, Some(9.))] {
+        let t = timer::Timer { stopwatch, share, running, label, theta };
+        let words = both("timer", 0, |w, focus| timer::face(w, &t, focus));
+        assert_eq!(words[0], [label]);
+        // In focus the presets as numbers of minutes too, in front of the rest.
+        assert_eq!(words[1], ["1", "3", "5", "10", "15", "30", label]);
+    }
+    // A tap lands where the face draws: the middle, each preset and mode mark in focus (not at rest), the rim.
+    let q = |v: f32| (v * (1 << 14) as f32) as i16;
+    assert_eq!(timer::hit(0, 0, true), timer::Hit::Centre);
+    assert_eq!(timer::hit(q(0.9), 0, true), timer::Hit::Rim);
+    let at = |a: f32, r: f32| (q(r * libm::sinf(a * core::f32::consts::TAU)), q(-r * libm::cosf(a * core::f32::consts::TAU)));
+    // The presets run along the bottom from the shortest on the left (a twentieth of a turn apart, none at the very bottom) to the longest on the right.
+    for (k, m) in [1, 3, 5, 10, 15, 30].into_iter().enumerate() {
+        let (x, y) = at(0.5 + (2.5 - k as f32) / 20., 0.56);
+        assert_eq!(timer::hit(x, y, true), timer::Hit::Preset(m));
+        assert_eq!(timer::hit(x, y, false), timer::Hit::Rim);
+    }
+    let (x, y) = at(0.06, 0.52);
+    assert_eq!(timer::hit(x, y, true), timer::Hit::Mode(true));
+    let (x, y) = at(-0.06, 0.52);
+    assert_eq!(timer::hit(x, y, true), timer::Hit::Mode(false));
 }

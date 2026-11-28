@@ -158,3 +158,119 @@ pub fn number(value_q16: i64, places: u8, unit: u8, base: u8, b: &mut [u8; OUT])
     let n = o.n;
     core::str::from_utf8(&b[..n]).unwrap_or("")
 }
+
+/// A day's seconds: the dozenal places of a duration are the clock's places of the day.
+const DAY: f64 = 86400.;
+
+/// A duration's last place in `base`: the place it counts in under its threshold (the fine), the place at and past it (the coarse), and the threshold as a count of fine places.
+/// - decimal: a tenth of a second under a minute (s.t), else a second (m:ss, h:mm:ss);
+/// - dozenal: the clock's places of the day (2 h, 10 min, 50 s, 50/12 s, 50/144 s), the fifth under the third's 50 s, else the fourth;
+/// - hex: a sixteenth of a second under G#40 s, else a second.
+fn duration_places(base: u8) -> (f64, f64, u64) {
+    match base {
+        12 => (DAY / libm::pow(12., 5.), DAY / libm::pow(12., 4.), 12 * 12),
+        16 => (1. / 16., 1., 64 * 16),
+        _ => (1. / 10., 1., 60 * 10),
+    }
+}
+
+/// The count of last places a duration of `secs` shows, rounded up (`up`: a countdown, which reads zero only once it is over) or down (a count up): in the fine place while that count is under the threshold, else in the coarse. With the place's seconds and whether it is the fine one.
+fn duration_count(secs: f64, base: u8, up: bool) -> (u64, f64, bool) {
+    let (fine, coarse, threshold) = duration_places(base);
+    let round = |x: f64| if up { libm::ceil(x) } else { libm::floor(x) };
+    // f64 to u64 saturates in Rust: a duration past 2^64 tenths (58 billion years) reads as that many, never wraps.
+    let n = round(secs / fine) as u64;
+    if n < threshold { (n, fine, true) } else { (round(secs / coarse) as u64, coarse, false) }
+}
+
+impl Out<'_> {
+    /// `v` in `base`, at least `min` digits (leading zeros; every caller asks one or more, so zero is written "0").
+    fn uint(&mut self, v: u64, base: u8, min: usize) {
+        // A u64 has at most 64 digits in any base from 2.
+        let mut digits = [0u8; 64];
+        let (mut k, mut v) = (0, v);
+        while v > 0 || k < min {
+            digits[k] = (v % base as u64) as u8;
+            v /= base as u64;
+            k += 1;
+        }
+        for i in (0..k).rev() {
+            self.digit(digits[i] as u32, base);
+        }
+    }
+}
+
+/// A duration of `secs` seconds (not negative) as a timer shows it in `base` (10, 12 or 16), rounded up to its last place when `up` (a countdown: the last place stays until it has passed, so zero shows only at the end) or down (a stopwatch):
+/// - decimal: h:mm:ss, m:ss under an hour, s.t under a minute, the hours counting on past a day;
+/// - dozenal: the clock's places of the day joined by ':' as the clock joins them, from the first that is not zil (at least the last two) to the fourth (50/12 s), or the fifth (50/144 s) under 50 s; the first place counts on past a dozen (a day is 10 of them);
+/// - hex: the seconds, with a sixteenth after the point under G#40 s.
+pub fn duration(secs: f64, base: u8, up: bool, b: &mut [u8; OUT]) -> &str {
+    let (n, _, fine) = duration_count(secs, base, up);
+    let mut o = Out { b, n: 0 };
+    match base {
+        12 => {
+            // Place `last` of the day (4 or 5) is the count's unit; place k above it is n / 12^(last − k), the first place unbounded.
+            let last = if fine { 5 } else { 4 };
+            let place = |k: u32| if k == 1 { n / 12u64.pow(last - 1) } else { (n / 12u64.pow(last - k)) % 12 };
+            let first = (1..last - 1).find(|&k| place(k) != 0).unwrap_or(last - 1);
+            for k in first..=last {
+                if k > first {
+                    o.ch(':');
+                }
+                o.uint(place(k), 12, 1);
+            }
+        }
+        16 => {
+            if fine {
+                o.uint(n / 16, 16, 1);
+                o.ch('.');
+                o.digit((n % 16) as u32, 16);
+            } else {
+                o.uint(n, 16, 1);
+            }
+        }
+        _ => {
+            if fine {
+                o.uint(n / 10, 10, 1);
+                o.ch('.');
+                o.digit((n % 10) as u32, 10);
+            } else {
+                let (h, m, s) = (n / 3600, (n / 60) % 60, n % 60);
+                if h > 0 {
+                    o.uint(h, 10, 1);
+                    o.ch(':');
+                    o.uint(m, 10, 2);
+                } else {
+                    o.uint(m, 10, 1);
+                }
+                o.ch(':');
+                o.uint(s, 10, 2);
+            }
+        }
+    }
+    let n = o.n;
+    core::str::from_utf8(&b[..n]).unwrap_or("")
+}
+
+/// How far a duration of `secs` moves (down when `up`, a countdown; else up) before what `duration` shows of it changes, in seconds; infinite for a countdown at zero, which shows zero from then on.
+pub fn duration_next(secs: f64, base: u8, up: bool) -> f64 {
+    let (n, step, fine) = duration_count(secs, base, up);
+    if !up {
+        return (n + 1) as f64 * step - secs;
+    }
+    if n == 0 {
+        return f64::INFINITY;
+    }
+    let mut at = (n - 1) as f64 * step;
+    // Counting down from the coarse place into the fine one: the coarse reading holds until the fine count falls under the threshold, at its last fine place below it, which is later than the coarse place's own boundary there.
+    let (f, _, threshold) = duration_places(base);
+    let edge = (threshold - 1) as f64 * f;
+    if !fine && at < edge {
+        at = edge;
+    }
+    // A reading that lies on a boundary to within f64's rounding of secs / step can count one place high, its boundary then secs itself: the change after it is a place further down, never a step of zero (which would wake the puck at once, again and again).
+    if at >= secs {
+        at -= step;
+    }
+    secs - at
+}

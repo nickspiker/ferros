@@ -16,6 +16,7 @@ pub mod rotary;
 pub mod sky;
 pub mod thermo;
 pub mod tide;
+pub mod timer;
 pub mod weather;
 #[cfg(test)]
 mod tests;

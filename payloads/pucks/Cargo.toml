@@ -37,6 +37,10 @@ path = "src/thermo.rs"
 name = "puck_battery"
 path = "src/battery.rs"
 
+[[bin]]
+name = "puck_timer"
+path = "src/timer.rs"
+
 [dependencies]
 ferros_sys = { path = "../../crates/sys" }
 ferros_heap = { path = "../../crates/heap", features = ["process"] }
@@ -51,5 +55,5 @@ ferros_weather = { path = "../../crates/weather" }
 # The weather's POST to fgtw.org over the `ip` process: the response decoded as it arrives, as the stower's GET does (ferros_kist::fetch).
 ferros_kist = { path = "../../crates/kist", features = ["process"] }
 libm = "0.2"
-# The compass's kept calibration, a VSF document in its own domain.
+# The compass's kept calibration and the timer's state, VSF documents in their own domains.
 vsf = { path = "../../../vsf", default-features = false }

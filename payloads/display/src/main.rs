@@ -36,6 +36,7 @@
 //! - 27 `whose point` and 41 `what of the system's` read the hit map (hit.rs: a u16 a pixel, the owner the compose wrote there, front to back); 58 `hit view [0 off, 1 on, 2 toggle, 3 ask]` → [0][on]: the map shown in the fourth temporal phase, a new palette each redraw (development builds; status 1 on a release build).
 //! - 24 `frame wait`: returns once the panel's next frame has started, or after a hundred-and-twentieth of a second when no frame is in flight (a command-mode panel starts a frame only when one is armed); the reply is the frame-start count, u32. A client that draws once per return is locked to the panel's refresh: it reads its input right after a frame starts and its update is ready for the next one (the map, while a finger is down).
 //! - 73 `puck bind [count u8][count x (developer 32, option 32)]`: the deck's pucks in order, the j-th drawn for scene icon G#90 + j from the list its kist sends on the `puck` endpoint (slot 9; puck.rs, docs/PUCKS.md); the system's alone. A scene circle with icon G#90 + j is that puck's circle; op 25 with that icon is its focus, its fuller face, still at the 10 Hz flips.
+//! - 90 `puck drag [scene index u8][x u16][y u16][phase u8]`: a finger dragged on the centred puck's circle (phase 0 where it landed, 1 each frame it moves, 2 where it lifted), passed thru to the puck's held watch in the face's own frame as op 74's taps are (puck.rs `drag`); the system's alone.
 //! The scene is retained here so a frame costs the client three numbers rather than one call per circle: nothing on the map ever moves, so between scene changes only the camera does.
 //! fluor's order holds inside a frame: what a client sends first is on top.
 //!
@@ -3388,7 +3389,7 @@ static NOT_YOURS_COUNT: AtomicU64 = AtomicU64::new(0);
 /// The ops that name a surface or act on another's window, or carry such ops (a batch, a flight), the system's own (78 and 79, the icon cache; 80, the windows as they stood; 87, the loading pies) and the system's alone on a release build (58 the hit view, 84 the screenshot, 85 the offer): their caller's holdings are asked of the kernel as they arrive.
 /// An op left off this list runs with holdings 0, so a system-only op left off is refused to everyone (2026-11-20: 78 and 79 were, and no kist icon ever reached the glass).
 fn names_surface(op: u8) -> bool {
-    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 54 | 56 | 58 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76 | 78 | 79 | 80 | 84 | 85 | 87 | 88 | 89)
+    matches!(op, 15 | 22 | 23 | 26 | 27 | 29 | 43 | 45 | 54 | 56 | 58 | 59 | 60 | 61 | 62 | 66 | 67 | 68 | 69 | 70 | 71 | 73 | 74 | 76 | 78 | 79 | 80 | 84 | 85 | 87 | 88 | 89 | 90)
 }
 
 /// What the process behind the call holds (kernel SYS_CALLER: bit `CALLER_SURFACE0` + k surface slot k, `CALLER_SETTINGS`, `CALLER_KIST`), asked with its reply token before the reply; 0 when the kernel says nothing (a kernel from before the call: every op that names a surface is then refused, never trusted to the client's word).
@@ -8216,6 +8217,12 @@ extern "C" fn receive(grants: u64) -> ! {
         // 74 `puck tap [scene index u8][x u16][y u16]`: a tap on a puck's circle at that screen pixel, passed thru to the puck (puck.rs `tap`; owner, 2026-11-18: "a simple tap passes thru so we can make our dozenal calculator work"). The system's alone: [4] (`NOT_YOURS`) from anyone else.
         if op == 74 {
             let r = if system(h) { puck::tap(&m[1..n]) } else { NOT_YOURS };
+            ferros_sys::reply(&tok, &[r]);
+            continue;
+        }
+        // 90 `puck drag [scene index u8][x u16][y u16][phase u8]`: a finger dragged on the centred puck's circle (phase 0 where it landed, 1 each frame it moves, 2 where it lifted), passed thru to the puck as a tap is (puck.rs `drag`; owner, 2026-11-28: a drag is the puck's own only while it is centred, else it moves the puck as before). The system's alone, as 74: [4] (`NOT_YOURS`) from anyone else.
+        if op == 90 {
+            let r = if system(h) { puck::drag(&m[1..n]) } else { NOT_YOURS };
             ferros_sys::reply(&tok, &[r]);
             continue;
         }

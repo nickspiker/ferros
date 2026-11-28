@@ -311,3 +311,67 @@ fn a_square_holds_its_face_over_its_plane_in_g2t16() {
     // Every pixel opaque: the plane fills the square under the face.
     assert!(px.iter().all(|p| p >> 48 == 0xFFFF));
 }
+
+/// A duration as the timer writes it.
+fn dur(secs: f64, base: u8, up: bool) -> String {
+    let mut b = [0u8; fmt::OUT];
+    String::from(fmt::duration(secs, base, up, &mut b))
+}
+
+#[test]
+fn durations() {
+    // Decimal, counting down (rounded up): h:mm:ss, m:ss under an hour, s.t under a minute, never 60.0 or 60:00, zero only at the end.
+    for (secs, s) in [(216000., "60:00:00"), (3600., "1:00:00"), (3599.5, "1:00:00"), (3599., "59:59"), (300., "5:00"), (60., "1:00"), (59.95, "1:00"), (59.85, "59.9"), (5.04, "5.1"), (0.01, "0.1"), (0., "0.0")] {
+        assert_eq!(dur(secs, 10, true), s, "{secs} s down");
+    }
+    // Counting up (rounded down), the stopwatch's way.
+    for (secs, s) in [(0., "0.0"), (59.99, "59.9"), (60., "1:00"), (61.7, "1:01"), (3725.2, "1:02:05")] {
+        assert_eq!(dur(secs, 10, false), s, "{secs} s up");
+    }
+    // Dozenal: the clock's places of the day (2 h, 10 min, 50 s, 50/12 s, 50/144 s), from the first that is not zil, at least two.
+    let z = |d: &[u32]| d.iter().map(|&v| String::from(fmt::digit(v, 12))).collect::<Vec<_>>().join(":");
+    assert_eq!(dur(7200., 12, true), z(&[1, 0, 0, 0]));
+    assert_eq!(dur(600., 12, true), z(&[1, 0, 0]));
+    // A minute is 1 × 50 s and 3 × 50/12 s rounded up (62.5 s).
+    assert_eq!(dur(60., 12, true), z(&[1, 3]));
+    // Under 50 s the fifth place: 25 s is 6 × 50/12 s exactly.
+    assert_eq!(dur(25., 12, true), z(&[6, 0]));
+    assert_eq!(dur(0., 12, true), z(&[0, 0]));
+    // A day is ten of the first place, and the first counts on past a dozen.
+    assert_eq!(dur(86400. * 2., 12, true), String::from(fmt::digit(2, 12)) + &String::from(fmt::digit(0, 12)) + ":" + &z(&[0, 0, 0]));
+    // Hex: the seconds, a sixteenth after the point under G#40 s.
+    assert_eq!(dur(4096., 16, true), "1000");
+    assert_eq!(dur(64., 16, true), "40");
+    assert_eq!(dur(60., 16, true), "3C.0");
+    assert_eq!(dur(0.5, 16, true), "0.8");
+}
+
+#[test]
+fn duration_steps() {
+    // Counting down: the next change is the next lower boundary of the shown place, and from the coarse place into the fine one it is the fine place's last before the threshold.
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+    assert!(near(fmt::duration_next(300.5, 10, true), 0.5));
+    assert!(near(fmt::duration_next(300., 10, true), 1.));
+    assert!(near(fmt::duration_next(60., 10, true), 0.1));
+    assert!(near(fmt::duration_next(60.5, 10, true), 0.5));
+    assert!(near(fmt::duration_next(5.04, 10, true), 0.04));
+    assert!(fmt::duration_next(0., 10, true).is_infinite());
+    // Counting up: the next boundary above.
+    assert!(near(fmt::duration_next(59.95, 10, false), 0.05));
+    assert!(near(fmt::duration_next(61.25, 10, false), 0.75));
+    // What it says is when the text changes: just before the boundary it reads the old, just past it the new, all the way down from a minute and a half.
+    for base in [10u8, 12, 16] {
+        let mut t = 90.;
+        let mut n = 0;
+        while t > 0. {
+            let dt = fmt::duration_next(t, base, true);
+            assert!(dt > 0. && dt.is_finite(), "{base}: step {dt} at {t}");
+            assert_eq!(dur(t - dt * 0.5, base, true), dur(t, base, true), "{base}: changed before {t} - {dt}");
+            assert_ne!(dur(t - dt - 1e-9, base, true), dur(t, base, true), "{base}: no change at {t} - {dt}");
+            // Just past the boundary, never on it (the device's readings are any real; one on a boundary to the last bit is a test's artefact).
+            t -= dt + 1e-7;
+            n += 1;
+        }
+        assert!(n > 1 << 4, "{base}: {n} steps");
+    }
+}
